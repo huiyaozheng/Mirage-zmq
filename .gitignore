@@ -23,3 +23,19 @@ setup.log
 .merlin
 
 .vscode/
+
+*.byte
+*.depends
+_digests
+*.where
+_log
+_build/
+*.swp
+lib
+Makefile
+.mirage.config
+*.opam
+key_gen.ml
+main.ml
+*.native
+myocamlbuild.ml
