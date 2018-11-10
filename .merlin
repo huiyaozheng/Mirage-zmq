@@ -1,0 +1,7 @@
+S example_snippets/zmq_binding/hello_world_client
+S example_snippets/zmq_binding/hello_world_server
+
+B example_snippets/zmq_binding/hello_world_client/_build
+B example_snippets/zmq_binding/hello_world_server/_build
+
+PKG zmq mirage
