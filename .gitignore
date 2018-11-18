@@ -36,3 +36,5 @@ key_gen.ml
 main.ml
 *.native
 myocamlbuild.ml
+src/dune
+src/dune-project

@@ -36,3 +36,48 @@ let new_greeting mechanism = {signature; version; mechanism; filler}
 let decode_greeting byte_sequence = 
     let mechanism = Bytes.sub_string byte_sequence 12 20 in 
         {signature; version; mechanism; filler}
+
+
+type state = 
+    | SIGNATURE
+    | VERSION_MAJOR
+    | VERSION_MINOR
+    | MECHANISM
+    | FILLER
+
+type event =
+    | Recv_bytes of bytes
+    | Init of string
+
+type action =
+    | Send_bytes of bytes
+    | Set_mechanism of string
+    | Continue
+    | Error of string
+
+type t = {
+    state          : state;
+    match_start    : int;
+    match_len      : int;
+    bytes_to_match : bytes;
+    mutable buffer : bytes;
+}
+
+let init_fsm = {
+    state = SIGNATURE;
+    match_start = 0;
+    match_len = 10;
+    bytes_to_match = signature;
+    buffer = Bytes.empty
+}
+
+let place_holder = (init_fsm, [])
+
+let handle t event = 
+    match event with
+        | Recv_bytes(b) -> 
+            (match t.state with
+                | SIGNATURE -> place_holder
+                | VERSION_MAJOR -> place_holder
+                | _ -> (init_fsm, []))
+        | Init(mechanism) -> (init_fsm, [Send_bytes(to_bytes (new_greeting mechanism))])
