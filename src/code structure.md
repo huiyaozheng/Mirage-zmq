@@ -70,7 +70,12 @@ This base module defines the signature of the FSM of a handshake stage.
 ```
 ;   Traffic consists of commands and messages intermixed
 traffic = *(command | message)
+```
+This FSM handles the I/O message and command frames.
 
+### `frame.ml`
+
+```
 ;   A command is a single long or short frame
 command = command-size command-body
 command-size = %x04 short-size | %x06 long-size
@@ -80,7 +85,9 @@ command-body = command-name command-data
 command-name = OCTET 1*255command-name-char
 command-name-char = ALPHA
 command-data = *OCTET
+```
 
+```
 ;   A message is one or more frames
 message = *message-more message-last
 message-more = ( %x01 short-size | %x03 long-size ) message-body
@@ -88,7 +95,7 @@ message-last = ( %x00 short-size | %x02 long-size ) message-body
 message-body = *OCTET
 ```
 
-This FSM handles the semantics of messages and commands.
+`Frame` generates a complete frame from the given options and data.
 
 ## Concrete Implementations
 
