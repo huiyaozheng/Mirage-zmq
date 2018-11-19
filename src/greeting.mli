@@ -1,11 +1,15 @@
 (** A greeting consists of ZMTP signature, version, mechanism and filler. *)
-type greeting
+type t
 
-(** Given a mechanism, return a new greeting. *)
-val new_greeting : string -> greeting 
+type event =
+    | Recv_bytes of bytes
+    | Init of string
 
-(** Converts a greeting to a sequence of bytes*)
-val to_bytes : greeting -> bytes
+type action =
+    | Send_bytes of bytes
+    | Set_mechanism of string
+    | Continue
+    | Error of string
 
-(** Decodes a greeting byte sequence into a greeting. *)
-val decode_greeting : bytes -> greeting
+val handle : t -> event -> t * action list
+

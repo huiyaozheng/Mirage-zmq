@@ -1,6 +1,3 @@
-type command = {
-    name : bytes;
-    data : bytes
-}
+type command 
 
 val to_frame : command -> Frame.frame
