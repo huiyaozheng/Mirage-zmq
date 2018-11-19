@@ -81,5 +81,5 @@ let handle t event =
                 | VERSION_MAJOR -> place_holder
                 | VERSION_MINOR -> place_holder
                 | MECHANISM -> place_holder
-                | FILLER -> place_holder
+                | FILLER -> place_holder)
         | Init(mechanism) -> (init_fsm, [Send_bytes(to_bytes (new_greeting mechanism))])
