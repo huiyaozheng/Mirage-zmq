@@ -79,5 +79,7 @@ let handle t event =
             (match t.state with
                 | SIGNATURE -> place_holder
                 | VERSION_MAJOR -> place_holder
-                | _ -> (init_fsm, []))
+                | VERSION_MINOR -> place_holder
+                | MECHANISM -> place_holder
+                | FILLER -> place_holder
         | Init(mechanism) -> (init_fsm, [Send_bytes(to_bytes (new_greeting mechanism))])
