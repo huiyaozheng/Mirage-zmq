@@ -38,48 +38,46 @@ let decode_greeting byte_sequence =
         {signature; version; mechanism; filler}
 
 
-type state = 
+type state =
+    | START
     | SIGNATURE
     | VERSION_MAJOR
     | VERSION_MINOR
     | MECHANISM
     | FILLER
+    | SUCCESS
+    | ERROR
 
 type event =
-    | Recv_bytes of bytes
+    | Recv_sig of bytes
+    | Recv_Vmajor of bytes
+    | Recv_Vminor of bytes
+    | Recv_Mechanism of bytes
+    | Recv_filler
     | Init of string
 
 type action =
     | Send_bytes of bytes
     | Set_mechanism of string
     | Continue
+    | Ok
     | Error of string
 
-type t = {
-    state          : state;
-    match_start    : int;
-    match_len      : int;
-    bytes_to_match : bytes;
-    mutable buffer : bytes;
-}
-
-let init_fsm = {
-    state = SIGNATURE;
-    match_start = 0;
-    match_len = 10;
-    bytes_to_match = signature;
-    buffer = Bytes.empty
-}
-
-let place_holder = (init_fsm, [])
-
-let handle t event = 
-    match event with
-        | Recv_bytes(b) -> 
-            (match t.state with
-                | SIGNATURE -> place_holder
-                | VERSION_MAJOR -> place_holder
-                | VERSION_MINOR -> place_holder
-                | MECHANISM -> place_holder
-                | FILLER -> place_holder)
-        | Init(mechanism) -> (init_fsm, [Send_bytes(to_bytes (new_greeting mechanism))])
+let handle (current_state, event) = 
+    match (current_state , event) with
+        | (START, Recv_sig(b)) -> 
+            if (Bytes.get b 0) = (Char.chr 255) && (Bytes.get b 7) = (Char.chr 127) 
+            then (SIGNATURE, Continue) 
+            else (ERROR, Error("Protocol Signature not detected."))
+        | (SIGNATURE, Recv_Vmajor(b)) ->
+            if (Bytes.get b 0) = (Char.chr 3) 
+            then (VERSION_MAJOR, Continue) 
+            else (ERROR, Error("Version-major is not 3."))
+        | (VERSION_MINOR, Recv_Vmajor(b)) ->
+            if (Bytes.get b 0) = (Char.chr 0) 
+            then (MECHANISM, Continue) 
+            else (ERROR, Error("Version-minor is not 0."))
+        | (MECHANISM, Recv_Mechanism(b)) ->
+            (FILLER, Set_mechanism(b))
+        | (FILLER, Recv_filler) -> (SUCCESS, Ok)
+        | _ -> (ERROR, Error("Unexpected event."))

@@ -1,11 +1,7 @@
-type socket = 
-    | REQ
-    | REP
-    | DEALER
-    | ROUTER
+type t =  List of Socket.socket
 
-type t =  List of socket
+let create () = []
 
-let new_context = []
+let new_socket 
 
 
