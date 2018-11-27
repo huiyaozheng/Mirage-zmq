@@ -13,3 +13,4 @@ type action =
 
 val handle : t -> event -> t * action list
 
+val handle_list : t -> event list -> t * action list

@@ -44,6 +44,7 @@ type state =
     | VERSION_MAJOR
     | VERSION_MINOR
     | MECHANISM
+    | AS_SERVER
     | FILLER
     | SUCCESS
     | ERROR
@@ -53,12 +54,14 @@ type event =
     | Recv_Vmajor of bytes
     | Recv_Vminor of bytes
     | Recv_Mechanism of bytes
+    | Recv_as_server of bytes
     | Recv_filler
     | Init of string
 
 type action =
     | Send_bytes of bytes
     | Set_mechanism of string
+    | Set_server of bool
     | Continue
     | Ok
     | Error of string
@@ -78,6 +81,21 @@ let handle (current_state, event) =
             then (MECHANISM, Continue) 
             else (ERROR, Error("Version-minor is not 0."))
         | (MECHANISM, Recv_Mechanism(b)) ->
-            (FILLER, Set_mechanism(b))
+            (AS_SERVER, Set_mechanism(b))
+        | (AS_SERVER, Recv_as_server(b)) ->
+            if (Bytes.get b 0) = (Char.chr 0)
+            then (FILLER, Set_server(false))
+            else (FILLER, Set_server(true))
         | (FILLER, Recv_filler) -> (SUCCESS, Ok)
         | _ -> (ERROR, Error("Unexpected event."))
+
+let handle_list (current_state, event_list) action_list =
+    match event_list with
+        | [] -> (match current_state with 
+                    | ERROR -> (ERROR, [List.hd action_list])
+                    | _ -> (current_state, List.rev action_list))
+        | hd::tl ->
+        match current_state with
+            | ERROR -> (ERROR, [List.hd action_list])
+            | _ -> let (new_state, action) = handle (current_state, hd) in
+                handle_list (new_state, tl) (action::action_list)
