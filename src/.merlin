@@ -1,4 +1,5 @@
 S .
+B .
 B ./_build
 
 PKG zmq mirage mirage-stack-lwt bytes

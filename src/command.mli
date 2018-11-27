@@ -1,3 +1,6 @@
-type command 
+type t = {
+    name : string;
+    data : bytes
+}
 
-val to_frame : command -> Frame.frame
+val to_frame : t -> Frame.frame

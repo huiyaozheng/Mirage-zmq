@@ -1,7 +1,7 @@
-type command = {
-    name : bytes;
+type t = {
+    name : string;
     data : bytes
 }
 
 let to_frame c = 
-    Frame.make_frame (Bytes.to_string (Bytes.concat Bytes.empty [c.name; c.data])) false true
+    Frame.make_frame (Bytes.concat Bytes.empty [Bytes.of_string c.name; c.data]) false true

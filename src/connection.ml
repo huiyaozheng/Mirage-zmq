@@ -83,3 +83,13 @@ let connection_fsm t bytes =
         | TRAFFIC -> (t, [])
         | ERROR -> (t, [])
     
+module type Connection = sig
+    type t
+    type stage
+    type action =
+    | WRITE of bytes
+    | CONTINUE
+    | CLOSE
+    val connection_fsm : t -> Bytes.t -> t * action list
+    val new_connection : unit -> t
+end
