@@ -1,3 +1,80 @@
+type socket_type = REQ | REP | DEALER | ROUTER
+
+type socket = {
+    socket_type : socket_type
+}
+
+type context = {}
+
+module type Socket = sig
+    val name : string
+    val make_socket : socket
+end
+
+module type Connection = sig
+    type t
+end
+
+module Frame : sig
+    type t
+    val make_frame : bytes -> bool -> bool -> t
+    val to_bytes : t -> bytes
+end = struct
+    type t = { flag : char; size : int; body : bytes}
+
+    (** TODO network bytes order *)
+    let size_to_bytes size = 
+        if size > 255 then
+            Bytes.make 1 (Char.chr size)
+        else
+            Bytes.init 8 (fun i -> Char.chr ((size land (255 lsl (i - 1) * 8)) lsr ((i - 1) * 8)))
+
+    let make_frame body ifMore ifCommand = 
+        let f = ref 0 in
+        let len = Bytes.length body in
+            if ifMore then f := !f + 1;
+            if ifCommand then f := !f + 4;
+            if len > 255 then f := !f + 2;
+            {flag = (Char.chr (!f)); size = len; body}
+
+    let to_bytes t =
+        Bytes.concat Bytes.empty [Bytes.make 1 t.flag; size_to_bytes t.size; t.body]
+end
+
+module Command : sig
+    type t
+    val to_frame : t -> Frame.t
+end = struct
+    type t = { name : string; data : bytes }
+    let to_frame t = Frame.make_frame (Bytes.concat Bytes.empty [Bytes.of_string t.name; t.data]) false true 
+end
+
+module type Security_Mechanism = sig
+    type t
+    val name : string
+end
+
+module type Greeting = sig
+    type t
+    type event =
+        | Recv_sig of bytes
+        | Recv_Vmajor of bytes
+        | Recv_Vminor of bytes
+        | Recv_Mechanism of bytes
+        | Recv_as_server of bytes
+        | Recv_filler
+        | Init of string
+    type action =
+        | Send_bytes of bytes
+        | Set_mechanism of string
+        | Set_server of bool
+        | Continue
+        | Ok
+        | Error of string
+    val handle : t * event -> t * action
+    val handle_list : t * event list -> action list -> t * action list
+end 
+
 module New_Greeting (M : Security_Mechanism) : Greeting = struct
     type t =
         | START
@@ -89,3 +166,21 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
             | _ -> let (new_state, action) = handle (current_state, hd) in
                 handle_list (new_state, tl) (action::action_list)
 end
+
+module type Traffic = sig
+    type t
+end
+
+module REP : Socket = struct
+    let name = "REP"
+    let make_socket = {socket_type = REP}
+end
+
+let new_context = context
+
+let create_socket context socket_type =
+    match socket_type with
+        | REP -> let new_socket = REP.make_socket
+        | REQ ->
+        | ROUTER ->
+        | DEALER ->

@@ -21,3 +21,7 @@ let make_frame body ifMore ifCommand =
 
 let to_bytes f =
     Bytes.concat Bytes.empty [Bytes.make 1 f.flag; size_to_bytes f.size; f.body]
+
+let from_bytes bytes = {
+    
+}

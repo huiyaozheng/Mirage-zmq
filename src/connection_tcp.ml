@@ -13,16 +13,16 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection.Connection) = stru
             | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
             | Ok (`Data b) -> (Logs.debug (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
                               let (new_t, action_list) = C.connection_fsm t (Cstruct.to_bytes b) in
-                              let act actions = 
+                              let rec act actions = 
                                     (match actions with
                                       | [] -> read_and_print flow new_t
                                       | (hd::tl) -> 
                                       (match hd with
-                                          | C.WRITE(b) -> (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
+                                          | C.Write(b) -> (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
                                                             | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
                                                             | Ok () -> act tl)
-                                          | C.CONTINUE -> act tl
-                                          | C.CLOSE -> Lwt.return_unit))
+                                          | C.Continue -> act tl
+                                          | C.Close -> Lwt.return_unit))
                               in
                                     act action_list))
       in

@@ -11,11 +11,6 @@ type t = {
     security_policy : string
 }
 
-type action =
-    | WRITE of bytes
-    | CONTINUE
-    | CLOSE
-
 let new_connection = {
     mutable stage = GREETING;
     mutable as_server = false;
@@ -87,9 +82,9 @@ module type Connection = sig
     type t
     type stage
     type action =
-    | WRITE of bytes
-    | CONTINUE
-    | CLOSE
+    | Write of bytes
+    | Continue
+    | Close
     val connection_fsm : t -> Bytes.t -> t * action list
     val new_connection : unit -> t
 end
