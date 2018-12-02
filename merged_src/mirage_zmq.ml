@@ -1,14 +1,57 @@
+open Lwt
+open Mirage_stack_lwt
+
+
+exception Not_Implemented
 type socket_type = REQ | REP | DEALER | ROUTER
 
-type socket = {
-    socket_type : socket_type
-}
+module Context = struct
+    type t = {options : int}
+    let create_context () = {options = 0}
+end
 
-type context = {}
+module Socket = struct
+    type transport_type = TCP | INPROC
+    type transport_info = Tcp of string * int | Inproc
+    type t = {
+        socket_type : socket_type;
+        mutable transport_type : transport_type;
+        mutable transport_info : transport_info;
+    }
+    let default_t = {
+        socket_type = REP;
+        transport_type = TCP;
+        transport_info = Tcp("", 0)
+    }
+    let create_socket context socket_type =
+        match socket_type with
+            | REP -> {default_t with socket_type = REP}
+            | REQ -> {default_t with socket_type = REQ}
+            | DEALER -> {default_t with socket_type = DEALER}
+            | ROUTER -> {default_t with socket_type = ROUTER}
+    
+    (* Bind to a local port *)
+    let bind t transport = 
+        let parts = String.split_on_char '/' transport in
+        match parts with 
+            | [] -> ()
+            | hd::tl -> 
+                let ttype = String.lowercase_ascii hd in
+                match ttype with 
+                    | "tcp:" -> (t.transport_type <- TCP;
+                                let ip_address = String.split_on_char ':' (List.hd (List.tl tl)) in
+                                    match ip_address with
+                                        | [] -> assert false
+                                        | ip::port -> (t.transport_info <- Tcp(ip, int_of_string (List.hd port));
+
+                                        )
+                                )
+                    | "inproc:" -> raise Not_Implemented
+                    | _ -> assert false
+end
 
 module type Socket = sig
     val name : string
-    val make_socket : socket
 end
 
 module type Connection = sig
@@ -53,6 +96,8 @@ module type Security_Mechanism = sig
     type t
     val name : string
 end
+
+type mechanisms = NULL | PLAIN
 
 module type Greeting = sig
     type t
@@ -147,7 +192,7 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
             then (MECHANISM, Continue) 
             else (ERROR, Error("Version-minor is not 0."))
         | (MECHANISM, Recv_Mechanism(b)) ->
-            (AS_SERVER, Set_mechanism(b))
+            (AS_SERVER, Set_mechanism(Bytes.to_string b))
         | (AS_SERVER, Recv_as_server(b)) ->
             if (Bytes.get b 0) = (Char.chr 0)
             then (FILLER, Set_server(false))
@@ -173,14 +218,17 @@ end
 
 module REP : Socket = struct
     let name = "REP"
-    let make_socket = {socket_type = REP}
 end
 
-let new_context = context
+module REQ : Socket = struct
+    let name = "REQ"
+end
 
-let create_socket context socket_type =
-    match socket_type with
-        | REP -> let new_socket = REP.make_socket
-        | REQ ->
-        | ROUTER ->
-        | DEALER ->
+module DEALER : Socket = struct
+    let name = "DEALER"
+end
+
+module ROUTER : Socket = struct
+    let name = "ROUTER"
+end
+

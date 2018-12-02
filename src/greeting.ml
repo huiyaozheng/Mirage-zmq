@@ -70,7 +70,7 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
             then (MECHANISM, Continue) 
             else (ERROR, Error("Version-minor is not 0."))
         | (MECHANISM, Recv_Mechanism(b)) ->
-            (AS_SERVER, Set_mechanism(b))
+            (AS_SERVER, Set_mechanism(Bytes.to_string b))
         | (AS_SERVER, Recv_as_server(b)) ->
             if (Bytes.get b 0) = (Char.chr 0)
             then (FILLER, Set_server(false))
