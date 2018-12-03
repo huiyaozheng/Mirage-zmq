@@ -1,6 +1,6 @@
 type socket_type = REQ | REP | DEALER | ROUTER
 
-type mechanisms = NULL | PLAIN
+type mechanism_type = NULL | PLAIN
 
 module Context : sig
     type t
