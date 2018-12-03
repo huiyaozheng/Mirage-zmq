@@ -204,13 +204,13 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                     | (hd::tl) ->
                                         match hd with 
                                             | Greeting.Send_bytes(b) -> (Write(b)::(convert tl))
-                                            | Set_server(b) -> t.as_server <- b; convert tl
+                                            | Greeting.Set_server(b) -> t.as_server <- b; convert tl
                                             (* Assume security mechanism is pre-set*)
-                                            | Check_mechanism(s) -> if s != t.security_policy then [Close]
+                                            | Greeting.Check_mechanism(s) -> if s != t.security_policy then [Close]
                                                                     else convert tl
-                                            | Continue -> convert tl
-                                            | Ok -> t.stage <- HANDSHAKE; convert tl
-                                            | Error(_) -> [Close] in
+                                            | Greeting.Continue -> convert tl
+                                            | Greeting.Ok -> t.stage <- HANDSHAKE; convert tl
+                                            | Greeting.Error(_) -> [Close] in
                             (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54*)
                             match len with
                                 (* Full greeting *)
@@ -302,7 +302,7 @@ module type Socket = sig
     val create_socket : Context.t -> socket_type -> t
 end
 
-module Socket_tcp (S : Mirage_stack_lwt.V4) : Socket = struct
+module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
     type transport_info = Tcp of string * int
     type t = {
         socket_type : socket_type;
