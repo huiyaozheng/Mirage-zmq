@@ -1,16 +1,28 @@
-open Lwt
-open Mirage_stack_lwt
-open Mirage
-
+open Lwt.Infix
 
 exception Not_Implemented
 type socket_type = REQ | REP | DEALER | ROUTER
 type mechanism_type = NULL | PLAIN
 
-module type Socket = sig
+module type Socket_type = sig
     val name : string
 end
 
+module REP_socket : Socket_type = struct
+    let name = "REP"
+end
+
+module REQ : Socket_type = struct
+    let name = "REQ"
+end
+
+module DEALER : Socket_type = struct
+    let name = "DEALER"
+end
+
+module ROUTER : Socket_type = struct
+    let name = "ROUTER"
+end
 module type Connection = sig
     type stage
     type t
@@ -27,12 +39,12 @@ module type Security_Mechanism = sig
     val name : string
 end
 
-module NULL : Security_Mechanism = struct
+module NULL_mechanism : Security_Mechanism = struct
     type t
     let name = "NULL"
 end
 
-module PLAIN : Security_Mechanism = struct
+module PLAIN_mechanism : Security_Mechanism = struct
     type t
     let name = "PLAIN"
 end
@@ -49,16 +61,110 @@ module type Greeting = sig
         | Init of string
     type action =
         | Send_bytes of bytes
-        | Set_mechanism of string
+        | Check_mechanism of string
         | Set_server of bool
         | Continue
         | Ok
         | Error of string
+    val init_state : t
     val handle : t * event -> t * action
     val handle_list : t * event list -> action list -> t * action list
 end 
 
-module New_Connection (S : Socket) (M : Security_Mechanism) : Connection = struct 
+module New_Greeting (M : Security_Mechanism) : Greeting = struct
+    type t =
+        | START
+        | SIGNATURE
+        | VERSION_MAJOR
+        | VERSION_MINOR
+        | MECHANISM
+        | AS_SERVER
+        | SUCCESS
+        | ERROR
+    type event =
+        | Recv_sig of bytes
+        | Recv_Vmajor of bytes
+        | Recv_Vminor of bytes
+        | Recv_Mechanism of bytes
+        | Recv_as_server of bytes
+        | Recv_filler
+        | Init of string
+    type action =
+        | Send_bytes of bytes
+        | Check_mechanism of string
+        | Set_server of bool
+        | Continue
+        | Ok
+        | Error of string
+    type version = { major : bytes; minor : bytes}
+
+    type greeting = { 
+        signature  : bytes;
+        version    : version;
+        mechanism  : string;
+        filler     : bytes
+    }
+
+    let signature = 
+    let s = Bytes.make 10 (Char.chr 0) in
+        Bytes.set s 0 (Char.chr 255);
+        Bytes.set s 9 (Char.chr 127);
+        s
+
+    let version = {major = Bytes.make 1 (Char.chr 3); minor = Bytes.make 1 (Char.chr 0)}
+
+    let filler = Bytes.make 31 (Char.chr 0)
+
+    let pad_mechanism m =
+    let b = Bytes.of_string m in
+        if Bytes.length b < 20 then
+            Bytes.cat b (Bytes.make (20 - Bytes.length b) (Char.chr 0))
+        else
+            b
+
+    let to_bytes g = 
+        Bytes.concat Bytes.empty [g.signature; g.version.major; g.version.minor; pad_mechanism g.mechanism; g.filler]
+
+    let new_greeting mechanism = {signature; version; mechanism; filler}
+
+    let init_state = START
+
+    let handle (current_state, event) = 
+    match (current_state , event) with
+        | (START, Recv_sig(b)) -> 
+            if (Bytes.get b 0) = (Char.chr 255) && (Bytes.get b 7) = (Char.chr 127) 
+            then (SIGNATURE, Send_bytes (new_greeting M.name |> to_bytes)) 
+            else (ERROR, Error("Protocol Signature not detected."))
+        | (SIGNATURE, Recv_Vmajor(b)) ->
+            if (Bytes.get b 0) = (Char.chr 3) 
+            then (VERSION_MAJOR, Continue) 
+            else (ERROR, Error("Version-major is not 3."))
+        | (VERSION_MAJOR, Recv_Vminor(b)) ->
+            if (Bytes.get b 0) = (Char.chr 0) 
+            then (VERSION_MINOR, Continue) 
+            else (ERROR, Error("Version-minor is not 0."))
+        | (VERSION_MINOR, Recv_Mechanism(b)) ->
+            (MECHANISM, Check_mechanism(Bytes.to_string b))
+        | (MECHANISM, Recv_as_server(b)) ->
+            if (Bytes.get b 0) = (Char.chr 0)
+            then (AS_SERVER, Set_server(false))
+            else (AS_SERVER, Set_server(true))
+        | (AS_SERVER, Recv_filler) -> (SUCCESS, Ok)
+        | _ -> (ERROR, Error("Unexpected event."))
+
+    let rec handle_list (current_state, event_list) action_list =
+    match event_list with
+        | [] -> (match current_state with 
+                    | ERROR -> (ERROR, [List.hd action_list])
+                    | _ -> (current_state, List.rev action_list))
+        | hd::tl ->
+        match current_state with
+            | ERROR -> (ERROR, [List.hd action_list])
+            | _ -> let (new_state, action) = handle (current_state, hd) in
+                handle_list (new_state, tl) (action::action_list)
+end
+
+module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = struct 
     type stage = 
     | GREETING
     | HANDSHAKE
@@ -69,6 +175,8 @@ module New_Connection (S : Socket) (M : Security_Mechanism) : Connection = struc
     | Write of bytes
     | Continue
     | Close
+
+    module Greeting = New_Greeting (M)
     
     type t = {
         mutable stage : stage;
@@ -82,65 +190,66 @@ module New_Connection (S : Socket) (M : Security_Mechanism) : Connection = struc
         stage = GREETING;
         as_server = false;
         counter = 0;
-        greeting_state = START;
+        greeting_state = Greeting.init_state;
         (* Set custom policy *)
         security_policy = M.name
     }
 
-    let convert greeting_action_list =
-        match greeting_action_list with
-            | [] -> []
-            | (hd::tl) ->
-                match hd with 
-                    | Send_bytes(b) -> (Write(b)::(convert tl))
-                    | Set_server(b) -> t.as_server <- b; convert tl
-                    | Set_mechanism(s) -> t.security_policy <- s; convert tl
-                    | Continue -> convert tl
-                    | Ok -> t.stage <- HANDSHAKE; convert tl
-                    | Error(s) -> [Close]
-
     let connection_fsm t bytes = 
         match (t.stage) with
-            | GREETING -> (let len = Bytes.length bytes in
+            | GREETING ->   (let len = Bytes.length bytes in
+                            let rec convert greeting_action_list =
+                                match greeting_action_list with
+                                    | [] -> []
+                                    | (hd::tl) ->
+                                        match hd with 
+                                            | Greeting.Send_bytes(b) -> (Write(b)::(convert tl))
+                                            | Set_server(b) -> t.as_server <- b; convert tl
+                                            (* Assume security mechanism is pre-set*)
+                                            | Check_mechanism(s) -> if s != t.security_policy then [Close]
+                                                                    else convert tl
+                                            | Continue -> convert tl
+                                            | Ok -> t.stage <- HANDSHAKE; convert tl
+                                            | Error(_) -> [Close] in
                             (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54*)
                             match len with
                                 (* Full greeting *)
                                 | 64 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, 
-                                            [Recv_sig(Bytes.sub b 0 10); 
-                                             Recv_Vmajor(Bytes.sub b 10 1);
-                                             Recv_Vminor(Bytes.sub b 11 1);
-                                             Recv_Mechanism(Bytes.sub b 12 20);
-                                             Recv_as_server(Bytes.sub b 32 1);
-                                             Recv_filler(Bytes.sub b 33 31)   
+                                            [Recv_sig(Bytes.sub bytes 0 10); 
+                                             Recv_Vmajor(Bytes.sub bytes 10 1);
+                                             Recv_Vminor(Bytes.sub bytes 11 1);
+                                             Recv_Mechanism(Bytes.sub bytes 12 20);
+                                             Recv_as_server(Bytes.sub bytes 32 1);
+                                             Recv_filler  
                                             ]) [] in
-                                        let connection_action = convert action in 
-                                        ({t with greeting_state = state}, convert action)
+                                        let connection_action = convert action_list in 
+                                        ({t with greeting_state = state}, connection_action)
                                 (* Signature + version major *)
-                                | 11 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, [Recv_sig(Bytes.sub b 0 10); Recv_Vmajor(Bytes.sub b 10 1)]) [] in
-                                        ({t with greeting_state = state}, convert action)
+                                | 11 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, [Recv_sig(Bytes.sub bytes 0 10); Recv_Vmajor(Bytes.sub bytes 10 1)]) [] in
+                                        ({t with greeting_state = state}, convert action_list)
                                 (* Signature *)
-                                | 10 -> let (state, action_list) = Greeting.handle (t.greeting_state, Recv_sig(b)) in
-                                        ({t with greeting_state = state}, convert action)
+                                | 10 -> let (state, action) = Greeting.handle (t.greeting_state, Recv_sig(bytes)) in
+                                        ({t with greeting_state = state}, convert [action])
                                 (* version minor + rest *)
                                 | 53 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, 
-                                            [Recv_Vminor(Bytes.sub b 0 1);
-                                             Recv_Mechanism(Bytes.sub b 1 20);
-                                             Recv_as_server(Bytes.sub b 21 1);
-                                             Recv_filler(Bytes.sub b 22 31)   
+                                            [Recv_Vminor(Bytes.sub bytes 0 1);
+                                             Recv_Mechanism(Bytes.sub bytes 1 20);
+                                             Recv_as_server(Bytes.sub bytes 21 1);
+                                             Recv_filler   
                                             ]) [] in
-                                        let connection_action = convert action in 
-                                        ({t with greeting_state = state}, convert action)
+                                        let connection_action = convert action_list in 
+                                        ({t with greeting_state = state}, connection_action)
                                 (* version major + rest *)
                                 | 54 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, 
-                                            [Recv_Major(Bytes.sub 0 1)
-                                             Recv_Vminor(Bytes.sub b 1 1);
-                                             Recv_Mechanism(Bytes.sub b 2 20);
-                                             Recv_as_server(Bytes.sub b 22 1);
-                                             Recv_filler(Bytes.sub b 23 31)   
+                                            [Recv_Vmajor(Bytes.sub bytes 0 1);
+                                             Recv_Vminor(Bytes.sub bytes 1 1);
+                                             Recv_Mechanism(Bytes.sub bytes 2 20);
+                                             Recv_as_server(Bytes.sub bytes 22 1);
+                                             Recv_filler   
                                             ]) [] in
-                                        let connection_action = convert action in 
-                                        ({t with greeting_state = state}, convert action)
-                                | _ ->  {ERROR, [CLOSE]}
+                                        let connection_action = convert action_list in 
+                                        ({t with greeting_state = state}, connection_action)
+                                | _ ->  (t, [Close])
                         )
             | HANDSHAKE -> (t, [])
             | TRAFFIC -> (t, [])
@@ -188,18 +297,20 @@ module Context = struct
     let create_context () = {options = 0}
 end
 
-module Socket = struct
-    type transport_type = TCP | INPROC
-    type transport_info = Tcp of string * int | Inproc
+module type Socket = sig
+    type t
+    val create_socket : Context.t -> socket_type -> t
+end
+
+module Socket_tcp (S : Mirage_stack_lwt.V4) : Socket = struct
+    type transport_info = Tcp of string * int
     type t = {
         socket_type : socket_type;
-        mutable transport_type : transport_type;
         mutable transport_info : transport_info;
         mutable security_mechanism : mechanism_type
     }
     let default_t = {
         socket_type = REP;
-        transport_type = TCP;
         transport_info = Tcp("", 0);
         security_mechanism = NULL
     }
@@ -210,51 +321,19 @@ module Socket = struct
             | DEALER -> {default_t with socket_type = DEALER}
             | ROUTER -> {default_t with socket_type = ROUTER}
     
-    (* Bind to a local port 
-    let bind t transport = 
-        let parts = String.split_on_char '/' transport in
-        match parts with 
-            | [] -> ()
-            | hd::tl -> 
-                let ttype = String.lowercase_ascii hd in
-                match ttype with 
-                    | "tcp:" -> (t.transport_type <- TCP;
-                                let ip_address = String.split_on_char ':' (List.hd (List.tl tl)) in
-                                    match ip_address with
-                                        | [] -> assert false
-                                        | ip::port -> (t.transport_info <- Tcp(ip, int_of_string (List.hd port));
-                                        
-                                            module tcp_worker = Connection_tcp S (initialised outside by user)
-                                            module C = New_Connection (socket defind in t) (Mechanism defined in t) 
-                                            C.connect s t.port
-                                            Start listening on port port with cb 
-                                            want something like                                        
-                                            Tcp.connect s t.port
-                                            t contains socket type, mechanism
-                                        
-                                        
-                                        )
-                                )
-                    | "inproc:" -> raise Not_Implemented
-                    | _ -> assert false *)
-    let bind_tcp t port tcp_stack s =
-    let module C = (match t.socket_type with
-                | REP -> (match t.security_mechanism with
-                            | NULL -> New_Connection REP NULL
-                            | PLAIN -> New_Connection REP PLAIN
+    let bind t port s = 
+    let module C = 
+        (val (match t.socket_type with
+                | REP ->(match t.security_mechanism with
+                            | NULL -> (module New_Connection (REP_socket) (NULL_mechanism) :Connection)
+                            | PLAIN -> (module New_Connection (REP_socket) (PLAIN_mechanism) : Connection)
                         )
-                | _ -> (match t.security_mechanism with
-                            | NULL -> New_Connection REP NULL
-                            | PLAIN -> New_Connection REP PLAIN
-                        ))
-    in
-        module Tcp = (val tcp_stack : Mirage_stack_lwt);
-        module C_tcp = Connection_tcp Tcp C;
+                | _ -> raise Not_Implemented) 
+            : Connection) in
+    let module C_tcp = Connection_tcp (S) (C) in
         C_tcp.connect s port
 
-
-
-    let connect t transport = raise Not_Implemented
+    let connect t = raise Not_Implemented
     let set_mechanism t mechanism = ()
 end
 
@@ -293,116 +372,8 @@ end = struct
     let to_frame t = Frame.make_frame (Bytes.concat Bytes.empty [Bytes.of_string t.name; t.data]) false true 
 end
 
-
-module New_Greeting (M : Security_Mechanism) : Greeting = struct
-    type t =
-        | START
-        | SIGNATURE
-        | VERSION_MAJOR
-        | VERSION_MINOR
-        | MECHANISM
-        | AS_SERVER
-        | FILLER
-        | SUCCESS
-        | ERROR
-    type event =
-        | Recv_sig of bytes
-        | Recv_Vmajor of bytes
-        | Recv_Vminor of bytes
-        | Recv_Mechanism of bytes
-        | Recv_as_server of bytes
-        | Recv_filler
-        | Init of string
-    type action =
-        | Send_bytes of bytes
-        | Set_mechanism of string
-        | Set_server of bool
-        | Continue
-        | Ok
-        | Error of string
-    type version = { major : bytes; minor : bytes}
-
-    type greeting = { 
-        signature  : bytes;
-        version    : version;
-        mechanism  : string;
-        filler     : bytes
-    }
-
-    let signature = 
-    let s = Bytes.make 10 (Char.chr 0) in
-        Bytes.set s 0 (Char.chr 255);
-        Bytes.set s 9 (Char.chr 127);
-        s
-
-    let version = {major = Bytes.make 1 (Char.chr 3); minor = Bytes.make 1 (Char.chr 0)}
-
-    let filler = Bytes.make 31 (Char.chr 0)
-
-    let pad_mechanism m =
-    let b = Bytes.of_string m in
-        if Bytes.length b < 20 then
-            Bytes.cat b (Bytes.make (20 - Bytes.length b) (Char.chr 0))
-        else
-            b
-
-    let to_bytes g = 
-        Bytes.concat Bytes.empty [g.signature; g.version.major; g.version.minor; pad_mechanism g.mechanism; g.filler]
-
-    let new_greeting mechanism = {signature; version; mechanism; filler}
-
-    let handle (current_state, event) = 
-    match (current_state , event) with
-        | (START, Recv_sig(b)) -> 
-            if (Bytes.get b 0) = (Char.chr 255) && (Bytes.get b 7) = (Char.chr 127) 
-            then (SIGNATURE, Send_bytes (new_greeting M.name |> to_bytes)) 
-            else (ERROR, Error("Protocol Signature not detected."))
-        | (SIGNATURE, Recv_Vmajor(b)) ->
-            if (Bytes.get b 0) = (Char.chr 3) 
-            then (VERSION_MAJOR, Continue) 
-            else (ERROR, Error("Version-major is not 3."))
-        | (VERSION_MINOR, Recv_Vmajor(b)) ->
-            if (Bytes.get b 0) = (Char.chr 0) 
-            then (MECHANISM, Continue) 
-            else (ERROR, Error("Version-minor is not 0."))
-        | (MECHANISM, Recv_Mechanism(b)) ->
-            (AS_SERVER, Set_mechanism(Bytes.to_string b))
-        | (AS_SERVER, Recv_as_server(b)) ->
-            if (Bytes.get b 0) = (Char.chr 0)
-            then (FILLER, Set_server(false))
-            else (FILLER, Set_server(true))
-        | (FILLER, Recv_filler) -> (SUCCESS, Ok)
-        | _ -> (ERROR, Error("Unexpected event."))
-
-    let rec handle_list (current_state, event_list) action_list =
-    match event_list with
-        | [] -> (match current_state with 
-                    | ERROR -> (ERROR, [List.hd action_list])
-                    | _ -> (current_state, List.rev action_list))
-        | hd::tl ->
-        match current_state with
-            | ERROR -> (ERROR, [List.hd action_list])
-            | _ -> let (new_state, action) = handle (current_state, hd) in
-                handle_list (new_state, tl) (action::action_list)
-end
-
 module type Traffic = sig
     type t
 end
 
-module REP : Socket = struct
-    let name = "REP"
-end
-
-module REQ : Socket = struct
-    let name = "REQ"
-end
-
-module DEALER : Socket = struct
-    let name = "DEALER"
-end
-
-module ROUTER : Socket = struct
-    let name = "ROUTER"
-end
 

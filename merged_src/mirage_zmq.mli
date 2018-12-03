@@ -7,18 +7,13 @@ module Context : sig
     val create_context : unit -> t
 end
 
-module Socket : sig
+module type Socket = sig
     type t
     val create_socket : Context.t -> socket_type -> t
 end
 
-module type Socket = sig
-    val name : string
-end
 
-module type Connection = sig
-    type t
-end
+module Socket_tcp : functor (S : Mirage_stack_lwt.V4) -> Socket
 
 module type Security_Mechanism = sig
     type t
