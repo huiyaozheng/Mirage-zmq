@@ -102,6 +102,7 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
         signature  : bytes;
         version    : version;
         mechanism  : string;
+        as_server  : bool;
         filler     : bytes
     }
 
@@ -122,18 +123,28 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
         else
             b
 
-    let to_bytes g = 
-        Bytes.concat Bytes.empty [g.signature; g.version.major; g.version.minor; pad_mechanism g.mechanism; g.filler]
+    let trim_mechanism m =
+    let len = ref (Bytes.length m) in
+        while Bytes.get m (!len - 1) = Char.chr 0 do len := !len - 1 done;
+        Bytes.sub m 0 (!len)
 
-    let new_greeting mechanism = {signature; version; mechanism; filler}
+    let to_bytes g = 
+        Bytes.concat Bytes.empty [g.signature; g.version.major; g.version.minor; pad_mechanism g.mechanism; if g.as_server then (Bytes.make 1 (Char.chr 1)) else (Bytes.make 1 (Char.chr 0));g.filler]
+
+    let new_greeting mechanism = {signature; version; mechanism; as_server = false; filler}
 
     let init_state = START
 
     let handle (current_state, event) = 
     match (current_state , event) with
         | (START, Recv_sig(b)) -> 
-            if (Bytes.get b 0) = (Char.chr 255) && (Bytes.get b 7) = (Char.chr 127) 
-            then (SIGNATURE, Send_bytes (new_greeting M.name |> to_bytes)) 
+            if (Bytes.get b 0) = (Char.chr 255) && (Bytes.get b 9) = (Char.chr 127) 
+            then (let ng = new_greeting M.name |> to_bytes in
+                
+                Logs.info (fun f -> f "Greeting length: %d\n" (Bytes.length ng));
+                (SIGNATURE, Send_bytes (ng)) 
+                
+                )
             else (ERROR, Error("Protocol Signature not detected."))
         | (SIGNATURE, Recv_Vmajor(b)) ->
             if (Bytes.get b 0) = (Char.chr 3) 
@@ -144,7 +155,7 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
             then (VERSION_MINOR, Continue) 
             else (ERROR, Error("Version-minor is not 0."))
         | (VERSION_MINOR, Recv_Mechanism(b)) ->
-            (MECHANISM, Check_mechanism(Bytes.to_string b))
+            (MECHANISM, Check_mechanism(Bytes.to_string(trim_mechanism b)))
         | (MECHANISM, Recv_as_server(b)) ->
             if (Bytes.get b 0) = (Char.chr 0)
             then (AS_SERVER, Set_server(false))
@@ -153,15 +164,14 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
         | _ -> (ERROR, Error("Unexpected event."))
 
     let rec handle_list (current_state, event_list) action_list =
-    match event_list with
-        | [] -> (match current_state with 
-                    | ERROR -> (ERROR, [List.hd action_list])
-                    | _ -> (current_state, List.rev action_list))
-        | hd::tl ->
-        match current_state with
-            | ERROR -> (ERROR, [List.hd action_list])
-            | _ -> let (new_state, action) = handle (current_state, hd) in
-                handle_list (new_state, tl) (action::action_list)
+        match event_list with
+            | [] -> (match current_state with 
+                        | ERROR -> (ERROR, [List.hd action_list])
+                        | _ -> (current_state, List.rev action_list))
+            | hd::tl -> match current_state with
+                        | ERROR -> (ERROR, [List.hd action_list])
+                        | _ -> let (new_state, action) = handle (current_state, hd) in
+                            handle_list (new_state, tl) (action::action_list)
 end
 
 module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = struct 
@@ -206,11 +216,14 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                             | Greeting.Send_bytes(b) -> (Write(b)::(convert tl))
                                             | Greeting.Set_server(b) -> t.as_server <- b; convert tl
                                             (* Assume security mechanism is pre-set*)
-                                            | Greeting.Check_mechanism(s) -> if s != t.security_policy then [Close]
-                                                                    else convert tl
+                                            | Greeting.Check_mechanism(s) -> if s <> t.security_policy then 
+                                                                                (Logs.info (fun f -> f "Security Policy mismatch: received (%s) with length %d but expecting (%s) with length %d\n" s (String.length s) t.security_policy (String.length t.security_policy));
+                                                                                [Close])
+                                                                             else convert tl
                                             | Greeting.Continue -> convert tl
                                             | Greeting.Ok -> t.stage <- HANDSHAKE; convert tl
-                                            | Greeting.Error(_) -> [Close] in
+                                            | Greeting.Error(s) -> Logs.info (fun f -> f "Greeting FSM error: %s\n" s);
+                                                                   [Close] in
                             (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54*)
                             match len with
                                 (* Full greeting *)
@@ -261,25 +274,28 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
         let buffer_to_string data = 
         let content = ref [] in
             Bytes.iter (fun b -> content := Char.code b :: !content) data;
-            String.concat " "  (List.map (fun x -> string_of_int x)  (List.rev !content))
+            String.concat " "  (List.map (fun x -> if x >= 65 && x <= 90 then String.make 1 (Char.chr x) else string_of_int x)  (List.rev !content))
 
         let connect s port =
         let rec read_and_print flow t = 
             S.TCPV4.read flow >>= (function
             | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
             | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
-            | Ok (`Data b) -> (Logs.debug (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
+            | Ok (`Data b) -> (Logs.info (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
                                 let (new_t, action_list) = C.connection_fsm t (Cstruct.to_bytes b) in
                                 let rec act actions = 
                                     (match actions with
                                         | [] -> read_and_print flow new_t
                                         | (hd::tl) -> 
                                         (match hd with
-                                            | C.Write(b) -> (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
+                                            | C.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n" (Bytes.length b));
+                                                            (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
                                                             | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
                                                             | Ok () -> act tl)
-                                            | C.Continue -> act tl
-                                            | C.Close -> Lwt.return_unit))
+                                            | C.Continue -> Logs.info (fun f -> f "Connection FSM Continue\n");
+                                                            act tl
+                                            | C.Close -> Logs.info (fun f -> f "Connection FSM Close\n");
+                                                         Lwt.return_unit))
                                 in
                                     act action_list))
         in
