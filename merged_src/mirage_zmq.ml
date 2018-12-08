@@ -1,8 +1,88 @@
 open Lwt.Infix
 
 exception Not_Implemented
-type socket_type = REQ | REP | DEALER | ROUTER
+exception Frame_Not_Complete
+type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH | PULL | PAIR
 type mechanism_type = NULL | PLAIN
+
+let if_valid_socket_pair a b =
+    match (a,b) with 
+        | (REQ, REP) | (REQ, ROUTER)
+        | (REP, REQ) | (REP, DEALER)
+        | (DEALER, REP) | (DEALER, DEALER) | (DEALER, ROUTER)
+        | (ROUTER, REQ) | (ROUTER, DEALER) | (ROUTER, ROUTER)
+        | (PUB, SUB) | (PUB, XSUB) 
+        | (XPUB, SUB) | (XPUB, XSUB)
+        | (SUB, PUB) | (SUB, XPUB)
+        | (XSUB, PUB) | (XSUB, XPUB)
+        | (PUSH, PULL) | (PULL, PUSH)
+        | (PAIR, PAIR) -> true
+        | _ -> false 
+
+module Frame : sig
+    type t
+    val make_frame : bytes -> bool -> bool -> t
+    val to_bytes : t -> bytes
+    val of_bytes : bytes -> t
+    val if_more : t -> bool
+    val if_command : t -> bool
+    val body : t -> bytes
+end = struct
+    type t = { flag : char; size : int; body : bytes}
+
+    (** TODO network bytes order *)
+    let size_to_bytes size = 
+        if size > 255 then
+            Bytes.make 1 (Char.chr size)
+        else
+            Bytes.init 8 (fun i -> Char.chr ((size land (255 lsl (i - 1) * 8)) lsr ((i - 1) * 8)))
+
+    let make_frame body ifMore ifCommand = 
+        let f = ref 0 in
+        let len = Bytes.length body in
+            if ifMore then f := !f + 1;
+            if ifCommand then f := !f + 4;
+            if len > 255 then f := !f + 2;
+            {flag = (Char.chr (!f)); size = len; body}
+
+    let to_bytes t =
+        Bytes.concat Bytes.empty [Bytes.make 1 t.flag; size_to_bytes t.size; t.body]
+
+    let of_bytes bytes = 
+    let flag = Char.code (Bytes.get bytes 0) in
+    let (ifCommand, ifLong, ifMore) = ((flag land 4) = 4, (flag land 2) = 2, (flag land 1) = 1) in
+        if ifLong then
+            (* long-size *)
+            raise Not_Implemented
+        else
+            (* short-size *)
+            let length = Char.code (Bytes.get bytes 1) in
+                (* check length *)
+                if (Bytes.length bytes) <> length + 2 then raise Frame_Not_Complete;
+                {flag = Char.chr flag; size = length; body = Bytes.sub bytes 2 (length - 2)}
+    
+    let if_more t = (Char.code(t.flag) land 1) = 1
+    let if_command t = (Char.code(t.flag) land 4) = 4
+    let body t = t.body
+end
+
+module Command : sig
+    type t
+    val to_frame : t -> Frame.t
+    val get_name : t -> string
+    val get_data : t -> bytes
+    val of_frame : Frame.t -> t
+end = struct
+    type t = { name : string; data : bytes }
+    let to_frame t = Frame.make_frame (Bytes.concat Bytes.empty [Bytes.of_string t.name; t.data]) false true 
+    let get_name t = t.name
+    let get_data t = t.data
+    
+    let of_frame frame = 
+    let data = Frame.body frame in
+    let name_length = Char.code (Bytes.get data 0) in
+        {name = Bytes.sub_string data 1 name_length; data = Bytes.sub data (name_length + 1) ((Bytes.length data) - 1 - name_length)}
+end
 
 module type Socket_type = sig
     val name : string
@@ -36,17 +116,31 @@ end
 
 module type Security_Mechanism = sig
     type t
+    type action = Write of bytes | Continue | Close
     val name : string
+    val fsm : t -> Command.t -> t * action
+    val init_state : t
 end
 
 module NULL_mechanism : Security_Mechanism = struct
-    type t
+    type t = START | READY | OK
+    type action = Write of bytes | Continue | Close
     let name = "NULL"
+
+    let init_state = START
+
+    let fsm (state:t) command =
+    let name = Command.get_name command in
+    let data = Command.get_data command in (state, Continue)
 end
 
 module PLAIN_mechanism : Security_Mechanism = struct
-    type t
+    type t = START | READY | OK
+    type action = Write of bytes | Continue | Close
     let name = "PLAIN"
+    let init_state = START
+    let fsm (state:t) command = raise Not_Implemented
+
 end
 
 module type Greeting = sig
@@ -71,6 +165,7 @@ module type Greeting = sig
     val handle_list : t * event list -> action list -> t * action list
 end 
 
+(* TODO: as_server determined by socket_type?*)
 module New_Greeting (M : Security_Mechanism) : Greeting = struct
     type t =
         | START
@@ -193,6 +288,7 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
         mutable as_server : bool;
         counter : int;
         greeting_state : Greeting.t;
+        handshake_state : M.t;
         security_policy : string
     }
 
@@ -201,6 +297,7 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
         as_server = false;
         counter = 0;
         greeting_state = Greeting.init_state;
+        handshake_state = M.init_state;
         (* Set custom policy *)
         security_policy = M.name
     }
@@ -221,7 +318,7 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                                                                 [Close])
                                                                              else convert tl
                                             | Greeting.Continue -> convert tl
-                                            | Greeting.Ok -> t.stage <- HANDSHAKE; convert tl
+                                            | Greeting.Ok -> Logs.info (fun f -> f "Greeting OK\n"); t.stage <- HANDSHAKE; convert tl
                                             | Greeting.Error(s) -> Logs.info (fun f -> f "Greeting FSM error: %s\n" s);
                                                                    [Close] in
                             (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54*)
@@ -264,7 +361,15 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                         ({t with greeting_state = state}, connection_action)
                                 | _ ->  (t, [Close])
                         )
-            | HANDSHAKE -> (t, [])
+            | HANDSHAKE -> (let command = Command.of_frame (Frame.of_bytes bytes) in
+                            let (new_state, action) = M.fsm t.handshake_state command in
+                            let convert action = 
+                                match action with 
+                                    | M.Write(b) -> Write(b)
+                                    | M.Continue -> Continue
+                                    | M.Close -> Close
+                            in
+                            ({t with handshake_state = new_state}, [convert action]))
             | TRAFFIC -> (t, [])
             | ERROR -> (t, [])
 
@@ -274,7 +379,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
         let buffer_to_string data = 
         let content = ref [] in
             Bytes.iter (fun b -> content := Char.code b :: !content) data;
-            String.concat " "  (List.map (fun x -> if x >= 65 && x <= 90 then String.make 1 (Char.chr x) else string_of_int x)  (List.rev !content))
+            String.concat " "  (List.map (fun x -> if (x >= 65 && x <= 90) || (x >= 97 && x <= 122) then String.make 1 (Char.chr x) else string_of_int x)  (List.rev !content))
 
         let connect s port =
         let rec read_and_print flow t = 
@@ -354,39 +459,9 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
 end
 
 
-module Frame : sig
-    type t
-    val make_frame : bytes -> bool -> bool -> t
-    val to_bytes : t -> bytes
-end = struct
-    type t = { flag : char; size : int; body : bytes}
 
-    (** TODO network bytes order *)
-    let size_to_bytes size = 
-        if size > 255 then
-            Bytes.make 1 (Char.chr size)
-        else
-            Bytes.init 8 (fun i -> Char.chr ((size land (255 lsl (i - 1) * 8)) lsr ((i - 1) * 8)))
 
-    let make_frame body ifMore ifCommand = 
-        let f = ref 0 in
-        let len = Bytes.length body in
-            if ifMore then f := !f + 1;
-            if ifCommand then f := !f + 4;
-            if len > 255 then f := !f + 2;
-            {flag = (Char.chr (!f)); size = len; body}
 
-    let to_bytes t =
-        Bytes.concat Bytes.empty [Bytes.make 1 t.flag; size_to_bytes t.size; t.body]
-end
-
-module Command : sig
-    type t
-    val to_frame : t -> Frame.t
-end = struct
-    type t = { name : string; data : bytes }
-    let to_frame t = Frame.make_frame (Bytes.concat Bytes.empty [Bytes.of_string t.name; t.data]) false true 
-end
 
 module type Traffic = sig
     type t
