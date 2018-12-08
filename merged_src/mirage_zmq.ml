@@ -2,8 +2,39 @@ open Lwt.Infix
 
 exception Not_Implemented
 exception Frame_Not_Complete
+exception Socket_Name_Not_Recognised
+
 type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH | PULL | PAIR
+(* CURVE not implemented *)
 type mechanism_type = NULL | PLAIN
+
+let string_of_socket_type = function
+    | REQ -> "REQ"
+    | REP -> "REP"
+    | DEALER -> "DEALER"
+    | ROUTER -> "ROUTER"
+    | PUB -> "PUB"
+    | XPUB -> "XPUB"
+    | SUB -> "SUB"
+    | XSUB -> "XSUB"
+    | PUSH -> "PUSH"
+    | PULL -> "PULL"
+    | PAIR -> "PAIR"
+
+let socket_type_from_string = function
+    | "REQ" -> REQ
+    | "REP" -> REP
+    | "DEALER" -> DEALER
+    | "ROUTER" -> ROUTER
+    | "PUB" -> PUB
+    | "XPUB" -> XPUB
+    | "SUB" -> SUB
+    | "XSUB" -> XSUB
+    | "PUSH" -> PUSH
+    | "PULL" -> PULL
+    | "PAIR" -> PAIR
+    | _ -> raise Socket_Name_Not_Recognised
+
 
 let if_valid_socket_pair a b =
     match (a,b) with 
@@ -18,6 +49,12 @@ let if_valid_socket_pair a b =
         | (PUSH, PULL) | (PULL, PUSH)
         | (PAIR, PAIR) -> true
         | _ -> false 
+
+let rec network_order_to_int bytes = 
+    let length = Bytes.length bytes in
+        if length = 1 then Char.code (Bytes.get bytes 0)
+        else (Char.code (Bytes.get bytes 0)) + (network_order_to_int (Bytes.sub bytes 0 (length - 1))) * 256
+
 
 module Frame : sig
     type t
@@ -85,24 +122,25 @@ end = struct
 end
 
 module type Socket_type = sig
-    val name : string
+    val socket_type : socket_type
 end
 
 module REP_socket : Socket_type = struct
-    let name = "REP"
+    let socket_type = REP
 end
 
 module REQ : Socket_type = struct
-    let name = "REQ"
+    let socket_type = REQ
 end
 
 module DEALER : Socket_type = struct
-    let name = "DEALER"
+    let socket_type = DEALER
 end
 
 module ROUTER : Socket_type = struct
-    let name = "ROUTER"
+    let socket_type = ROUTER
 end
+
 module type Connection = sig
     type stage
     type t
@@ -116,27 +154,41 @@ end
 
 module type Security_Mechanism = sig
     type t
-    type action = Write of bytes | Continue | Close
+    type action = Write of bytes | Continue | Close | Received_property of string * bytes
     val name : string
-    val fsm : t -> Command.t -> t * action
+    val fsm : t -> Command.t -> t * action list
     val init_state : t
 end
 
 module NULL_mechanism : Security_Mechanism = struct
     type t = START | READY | OK
-    type action = Write of bytes | Continue | Close
+    type action = Write of bytes | Continue | Close | Received_property of string * bytes
     let name = "NULL"
 
     let init_state = START
 
+    let rec extract_metadata bytes = 
+    let len = Bytes.length bytes in
+        if len = 0 then []
+        else 
+            let name_length = Char.code (Bytes.get bytes 0) in
+            let name = Bytes.sub_string bytes 1 name_length in
+            let property_length = network_order_to_int (Bytes.sub bytes (name_length + 1) 4) in
+            let property = Bytes.sub bytes (name_length + 1 + 4) property_length in
+                (name, property)::(extract_metadata (Bytes.sub bytes (name_length + 1 + 4 + property_length) (len - (name_length + 1 + 4 + property_length))))
+
     let fsm (state:t) command =
     let name = Command.get_name command in
-    let data = Command.get_data command in (state, Continue)
+    let data = Command.get_data command in 
+        match name with
+            | "READY" -> (state, [Continue])
+            | "ERROR" -> raise Not_Implemented
+            | _ -> raise Not_Implemented
 end
 
 module PLAIN_mechanism : Security_Mechanism = struct
     type t = START | READY | OK
-    type action = Write of bytes | Continue | Close
+    type action = Write of bytes | Continue | Close | Received_property of string * bytes
     let name = "PLAIN"
     let init_state = START
     let fsm (state:t) command = raise Not_Implemented
@@ -234,12 +286,7 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
     match (current_state , event) with
         | (START, Recv_sig(b)) -> 
             if (Bytes.get b 0) = (Char.chr 255) && (Bytes.get b 9) = (Char.chr 127) 
-            then (let ng = new_greeting M.name |> to_bytes in
-                
-                Logs.info (fun f -> f "Greeting length: %d\n" (Bytes.length ng));
-                (SIGNATURE, Send_bytes (ng)) 
-                
-                )
+            then (SIGNATURE, Send_bytes (new_greeting M.name |> to_bytes)) 
             else (ERROR, Error("Protocol Signature not detected."))
         | (SIGNATURE, Recv_Vmajor(b)) ->
             if (Bytes.get b 0) = (Char.chr 3) 
@@ -363,13 +410,21 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                         )
             | HANDSHAKE -> (let command = Command.of_frame (Frame.of_bytes bytes) in
                             let (new_state, action) = M.fsm t.handshake_state command in
-                            let convert action = 
-                                match action with 
-                                    | M.Write(b) -> Write(b)
-                                    | M.Continue -> Continue
-                                    | M.Close -> Close
+                            let rec convert handshake_action_list = 
+                                match handshake_action_list with 
+                                    | [] -> []
+                                    | (hd::tl) -> (match hd with
+                                                    | M.Write(b) -> Write(b)::(convert tl)
+                                                    | M.Continue -> Continue::(convert tl)
+                                                    | M.Close -> [Close]
+                                                    | M.Received_property(name, value) -> 
+                                                        match name with
+                                                            | "Socket-Type" -> convert tl
+                                                            | "Identity" -> convert tl
+                                                            | _ -> Logs.info (fun f -> f "Ignore unknown identity %s\n" name); convert tl
+                                                    )
                             in
-                            ({t with handshake_state = new_state}, [convert action]))
+                            ({t with handshake_state = new_state}, convert action))
             | TRAFFIC -> (t, [])
             | ERROR -> (t, [])
 
