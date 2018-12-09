@@ -55,9 +55,13 @@ let rec network_order_to_int bytes =
         if length = 1 then Char.code (Bytes.get bytes 0)
         else (Char.code (Bytes.get bytes 0)) + (network_order_to_int (Bytes.sub bytes 0 (length - 1))) * 256
 
+let int_to_network_order n length =
+    Bytes.init length (fun i -> (Char.chr (n lsr (8 * (length - i - 1)) land 256)))
 
 module Frame : sig
     type t
+
+    (* make_frame body ifMore ifCommand*)
     val make_frame : bytes -> bool -> bool -> t
     val to_bytes : t -> bytes
     val of_bytes : bytes -> t
@@ -123,22 +127,27 @@ end
 
 module type Socket_type = sig
     val socket_type : socket_type
+    val metadata : (string * string) list
 end
 
 module REP_socket : Socket_type = struct
     let socket_type = REP
+    let metadata = [("Socket-Type","REP")]
 end
 
 module REQ : Socket_type = struct
     let socket_type = REQ
+    let metadata = [("Socket-Type","REQ")]
 end
 
 module DEALER : Socket_type = struct
     let socket_type = DEALER
+    let metadata = [("Socket-Type","DEALER");("Identity","")]
 end
 
 module ROUTER : Socket_type = struct
     let socket_type = ROUTER
+    let metadata = [("Socket-Type","ROUTER")]
 end
 
 module type Connection = sig
@@ -154,15 +163,15 @@ end
 
 module type Security_Mechanism = sig
     type t
-    type action = Write of bytes | Continue | Close | Received_property of string * bytes
+    type action = Write of bytes | Continue | Close | Received_property of string * string
     val name : string
     val fsm : t -> Command.t -> t * action list
     val init_state : t
 end
 
-module NULL_mechanism : Security_Mechanism = struct
-    type t = START | READY | OK
-    type action = Write of bytes | Continue | Close | Received_property of string * bytes
+module NULL_mechanism (S: Socket_type) : Security_Mechanism = struct
+    type t = START | OK
+    type action = Write of bytes | Continue | Close | Received_property of string * string
     let name = "NULL"
 
     let init_state = START
@@ -174,21 +183,35 @@ module NULL_mechanism : Security_Mechanism = struct
             let name_length = Char.code (Bytes.get bytes 0) in
             let name = Bytes.sub_string bytes 1 name_length in
             let property_length = network_order_to_int (Bytes.sub bytes (name_length + 1) 4) in
-            let property = Bytes.sub bytes (name_length + 1 + 4) property_length in
+            let property = Bytes.sub_string bytes (name_length + 1 + 4) property_length in
                 (name, property)::(extract_metadata (Bytes.sub bytes (name_length + 1 + 4 + property_length) (len - (name_length + 1 + 4 + property_length))))
+
+    let new_handshake = 
+    let bytes_of_metadata (name, property) = (
+        let name_length = String.length name in
+        let property_length = String.length property in
+        Bytes.cat (int_to_network_order name_length 4) (Bytes.of_string property)
+    ) in
+    let rec convert_metadata = function
+        | [] -> Bytes.empty
+        | hd::tl -> Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
+    in let name = string_of_socket_type S.socket_type in
+    Frame.to_bytes (Frame.make_frame (Bytes.concat Bytes.empty [(Bytes.make 1 (Char.chr (String.length name))); Bytes.of_string name; convert_metadata S.metadata]) false true)
 
     let fsm (state:t) command =
     let name = Command.get_name command in
     let data = Command.get_data command in 
-        match name with
-            | "READY" -> (state, [Continue])
-            | "ERROR" -> raise Not_Implemented
+        match state with 
+            | START -> (match name with
+                        | "READY" -> (OK, (List.map (fun (name, property) -> Received_property(name, property)) (extract_metadata data)) @ [Write(new_handshake)])
+                        | "ERROR" -> raise Not_Implemented
+                        | _ -> raise Not_Implemented)
             | _ -> raise Not_Implemented
 end
 
-module PLAIN_mechanism : Security_Mechanism = struct
+module PLAIN_mechanism (S: Socket_type) : Security_Mechanism = struct
     type t = START | READY | OK
-    type action = Write of bytes | Continue | Close | Received_property of string * bytes
+    type action = Write of bytes | Continue | Close | Received_property of string * string
     let name = "PLAIN"
     let init_state = START
     let fsm (state:t) command = raise Not_Implemented
@@ -501,8 +524,8 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
     let module C = 
         (val (match t.socket_type with
                 | REP ->(match t.security_mechanism with
-                            | NULL -> (module New_Connection (REP_socket) (NULL_mechanism) :Connection)
-                            | PLAIN -> (module New_Connection (REP_socket) (PLAIN_mechanism) : Connection)
+                            | NULL -> (module New_Connection (REP_socket) (NULL_mechanism (REP_socket)) : Connection)
+                            | PLAIN -> (module New_Connection (REP_socket) (PLAIN_mechanism (REP_socket)) : Connection)
                         )
                 | _ -> raise Not_Implemented) 
             : Connection) in
