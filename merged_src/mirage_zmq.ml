@@ -53,10 +53,15 @@ let if_valid_socket_pair a b =
 let rec network_order_to_int bytes = 
     let length = Bytes.length bytes in
         if length = 1 then Char.code (Bytes.get bytes 0)
-        else (Char.code (Bytes.get bytes 0)) + (network_order_to_int (Bytes.sub bytes 0 (length - 1))) * 256
+        else (Char.code (Bytes.get bytes (length - 1))) + (network_order_to_int (Bytes.sub bytes 0 (length - 1))) * 256
 
 let int_to_network_order n length =
-    Bytes.init length (fun i -> (Char.chr (n lsr (8 * (length - i - 1)) land 256)))
+    Bytes.init length (fun i -> (Char.chr (n lsr (8 * (length - i - 1)) land 255)))
+
+let buffer_to_string data = 
+let content = ref [] in
+    Bytes.iter (fun b -> content := Char.code b :: !content) data;
+    String.concat " "  (List.map (fun x -> if (x >= 65 && x <= 90) || (x >= 97 && x <= 122) then String.make 1 (Char.chr x) else string_of_int x)  (List.rev !content))
 
 module Frame : sig
     type t
@@ -73,7 +78,7 @@ end = struct
 
     (** TODO network bytes order *)
     let size_to_bytes size = 
-        if size > 255 then
+        if size < 255 then
             Bytes.make 1 (Char.chr size)
         else
             Bytes.init 8 (fun i -> Char.chr ((size land (255 lsl (i - 1) * 8)) lsr ((i - 1) * 8)))
@@ -91,7 +96,7 @@ end = struct
 
     let of_bytes bytes = 
     let flag = Char.code (Bytes.get bytes 0) in
-    let (ifCommand, ifLong, ifMore) = ((flag land 4) = 4, (flag land 2) = 2, (flag land 1) = 1) in
+    let ifLong = (flag land 2) = 2 in
         if ifLong then
             (* long-size *)
             raise Not_Implemented
@@ -100,7 +105,7 @@ end = struct
             let length = Char.code (Bytes.get bytes 1) in
                 (* check length *)
                 if (Bytes.length bytes) <> length + 2 then raise Frame_Not_Complete;
-                {flag = Char.chr flag; size = length; body = Bytes.sub bytes 2 (length - 2)}
+                {flag = Char.chr flag; size = length; body = Bytes.sub bytes 2 length}
     
     let if_more t = (Char.code(t.flag) land 1) = 1
     let if_command t = (Char.code(t.flag) land 4) = 4
@@ -113,9 +118,10 @@ module Command : sig
     val get_name : t -> string
     val get_data : t -> bytes
     val of_frame : Frame.t -> t
+    val make_command : string -> bytes -> t
 end = struct
     type t = { name : string; data : bytes }
-    let to_frame t = Frame.make_frame (Bytes.concat Bytes.empty [Bytes.of_string t.name; t.data]) false true 
+    let to_frame t = Frame.make_frame (Bytes.concat Bytes.empty [(Bytes.make 1 (Char.chr (String.length t.name))); Bytes.of_string t.name; t.data]) false true 
     let get_name t = t.name
     let get_data t = t.data
     
@@ -123,6 +129,9 @@ end = struct
     let data = Frame.body frame in
     let name_length = Char.code (Bytes.get data 0) in
         {name = Bytes.sub_string data 1 name_length; data = Bytes.sub data (name_length + 1) ((Bytes.length data) - 1 - name_length)}
+
+    let make_command name data =
+        {name = name; data = data}
 end
 
 module type Socket_type = sig
@@ -156,7 +165,7 @@ module type Connection = sig
     type action =
     | Write of bytes
     | Continue
-    | Close
+    | Close of string
     val connection_fsm : t -> Bytes.t -> t * action list
     val new_connection : unit -> t
 end
@@ -190,13 +199,15 @@ module NULL_mechanism (S: Socket_type) : Security_Mechanism = struct
     let bytes_of_metadata (name, property) = (
         let name_length = String.length name in
         let property_length = String.length property in
-        Bytes.cat (int_to_network_order name_length 4) (Bytes.of_string property)
+            Bytes.cat
+            (Bytes.cat (Bytes.make 1 (Char.chr name_length)) (Bytes.of_string name))
+            (Bytes.cat (int_to_network_order property_length 4) (Bytes.of_string property))
     ) in
     let rec convert_metadata = function
         | [] -> Bytes.empty
         | hd::tl -> Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
     in let name = string_of_socket_type S.socket_type in
-    Frame.to_bytes (Frame.make_frame (Bytes.concat Bytes.empty [(Bytes.make 1 (Char.chr (String.length name))); Bytes.of_string name; convert_metadata S.metadata]) false true)
+        Frame.to_bytes (Command.to_frame (Command.make_command "READY" (convert_metadata S.metadata)))
 
     let fsm (state:t) command =
     let name = Command.get_name command in
@@ -349,32 +360,36 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
     type action =
     | Write of bytes
     | Continue
-    | Close
+    | Close of string
 
     module Greeting = New_Greeting (M)
     
     type t = {
         mutable stage : stage;
         mutable as_server : bool;
-        counter : int;
+        security_policy : string;
+        expected_bytes_length : int;
         greeting_state : Greeting.t;
         handshake_state : M.t;
-        security_policy : string
+        mutable incoming_socket : socket_type;
+        mutable incoming_identity : string;
     }
 
     let new_connection () = {
         stage = GREETING;
         as_server = false;
-        counter = 0;
+        expected_bytes_length = 64; (* A value of 0 means expecting a frame of any length *)
         greeting_state = Greeting.init_state;
         handshake_state = M.init_state;
         (* Set custom policy *)
-        security_policy = M.name
+        security_policy = M.name;
+        incoming_socket = REP;
+        incoming_identity = ""
     }
 
-    let connection_fsm t bytes = 
+    let rec connection_fsm t bytes = 
         match (t.stage) with
-            | GREETING ->   (let len = Bytes.length bytes in
+            | GREETING ->  (let len = Bytes.length bytes in
                             let rec convert greeting_action_list =
                                 match greeting_action_list with
                                     | [] -> []
@@ -383,53 +398,54 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                             | Greeting.Send_bytes(b) -> (Write(b)::(convert tl))
                                             | Greeting.Set_server(b) -> t.as_server <- b; convert tl
                                             (* Assume security mechanism is pre-set*)
-                                            | Greeting.Check_mechanism(s) -> if s <> t.security_policy then 
-                                                                                (Logs.info (fun f -> f "Security Policy mismatch: received (%s) with length %d but expecting (%s) with length %d\n" s (String.length s) t.security_policy (String.length t.security_policy));
-                                                                                [Close])
+                                            | Greeting.Check_mechanism(s) -> if s <> t.security_policy then [Close("Security Policy mismatch")]
                                                                              else convert tl
                                             | Greeting.Continue -> convert tl
                                             | Greeting.Ok -> Logs.info (fun f -> f "Greeting OK\n"); t.stage <- HANDSHAKE; convert tl
-                                            | Greeting.Error(s) -> Logs.info (fun f -> f "Greeting FSM error: %s\n" s);
-                                                                   [Close] in
+                                            | Greeting.Error(s) -> [Close("Greeting FSM error")] in
                             (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54*)
                             match len with
                                 (* Full greeting *)
                                 | 64 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, 
-                                            [Recv_sig(Bytes.sub bytes 0 10); 
-                                             Recv_Vmajor(Bytes.sub bytes 10 1);
-                                             Recv_Vminor(Bytes.sub bytes 11 1);
-                                             Recv_Mechanism(Bytes.sub bytes 12 20);
-                                             Recv_as_server(Bytes.sub bytes 32 1);
-                                             Recv_filler  
+                                            [Greeting.Recv_sig(Bytes.sub bytes 0 10); 
+                                             Greeting.Recv_Vmajor(Bytes.sub bytes 10 1);
+                                             Greeting.Recv_Vminor(Bytes.sub bytes 11 1);
+                                             Greeting.Recv_Mechanism(Bytes.sub bytes 12 20);
+                                             Greeting.Recv_as_server(Bytes.sub bytes 32 1);
+                                             Greeting.Recv_filler  
                                             ]) [] in
                                         let connection_action = convert action_list in 
-                                        ({t with greeting_state = state}, connection_action)
+                                        ({t with greeting_state = state; expected_bytes_length = 0}, connection_action)
                                 (* Signature + version major *)
-                                | 11 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, [Recv_sig(Bytes.sub bytes 0 10); Recv_Vmajor(Bytes.sub bytes 10 1)]) [] in
-                                        ({t with greeting_state = state}, convert action_list)
+                                | 11 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, [Greeting.Recv_sig(Bytes.sub bytes 0 10); Greeting.Recv_Vmajor(Bytes.sub bytes 10 1)]) [] in
+                                        ({t with greeting_state = state; expected_bytes_length = 53}, convert action_list)
                                 (* Signature *)
-                                | 10 -> let (state, action) = Greeting.handle (t.greeting_state, Recv_sig(bytes)) in
-                                        ({t with greeting_state = state}, convert [action])
+                                | 10 -> let (state, action) = Greeting.handle (t.greeting_state, Greeting.Recv_sig(bytes)) in
+                                        ({t with greeting_state = state; expected_bytes_length = 54}, convert [action])
                                 (* version minor + rest *)
                                 | 53 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, 
-                                            [Recv_Vminor(Bytes.sub bytes 0 1);
-                                             Recv_Mechanism(Bytes.sub bytes 1 20);
-                                             Recv_as_server(Bytes.sub bytes 21 1);
-                                             Recv_filler   
+                                            [Greeting.Recv_Vminor(Bytes.sub bytes 0 1);
+                                             Greeting.Recv_Mechanism(Bytes.sub bytes 1 20);
+                                             Greeting.Recv_as_server(Bytes.sub bytes 21 1);
+                                             Greeting.Recv_filler   
                                             ]) [] in
                                         let connection_action = convert action_list in 
-                                        ({t with greeting_state = state}, connection_action)
+                                        ({t with greeting_state = state; expected_bytes_length = 0}, connection_action)
                                 (* version major + rest *)
                                 | 54 -> let (state, action_list) = Greeting.handle_list (t.greeting_state, 
-                                            [Recv_Vmajor(Bytes.sub bytes 0 1);
-                                             Recv_Vminor(Bytes.sub bytes 1 1);
-                                             Recv_Mechanism(Bytes.sub bytes 2 20);
-                                             Recv_as_server(Bytes.sub bytes 22 1);
-                                             Recv_filler   
+                                            [Greeting.Recv_Vmajor(Bytes.sub bytes 0 1);
+                                             Greeting.Recv_Vminor(Bytes.sub bytes 1 1);
+                                             Greeting.Recv_Mechanism(Bytes.sub bytes 2 20);
+                                             Greeting.Recv_as_server(Bytes.sub bytes 22 1);
+                                             Greeting.Recv_filler   
                                             ]) [] in
                                         let connection_action = convert action_list in 
-                                        ({t with greeting_state = state}, connection_action)
-                                | _ ->  (t, [Close])
+                                        ({t with greeting_state = state; expected_bytes_length = 0}, connection_action)
+                                | n -> if n < t.expected_bytes_length then (t, [Close("Message too short")])
+                                       else (let expected_length = t.expected_bytes_length in
+                                            let (new_t_1, action_list_1) = connection_fsm t (Bytes.sub bytes 0 expected_length) in
+                                            let (new_t_2, action_list_2) = connection_fsm new_t_1 (Bytes.sub bytes expected_length (n - expected_length)) in
+                                                (new_t_2, action_list_1 @ action_list_2))
                         )
             | HANDSHAKE -> (let command = Command.of_frame (Frame.of_bytes bytes) in
                             let (new_state, action) = M.fsm t.handshake_state command in
@@ -439,11 +455,12 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                     | (hd::tl) -> (match hd with
                                                     | M.Write(b) -> Write(b)::(convert tl)
                                                     | M.Continue -> Continue::(convert tl)
-                                                    | M.Close -> [Close]
+                                                    | M.Close -> [Close("Handshake FSM error")]
                                                     | M.Received_property(name, value) -> 
                                                         match name with
-                                                            | "Socket-Type" -> convert tl
-                                                            | "Identity" -> convert tl
+                                                            | "Socket-Type" -> (if if_valid_socket_pair S.socket_type (socket_type_from_string value) 
+                                                                               then (t.incoming_socket <- (socket_type_from_string value); convert tl) else [Close("Socket type mismatch")])
+                                                            | "Identity" -> t.incoming_identity <- value; convert tl
                                                             | _ -> Logs.info (fun f -> f "Ignore unknown identity %s\n" name); convert tl
                                                     )
                             in
@@ -454,11 +471,6 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
 end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
-        let buffer_to_string data = 
-        let content = ref [] in
-            Bytes.iter (fun b -> content := Char.code b :: !content) data;
-            String.concat " "  (List.map (fun x -> if (x >= 65 && x <= 90) || (x >= 97 && x <= 122) then String.make 1 (Char.chr x) else string_of_int x)  (List.rev !content))
-
         let connect s port =
         let rec read_and_print flow t = 
             S.TCPV4.read flow >>= (function
@@ -471,13 +483,13 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
                                         | [] -> read_and_print flow new_t
                                         | (hd::tl) -> 
                                         (match hd with
-                                            | C.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n" (Bytes.length b));
+                                            | C.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
                                                             (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
                                                             | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
                                                             | Ok () -> act tl)
                                             | C.Continue -> Logs.info (fun f -> f "Connection FSM Continue\n");
                                                             act tl
-                                            | C.Close -> Logs.info (fun f -> f "Connection FSM Close\n");
+                                            | C.Close(s) -> Logs.info (fun f -> f "Connection FSM Close due to: %s\n" s);
                                                          Lwt.return_unit))
                                 in
                                     act action_list))
@@ -519,6 +531,13 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
             | REQ -> {default_t with socket_type = REQ}
             | DEALER -> {default_t with socket_type = DEALER}
             | ROUTER -> {default_t with socket_type = ROUTER}
+            | PUB  -> {default_t with socket_type = PUB}
+            | XPUB -> {default_t with socket_type = XPUB}
+            | SUB -> {default_t with socket_type = SUB}
+            | XSUB -> {default_t with socket_type = XSUB}
+            | PUSH -> {default_t with socket_type = PUSH}
+            | PULL -> {default_t with socket_type = PULL}
+            | PAIR -> {default_t with socket_type = PAIR}
     
     let bind t port s = 
     let module C = 
@@ -535,11 +554,6 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
     let connect t = raise Not_Implemented
     let set_mechanism t mechanism = ()
 end
-
-
-
-
-
 
 module type Traffic = sig
     type t

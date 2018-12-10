@@ -40,3 +40,4 @@ src/dune
 src/dune-project
 bootstrap/server/network
 merged_src/network
+*.ctf
