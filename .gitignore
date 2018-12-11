@@ -38,6 +38,7 @@ main.ml
 myocamlbuild.ml
 src/dune
 src/dune-project
-bootstrap/server/network
-merged_src/network
 *.ctf
+
+test/**/mirage_zmq.ml
+test/**/mirage_zmq.mli
