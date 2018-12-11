@@ -3,6 +3,7 @@ open Lwt.Infix
 exception Not_Implemented
 exception Frame_Not_Complete
 exception Socket_Name_Not_Recognised
+exception Not_Able_To_Set_Credentials
 
 type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH | PULL | PAIR
 (* CURVE not implemented *)
@@ -172,18 +173,18 @@ end
 
 module type Security_Mechanism = sig
     type t
-    type action = Write of bytes | Continue | Close | Received_property of string * string
+    type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
     val name : string
     val fsm : t -> Command.t -> t * action list
-    val init_state : t
+    val init_state : ?as_server:bool -> t
 end
 
 module NULL_mechanism (S: Socket_type) : Security_Mechanism = struct
     type t = START | OK
-    type action = Write of bytes | Continue | Close | Received_property of string * string
+    type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
     let name = "NULL"
 
-    let init_state = START
+    let init_state ?(as_server=false) = START
 
     let rec extract_metadata bytes = 
     let len = Bytes.length bytes in
@@ -214,18 +215,31 @@ module NULL_mechanism (S: Socket_type) : Security_Mechanism = struct
     let data = Command.get_data command in 
         match state with 
             | START -> (match name with
-                        | "READY" -> (OK, (List.map (fun (name, property) -> Received_property(name, property)) (extract_metadata data)) @ [Write(new_handshake)])
-                        | "ERROR" -> raise Not_Implemented
-                        | _ -> raise Not_Implemented)
+                        | "READY" -> (OK, (List.map (fun (name, property) -> Received_property(name, property)) (extract_metadata data)) @ [Write(new_handshake); Ok])
+                        | "ERROR" -> (OK, [Close])
+                        | _ -> (OK, [Close]))
             | _ -> raise Not_Implemented
 end
 
 module PLAIN_mechanism (S: Socket_type) : Security_Mechanism = struct
-    type t = START | READY | OK
-    type action = Write of bytes | Continue | Close | Received_property of string * string
+    type t = START_SERVER | START_CLIENT | HELLO | WELCOME | INITIATE | READY | OK
+    type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
     let name = "PLAIN"
-    let init_state = START
-    let fsm (state:t) command = raise Not_Implemented
+
+    let init_state ?(as_server = false)= 
+        if as_server then START_SERVER else START_CLIENT
+
+    let fsm state command =
+    let name = Command.get_name command in
+    let data = Command.get_data command in 
+        match state with 
+            | START_SERVER -> 
+            | START_CLIENT ->
+            | HELLO ->
+            | WELCOME ->
+            | INITIATE ->
+            | READY ->
+
 
 end
 
@@ -455,6 +469,7 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                     | (hd::tl) -> (match hd with
                                                     | M.Write(b) -> Write(b)::(convert tl)
                                                     | M.Continue -> Continue::(convert tl)
+                                                    | M.Ok -> Logs.info (fun f -> f "Handshake OK\n"); t.stage <- TRAFFIC; convert tl
                                                     | M.Close -> [Close("Handshake FSM error")]
                                                     | M.Received_property(name, value) -> 
                                                         match name with
@@ -471,12 +486,12 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
 end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
-        let connect s port =
-        let rec read_and_print flow t = 
-            S.TCPV4.read flow >>= (function
-            | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
-            | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
-            | Ok (`Data b) -> (Logs.info (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
+    let listen s port =
+    let rec read_and_print flow t = 
+        S.TCPV4.read flow >>= (function
+        | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
+        | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
+        | Ok (`Data b) -> (Logs.info (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
                                 let (new_t, action_list) = C.connection_fsm t (Cstruct.to_bytes b) in
                                 let rec act actions = 
                                     (match actions with
@@ -493,14 +508,42 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
                                                          Lwt.return_unit))
                                 in
                                     act action_list))
-        in
-            S.listen_tcpv4 s ~port (
-                fun flow ->
-                    let dst, dst_port = S.TCPV4.dst flow in
-                    Logs.info (fun f -> f "new tcp connection from IP %s on port %d" (Ipaddr.V4.to_string dst) dst_port);
-                    read_and_print flow (C.new_connection ())
-            );
-            S.listen s
+    in
+        S.listen_tcpv4 s ~port (
+            fun flow ->
+                let dst, dst_port = S.TCPV4.dst flow in
+                Logs.info (fun f -> f "new tcp connection from IP %s on port %d" (Ipaddr.V4.to_string dst) dst_port);
+                read_and_print flow (C.new_connection ())
+        );
+        S.listen s
+
+    let connect s addr port =
+    let ipaddr = Ipaddr.V4.of_string_exn addr in
+    let rec read_and_print flow t = 
+        S.TCPV4.read flow >>= (function
+        | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
+        | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
+        | Ok (`Data b) -> (Logs.info (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
+                                let (new_t, action_list) = C.connection_fsm t (Cstruct.to_bytes b) in
+                                let rec act actions = 
+                                    (match actions with
+                                        | [] -> read_and_print flow new_t
+                                        | (hd::tl) -> 
+                                        (match hd with
+                                            | C.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                                                            (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
+                                                            | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
+                                                            | Ok () -> act tl)
+                                            | C.Continue -> Logs.info (fun f -> f "Connection FSM Continue\n");
+                                                            act tl
+                                            | C.Close(s) -> Logs.info (fun f -> f "Connection FSM Close due to: %s\n" s);
+                                                         Lwt.return_unit))
+                                in
+                                    act action_list))
+    in
+        S.TCPV4.create_connection s (ipaddr, port) >>= function
+            | Ok(f) -> read_and_print f (C.new_connection ())
+            | Error(e) -> Logs.warn (fun f -> f "Error establishing connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
 end
 
 module Context = struct
@@ -510,34 +553,41 @@ end
 
 module type Socket = sig
     type t
-    val create_socket : Context.t -> socket_type -> t
+    val create_socket : Context.t -> ?mechanism:mechanism_type -> socket_type -> t
+    val set_plain_credentials : t -> string -> string -> t
+    val set_plain_user_list : t -> (string * string) list -> t
 end
 
 module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
     type transport_info = Tcp of string * int
+    type security_info = NA | PLAIN_CLIENT of string * string | PLAIN_SERVER of (string * string) list
     type t = {
         socket_type : socket_type;
         mutable transport_info : transport_info;
-        mutable security_mechanism : mechanism_type
+        security_mechanism : mechanism_type;
+        security_info : security_info
     }
+
     let default_t = {
         socket_type = REP;
         transport_info = Tcp("", 0);
-        security_mechanism = NULL
+        security_mechanism = NULL;
+        security_info = NA
     }
-    let create_socket context socket_type =
+
+    let create_socket context ?(mechanism = NULL) socket_type  =
         match socket_type with
-            | REP -> {default_t with socket_type = REP}
-            | REQ -> {default_t with socket_type = REQ}
-            | DEALER -> {default_t with socket_type = DEALER}
-            | ROUTER -> {default_t with socket_type = ROUTER}
-            | PUB  -> {default_t with socket_type = PUB}
-            | XPUB -> {default_t with socket_type = XPUB}
-            | SUB -> {default_t with socket_type = SUB}
-            | XSUB -> {default_t with socket_type = XSUB}
-            | PUSH -> {default_t with socket_type = PUSH}
-            | PULL -> {default_t with socket_type = PULL}
-            | PAIR -> {default_t with socket_type = PAIR}
+            | REP -> {default_t with socket_type = REP; security_mechanism = mechanism}
+            | REQ -> {default_t with socket_type = REQ; security_mechanism = mechanism}
+            | DEALER -> {default_t with socket_type = DEALER; security_mechanism = mechanism}
+            | ROUTER -> {default_t with socket_type = ROUTER; security_mechanism = mechanism}
+            | PUB  -> {default_t with socket_type = PUB; security_mechanism = mechanism}
+            | XPUB -> {default_t with socket_type = XPUB; security_mechanism = mechanism}
+            | SUB -> {default_t with socket_type = SUB; security_mechanism = mechanism}
+            | XSUB -> {default_t with socket_type = XSUB; security_mechanism = mechanism}
+            | PUSH -> {default_t with socket_type = PUSH; security_mechanism = mechanism}
+            | PULL -> {default_t with socket_type = PULL; security_mechanism = mechanism}
+            | PAIR -> {default_t with socket_type = PAIR; security_mechanism = mechanism}
     
     let bind t port s = 
     let module C = 
@@ -549,10 +599,21 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
                 | _ -> raise Not_Implemented) 
             : Connection) in
     let module C_tcp = Connection_tcp (S) (C) in
-        C_tcp.connect s port
+        C_tcp.listen s port
 
-    let connect t = raise Not_Implemented
-    let set_mechanism t mechanism = ()
+    let connect t ipaddr port s = raise Not_Implemented
+
+    let set_plain_credentials t name password = 
+        if t.security_mechanism = PLAIN then {t with security_info = PLAIN_CLIENT(name, password)}
+        else raise Not_Able_To_Set_Credentials
+    
+    let set_plain_user_list t list = 
+        if t.security_mechanism = PLAIN then {t with security_info = PLAIN_SERVER(list)}
+        else raise Not_Able_To_Set_Credentials
+
+    let recv t = raise Not_Implemented
+
+    let send t = raise Not_Implemented
 end
 
 module type Traffic = sig
