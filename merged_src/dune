@@ -1,1 +1,0 @@
-(library (name mirage_zmq) (libraries lwt mirage-stack-lwt mirage))
