@@ -233,12 +233,13 @@ module PLAIN_mechanism (S: Socket_type) : Security_Mechanism = struct
     let name = Command.get_name command in
     let data = Command.get_data command in 
         match state with 
-            | START_SERVER -> 
-            | START_CLIENT ->
-            | HELLO ->
-            | WELCOME ->
-            | INITIATE ->
-            | READY ->
+            | START_SERVER -> raise Not_Implemented
+            | START_CLIENT -> raise Not_Implemented
+            | HELLO -> raise Not_Implemented
+            | WELCOME -> raise Not_Implemented
+            | INITIATE -> raise Not_Implemented
+            | READY -> raise Not_Implemented
+            | _ -> raise Not_Implemented
 
 
 end
@@ -394,7 +395,7 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
         as_server = false;
         expected_bytes_length = 64; (* A value of 0 means expecting a frame of any length *)
         greeting_state = Greeting.init_state;
-        handshake_state = M.init_state;
+        handshake_state = M.init_state ~as_server:false;
         (* Set custom policy *)
         security_policy = M.name;
         incoming_socket = REP;
@@ -556,6 +557,8 @@ module type Socket = sig
     val create_socket : Context.t -> ?mechanism:mechanism_type -> socket_type -> t
     val set_plain_credentials : t -> string -> string -> t
     val set_plain_user_list : t -> (string * string) list -> t
+    val recv : t -> string
+    val send : t -> unit
 end
 
 module Socket_tcp (S : Mirage_stack_lwt.V4) = struct

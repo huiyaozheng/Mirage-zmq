@@ -1,3 +1,4 @@
+EXCLUDE_QUERY_DIR
 B /Users/Huiyao/.opam/system/lib/astring
 B /Users/Huiyao/.opam/system/lib/bos
 B /Users/Huiyao/.opam/system/lib/bytes
@@ -64,4 +65,4 @@ S /Users/Huiyao/.opam/system/lib/sexplib0
 S /Users/Huiyao/.opam/system/lib/uchar
 S /usr/local/lib/ocaml
 S .
-FLG -open Mirage_zmq__ -w -40
+FLG -w @a-4-29-40-41-42-44-45-48-58-59-60-40 -strict-sequence -strict-formats -short-paths -keep-locs
