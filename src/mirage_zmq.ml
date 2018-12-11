@@ -1,9 +1,11 @@
 open Lwt.Infix
 
 exception Not_Implemented
+exception Should_Not_Reach
 exception Frame_Not_Complete
 exception Socket_Name_Not_Recognised
 exception Not_Able_To_Set_Credentials
+exception Internal_Error of string
 
 type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH | PULL | PAIR
 (* CURVE not implemented *)
@@ -176,15 +178,20 @@ module type Security_Mechanism = sig
     type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
     val name : string
     val fsm : t -> Command.t -> t * action list
-    val init_state : ?as_server:bool -> t
+    val init_state : t
+    val as_server : bool
+    val as_client : bool
+    val client_first_message : bytes
 end
 
 module NULL_mechanism (S: Socket_type) : Security_Mechanism = struct
     type t = START | OK
     type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
     let name = "NULL"
-
-    let init_state ?(as_server=false) = START
+    let init_state = START
+    let as_server = false
+    let as_client = false
+    let client_first_message = Bytes.empty
 
     let rec extract_metadata bytes = 
     let len = Bytes.length bytes in
@@ -210,37 +217,99 @@ module NULL_mechanism (S: Socket_type) : Security_Mechanism = struct
     in let name = string_of_socket_type S.socket_type in
         Frame.to_bytes (Command.to_frame (Command.make_command "READY" (convert_metadata S.metadata)))
 
+    let error error_reason = 
+        Frame.to_bytes (Command.to_frame (Command.make_command "ERROR" (Bytes.cat (Bytes.make 1 (Char.chr (String.length error_reason))) (Bytes.of_string error_reason))))
+
     let fsm (state:t) command =
     let name = Command.get_name command in
     let data = Command.get_data command in 
         match state with 
             | START -> (match name with
                         | "READY" -> (OK, (List.map (fun (name, property) -> Received_property(name, property)) (extract_metadata data)) @ [Write(new_handshake); Ok])
-                        | "ERROR" -> (OK, [Close])
-                        | _ -> (OK, [Close]))
-            | _ -> raise Not_Implemented
+                        | "ERROR" -> (OK, [Write(error "ERROR command received"); Close])
+                        | _ -> (OK, [Write(error "unknown command received"); Close]))
+            | _ -> raise Should_Not_Reach
 end
 
-module PLAIN_mechanism (S: Socket_type) : Security_Mechanism = struct
-    type t = START_SERVER | START_CLIENT | HELLO | WELCOME | INITIATE | READY | OK
+module type PLAIN_mechanism_data = sig
+    type data = Client of string * string | Server of (string * string) list
+    val as_server : bool
+    val data : data
+end
+
+module PLAIN_mechanism (S : Socket_type) (D : PLAIN_mechanism_data) : Security_Mechanism = struct
+    type t = START_SERVER | START_CLIENT | WELCOME | INITIATE | OK
     type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
     let name = "PLAIN"
 
-    let init_state ?(as_server = false)= 
-        if as_server then START_SERVER else START_CLIENT
+    let init_state = 
+        if D.as_server then START_SERVER else START_CLIENT
+
+    let as_server = D.as_server
+    let as_client = not D.as_server
+
+    let client_first_message = 
+        if as_client then raise Not_Implemented
+        else Bytes.empty
+
+    let error error_reason = 
+        Frame.to_bytes (Command.to_frame (Command.make_command "ERROR" (Bytes.cat (Bytes.make 1 (Char.chr (String.length error_reason))) (Bytes.of_string error_reason))))
+
+    let rec extract_metadata bytes = 
+    let len = Bytes.length bytes in
+        if len = 0 then []
+        else 
+            let name_length = Char.code (Bytes.get bytes 0) in
+            let name = Bytes.sub_string bytes 1 name_length in
+            let property_length = network_order_to_int (Bytes.sub bytes (name_length + 1) 4) in
+            let property = Bytes.sub_string bytes (name_length + 1 + 4) property_length in
+                (name, property)::(extract_metadata (Bytes.sub bytes (name_length + 1 + 4 + property_length) (len - (name_length + 1 + 4 + property_length))))
+
+    let rec search name password list =
+        match list with
+            | [] -> false
+            | (n, p)::tl -> (n = name && p = password) || (search name password tl)
+
+    let welcome = 
+        Frame.to_bytes (Command.to_frame (Command.make_command "WELCOME" Bytes.empty))
+
+    let metadata_command command = 
+    let bytes_of_metadata (name, property) = (
+        let name_length = String.length name in
+        let property_length = String.length property in
+            Bytes.cat
+            (Bytes.cat (Bytes.make 1 (Char.chr name_length)) (Bytes.of_string name))
+            (Bytes.cat (int_to_network_order property_length 4) (Bytes.of_string property))
+    ) in
+    let rec convert_metadata = function
+        | [] -> Bytes.empty
+        | hd::tl -> Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
+    in let name = string_of_socket_type S.socket_type in
+        Frame.to_bytes (Command.to_frame (Command.make_command command (convert_metadata S.metadata)))
 
     let fsm state command =
     let name = Command.get_name command in
     let data = Command.get_data command in 
         match state with 
-            | START_SERVER -> raise Not_Implemented
-            | START_CLIENT -> raise Not_Implemented
-            | HELLO -> raise Not_Implemented
-            | WELCOME -> raise Not_Implemented
-            | INITIATE -> raise Not_Implemented
-            | READY -> raise Not_Implemented
-            | _ -> raise Not_Implemented
-
+            | START_SERVER -> if name = "HELLO" then (
+                                let meta_data = extract_metadata data in
+                                match meta_data with | [] -> (OK, [Write(error "Handshake error"); Close])
+                                | (n, name)::tl -> match tl with | [] -> (OK, [Write(error "Handshake error"); Close])
+                                | (p, password)::tl -> match D.data with | Client(_) -> raise (Internal_Error "Server data expected")
+                                | Server(list) ->  
+                                    if search name password list then (WELCOME, [Write(welcome)])
+                                    else (OK, [Write(error "Handshake error"); Close])
+                                ) else (OK, [Write(error "Handshake error"); Close])
+            | START_CLIENT -> if name = "WELCOME" then 
+                                (INITIATE, [Write(metadata_command "INITIATE")])
+                              else raise (Internal_Error "Wrong credentials")
+            | WELCOME -> if name = "INITIATE" then 
+                            (OK, (List.map (fun (name, property) -> Received_property(name, property)) (extract_metadata data)) @ [Write(metadata_command "READY"); Ok]) 
+                        else (OK, [Write(error "Handshake error"); Close])
+            | INITIATE -> if name = "READY" then 
+                            (OK, (List.map (fun (name, property) -> Received_property(name, property)) (extract_metadata data)) @ [Ok]) 
+                        else (OK, [Write(error "Handshake error"); Close])
+            | _ -> raise Should_Not_Reach
 
 end
 
@@ -327,7 +396,7 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
     let to_bytes g = 
         Bytes.concat Bytes.empty [g.signature; g.version.major; g.version.minor; pad_mechanism g.mechanism; if g.as_server then (Bytes.make 1 (Char.chr 1)) else (Bytes.make 1 (Char.chr 0));g.filler]
 
-    let new_greeting mechanism = {signature; version; mechanism; as_server = false; filler}
+    let new_greeting mechanism = {signature; version; mechanism; as_server = M.as_server; filler}
 
     let init_state = START
 
@@ -395,7 +464,7 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
         as_server = false;
         expected_bytes_length = 64; (* A value of 0 means expecting a frame of any length *)
         greeting_state = Greeting.init_state;
-        handshake_state = M.init_state ~as_server:false;
+        handshake_state = M.init_state;
         (* Set custom policy *)
         security_policy = M.name;
         incoming_socket = REP;
@@ -411,13 +480,18 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                     | (hd::tl) ->
                                         match hd with 
                                             | Greeting.Send_bytes(b) -> (Write(b)::(convert tl))
-                                            | Greeting.Set_server(b) -> t.as_server <- b; convert tl
+                                            | Greeting.Set_server(b) -> t.as_server <- b; 
+                                                                        if t.as_server && M.as_server then raise (Internal_Error "Both ends cannot be servers")
+                                                                        else if M.as_client && not t.as_server then raise (Internal_Error "Other end is not a server")
+                                                                        else convert tl
                                             (* Assume security mechanism is pre-set*)
                                             | Greeting.Check_mechanism(s) -> if s <> t.security_policy then [Close("Security Policy mismatch")]
                                                                              else convert tl
                                             | Greeting.Continue -> convert tl
-                                            | Greeting.Ok -> Logs.info (fun f -> f "Greeting OK\n"); t.stage <- HANDSHAKE; convert tl
-                                            | Greeting.Error(s) -> [Close("Greeting FSM error")] in
+                                            | Greeting.Ok -> Logs.info (fun f -> f "Greeting OK\n"); t.stage <- HANDSHAKE; 
+                                                             if M.as_client then Write(M.client_first_message)::(convert tl)
+                                                             else convert tl
+                                            | Greeting.Error(s) -> [Close("Greeting FSM error" ^ s)] in
                             (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54*)
                             match len with
                                 (* Full greeting *)
@@ -458,7 +532,9 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
                                         ({t with greeting_state = state; expected_bytes_length = 0}, connection_action)
                                 | n -> if n < t.expected_bytes_length then (t, [Close("Message too short")])
                                        else (let expected_length = t.expected_bytes_length in
+                                            (* Handle greeting part *)
                                             let (new_t_1, action_list_1) = connection_fsm t (Bytes.sub bytes 0 expected_length) in
+                                            (* Handle handshake part *)
                                             let (new_t_2, action_list_2) = connection_fsm new_t_1 (Bytes.sub bytes expected_length (n - expected_length)) in
                                                 (new_t_2, action_list_1 @ action_list_2))
                         )
@@ -597,7 +673,21 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
         (val (match t.socket_type with
                 | REP ->(match t.security_mechanism with
                             | NULL -> (module New_Connection (REP_socket) (NULL_mechanism (REP_socket)) : Connection)
-                            | PLAIN -> (module New_Connection (REP_socket) (PLAIN_mechanism (REP_socket)) : Connection)
+                            | PLAIN -> match t.security_info with
+                                         | PLAIN_CLIENT(name, password) -> (module New_Connection (REP_socket) (PLAIN_mechanism (REP_socket) (
+                                                                            struct 
+                                                                                type data = Client of string * string | Server of (string * string) list
+                                                                                let as_server = false
+                                                                                let data = Client(name, password)
+                                                                            end 
+                                         )) : Connection)
+                                         | PLAIN_SERVER(list) -> (module New_Connection (REP_socket) (PLAIN_mechanism (REP_socket) (
+                                                                            struct 
+                                                                                type data = Client of string * string | Server of (string * string) list
+                                                                                let as_server = true
+                                                                                let data = Server(list)
+                                                                            end )) : Connection)
+                                         | _ -> raise (Internal_Error "security mechanism mismatch")
                         )
                 | _ -> raise Not_Implemented) 
             : Connection) in
