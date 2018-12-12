@@ -138,26 +138,31 @@ end = struct
 end
 
 module type Socket_type = sig
+    type t
     val socket_type : socket_type
     val metadata : (string * string) list
 end
 
 module REP_socket : Socket_type = struct
+    type t
     let socket_type = REP
     let metadata = [("Socket-Type","REP")]
 end
 
 module REQ : Socket_type = struct
+    type t
     let socket_type = REQ
     let metadata = [("Socket-Type","REQ")]
 end
 
 module DEALER : Socket_type = struct
+    type t
     let socket_type = DEALER
     let metadata = [("Socket-Type","DEALER");("Identity","")]
 end
 
 module ROUTER : Socket_type = struct
+    type t
     let socket_type = ROUTER
     let metadata = [("Socket-Type","ROUTER")]
 end
@@ -618,7 +623,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
                                 in
                                     act action_list))
     in
-        S.TCPV4.create_connection s (ipaddr, port) >>= function
+        S.TCPV4.create_connection (S.tcpv4 s) (ipaddr, port) >>= function
             | Ok(f) -> read_and_print f (C.new_connection ())
             | Error(e) -> Logs.warn (fun f -> f "Error establishing connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
 end
@@ -634,7 +639,7 @@ module type Socket = sig
     val set_plain_credentials : t -> string -> string -> t
     val set_plain_user_list : t -> (string * string) list -> t
     val recv : t -> string
-    val send : t -> unit
+    val send : t -> string -> unit
 end
 
 module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
@@ -692,7 +697,7 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
                 | _ -> raise Not_Implemented) 
             : Connection) in
     let module C_tcp = Connection_tcp (S) (C) in
-        C_tcp.listen s port
+        Lwt.async (fun () -> C_tcp.listen s port)
 
     let connect t ipaddr port s = raise Not_Implemented
 
@@ -706,7 +711,7 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
 
     let recv t = raise Not_Implemented
 
-    let send t = raise Not_Implemented
+    let send t msg = raise Not_Implemented
 end
 
 module type Traffic = sig
