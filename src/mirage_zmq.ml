@@ -219,7 +219,7 @@ module NULL_mechanism (S: Socket_type) : Security_Mechanism = struct
     let rec convert_metadata = function
         | [] -> Bytes.empty
         | hd::tl -> Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
-    in let name = string_of_socket_type S.socket_type in
+    in
         Frame.to_bytes (Command.to_frame (Command.make_command "READY" (convert_metadata S.metadata)))
 
     let error error_reason = 
@@ -289,7 +289,7 @@ module PLAIN_mechanism (S : Socket_type) (D : PLAIN_mechanism_data) : Security_M
     let rec convert_metadata = function
         | [] -> Bytes.empty
         | hd::tl -> Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
-    in let name = string_of_socket_type S.socket_type in
+    in
         Frame.to_bytes (Command.to_frame (Command.make_command command (convert_metadata S.metadata)))
 
     let fsm state command =
@@ -299,8 +299,8 @@ module PLAIN_mechanism (S : Socket_type) (D : PLAIN_mechanism_data) : Security_M
             | START_SERVER -> if name = "HELLO" then (
                                 let meta_data = extract_metadata data in
                                 match meta_data with | [] -> (OK, [Write(error "Handshake error"); Close])
-                                | (n, name)::tl -> match tl with | [] -> (OK, [Write(error "Handshake error"); Close])
-                                | (p, password)::tl -> match D.data with | Client(_) -> raise (Internal_Error "Server data expected")
+                                | (_, name)::tl -> match tl with | [] -> (OK, [Write(error "Handshake error"); Close])
+                                | (_, password)::tl -> match D.data with | Client(_) -> raise (Internal_Error "Server data expected")
                                 | Server(list) ->  
                                     if search name password list then (WELCOME, [Write(welcome)])
                                     else (OK, [Write(error "Handshake error"); Close])
@@ -565,10 +565,16 @@ module New_Connection (S : Socket_type) (M : Security_Mechanism) : Connection = 
             | TRAFFIC -> (t, [])
             | ERROR -> (t, [])
 
+    (* 
+    let send msg = 
+        push_function msg
+    
+    *)        
+
 end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
-    let listen s port =
+    let listen s port socket =
     let rec read_and_print flow t = 
         S.TCPV4.read flow >>= (function
         | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
@@ -595,6 +601,22 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) (C: Connection) = struct
             fun flow ->
                 let dst, dst_port = S.TCPV4.dst flow in
                 Logs.info (fun f -> f "new tcp connection from IP %s on port %d" (Ipaddr.V4.to_string dst) dst_port);
+                let stream, push_function = Lwt_stream.create () in 
+                (* create a stream and pass the ref to the socket
+                
+                
+                Connection.add_mailbox socket (stream, push_function);
+                let process_stream stream = Lwt_stream.get stream >>= function
+                    | Some (action) -> (match action with 
+                                            | Write(b) -> Logs.info (fun f -> f "Connection async Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                                                            (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
+                                                            | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
+                                                            | Ok () -> act tl)
+                                            | Close -> S.disconnect s)
+                    | None -> process_stream stream
+                lwt.join [read_and_print; check stream]
+                *)
+                (* *)
                 read_and_print flow (C.new_connection ())
         );
         S.listen s
@@ -642,7 +664,7 @@ module type Socket = sig
     val send : t -> string -> unit
 end
 
-module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
+module Socket_tcp (S : Mirage_stack_lwt.V4) : Socket = struct
     type transport_info = Tcp of string * int
     type security_info = NA | PLAIN_CLIENT of string * string | PLAIN_SERVER of (string * string) list
     type t = {
@@ -650,6 +672,7 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
         mutable transport_info : transport_info;
         security_mechanism : mechanism_type;
         security_info : security_info
+
     }
 
     let default_t = {
@@ -697,7 +720,7 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) = struct
                 | _ -> raise Not_Implemented) 
             : Connection) in
     let module C_tcp = Connection_tcp (S) (C) in
-        Lwt.async (fun () -> C_tcp.listen s port)
+        Lwt.async (fun () -> C_tcp.listen s port s)
 
     let connect t ipaddr port s = raise Not_Implemented
 
