@@ -341,7 +341,6 @@ module type Greeting = sig
     val handle_list : t * event list -> action list -> t * action list
 end 
 
-(* TODO: as_server determined by socket_type?*)
 module New_Greeting (M : Security_Mechanism) : Greeting = struct
     type t =
         | START
