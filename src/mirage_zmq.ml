@@ -168,7 +168,7 @@ module ROUTER : Socket_type = struct
     let metadata = [("Socket-Type","ROUTER")]
 end
 
-module Security_Mechanism : sig
+module Security_mechanism : sig
     type t
     type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
     type security_data = Null | Client of string * string | Server of (string * string) list
@@ -319,7 +319,7 @@ end = struct
     let as_client t = t.as_client
 end
 
-module type Greeting = sig
+module Greeting : sig 
     type t
     type event =
         | Recv_sig of bytes
@@ -336,13 +336,14 @@ module type Greeting = sig
         | Continue
         | Ok
         | Error of string
-    val init_state : t
-    val handle : t * event -> t * action
-    val handle_list : t * event list -> action list -> t * action list
-end 
-
-module New_Greeting (M : Security_Mechanism) : Greeting = struct
-    type t =
+    (** Initialise a t from a security mechanism to be used *)
+    val init : Security_mechanism.t -> t
+    (** FSM call for handling a single event *)
+    val fsm_single : t -> event -> t * action
+    (** FSM call for handling a list of events. Accumulator is used. *)
+    val fsm : t -> event list -> action list -> t * action list
+end = struct
+    type state =
         | START
         | SIGNATURE
         | VERSION_MAJOR
@@ -351,6 +352,12 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
         | AS_SERVER
         | SUCCESS
         | ERROR
+
+    type t = {
+        security : Security_mechanism.t;
+        state : state;
+    }
+
     type event =
         | Recv_sig of bytes
         | Recv_Vmajor of bytes
@@ -359,6 +366,7 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
         | Recv_as_server of bytes
         | Recv_filler
         | Init of string
+
     type action =
         | Send_bytes of bytes
         | Check_mechanism of string
@@ -366,7 +374,8 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
         | Continue
         | Ok
         | Error of string
-    type version = { major : bytes; minor : bytes}
+
+    type version = {major : bytes; minor : bytes}
 
     type greeting = { 
         signature  : bytes;
@@ -376,67 +385,79 @@ module New_Greeting (M : Security_Mechanism) : Greeting = struct
         filler     : bytes
     }
 
+    (* Start of helper functions *)
+    (** Make the signature bytes *)
     let signature = 
     let s = Bytes.make 10 (Char.chr 0) in
         Bytes.set s 0 (Char.chr 255);
         Bytes.set s 9 (Char.chr 127);
         s
 
+    (** The default version of this implementation is 3.0 (RFC 23/ZMTP) *)
     let version = {major = Bytes.make 1 (Char.chr 3); minor = Bytes.make 1 (Char.chr 0)}
 
-    let filler = Bytes.make 31 (Char.chr 0)
-
+    (** Pad the mechanism string to 20 bytes *)
     let pad_mechanism m =
     let b = Bytes.of_string m in
         if Bytes.length b < 20 then
             Bytes.cat b (Bytes.make (20 - Bytes.length b) (Char.chr 0))
         else
             b
-
+    
+    (** Get the actual mechanism from null padded string *)
     let trim_mechanism m =
     let len = ref (Bytes.length m) in
         while Bytes.get m (!len - 1) = Char.chr 0 do len := !len - 1 done;
         Bytes.sub m 0 (!len)
 
-    let to_bytes g = 
-        Bytes.concat Bytes.empty [g.signature; g.version.major; g.version.minor; pad_mechanism g.mechanism; if g.as_server then (Bytes.make 1 (Char.chr 1)) else (Bytes.make 1 (Char.chr 0));g.filler]
+    (** Makes the filler bytes *)
+    let filler = Bytes.make 31 (Char.chr 0)
+    (** Generates a new greeting *)
+    let new_greeting security = 
+        Bytes.concat Bytes.empty [
+            signature; 
+            version.major; 
+            version.minor; 
+            pad_mechanism (Security_mechanism.get_name_string security); 
+            if Security_mechanism.as_server security then (Bytes.make 1 (Char.chr 1)) else (Bytes.make 1 (Char.chr 0));
+            filler
+        ]
+    (* End of helper functions *)
+    
+    let init security_t = {security = security_t; state = START}    
 
-    let new_greeting mechanism = {signature; version; mechanism; as_server = M.as_server; filler}
-
-    let init_state = START
-
-    let handle (current_state, event) = 
-    match (current_state , event) with
+    let fsm_single t event = 
+    match (t.state , event) with
         | (START, Recv_sig(b)) -> 
             if (Bytes.get b 0) = (Char.chr 255) && (Bytes.get b 9) = (Char.chr 127) 
-            then (SIGNATURE, Send_bytes (new_greeting M.name |> to_bytes)) 
-            else (ERROR, Error("Protocol Signature not detected."))
+            then ({t with state = SIGNATURE}, Send_bytes (new_greeting t.security)) 
+            else ({t with state = ERROR}, Error("Protocol Signature not detected."))
         | (SIGNATURE, Recv_Vmajor(b)) ->
             if (Bytes.get b 0) = (Char.chr 3) 
-            then (VERSION_MAJOR, Continue) 
-            else (ERROR, Error("Version-major is not 3."))
+            then ({t with state = VERSION_MAJOR}, Continue) 
+            else ({t with state = ERROR}, Error("Version-major is not 3."))
         | (VERSION_MAJOR, Recv_Vminor(b)) ->
             if (Bytes.get b 0) = (Char.chr 0) 
-            then (VERSION_MINOR, Continue) 
-            else (ERROR, Error("Version-minor is not 0."))
+            then ({t with state = VERSION_MINOR}, Continue) 
+            else ({t with state = ERROR}, Error("Version-minor is not 0."))
         | (VERSION_MINOR, Recv_Mechanism(b)) ->
-            (MECHANISM, Check_mechanism(Bytes.to_string(trim_mechanism b)))
+            ({t with state = MECHANISM}, Check_mechanism(Bytes.to_string(trim_mechanism b)))
         | (MECHANISM, Recv_as_server(b)) ->
             if (Bytes.get b 0) = (Char.chr 0)
-            then (AS_SERVER, Set_server(false))
-            else (AS_SERVER, Set_server(true))
-        | (AS_SERVER, Recv_filler) -> (SUCCESS, Ok)
-        | _ -> (ERROR, Error("Unexpected event."))
+            then ({t with state = AS_SERVER}, Set_server(false))
+            else ({t with state = AS_SERVER}, Set_server(true))
+        | (AS_SERVER, Recv_filler) -> ({t with state = SUCCESS}, Ok)
+        | _ -> ({t with state = ERROR}, Error("Unexpected event."))
 
-    let rec handle_list (current_state, event_list) action_list =
+    let rec fsm t event_list action_list =
         match event_list with
-            | [] -> (match current_state with 
-                        | ERROR -> (ERROR, [List.hd action_list])
-                        | _ -> (current_state, List.rev action_list))
-            | hd::tl -> match current_state with
-                        | ERROR -> (ERROR, [List.hd action_list])
-                        | _ -> let (new_state, action) = handle (current_state, hd) in
-                            handle_list (new_state, tl) (action::action_list)
+            | [] -> (match t.state with 
+                        | ERROR -> ({t with state = ERROR}, [List.hd action_list])
+                        | _ -> (t, List.rev action_list))
+            | hd::tl -> match t.state with
+                        | ERROR -> ({t with state = ERROR}, [List.hd action_list])
+                        | _ -> let (new_state, action) = fsm_single t hd in
+                                fsm new_state tl (action::action_list)
 end
 
 module Connection : sig 
