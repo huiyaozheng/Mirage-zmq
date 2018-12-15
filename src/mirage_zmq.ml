@@ -6,6 +6,7 @@ exception Frame_Not_Complete
 exception Socket_Name_Not_Recognised
 exception Not_Able_To_Set_Credentials
 exception Internal_Error of string
+exception Incorrect_use_of_API of string
 
 type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH | PULL | PAIR
 (* CURVE not implemented *)
@@ -14,6 +15,8 @@ type socket_metadata = (string * string) list
 type security_data = Null | Plain_client of string * string | Plain_server of (string * string) list
 type connection_stage = | GREETING | HANDSHAKE | TRAFFIC | ERROR
 
+(* Start of helper functions *)
+(** Returns the string of the socket type *)
 let string_of_socket_type = function
     | REQ -> "REQ"
     | REP -> "REP"
@@ -27,6 +30,7 @@ let string_of_socket_type = function
     | PULL -> "PULL"
     | PAIR -> "PAIR"
 
+(** Returns the socket type from string *)
 let socket_type_from_string = function
     | "REQ" -> REQ
     | "REP" -> REP
@@ -41,7 +45,7 @@ let socket_type_from_string = function
     | "PAIR" -> PAIR
     | _ -> raise Socket_Name_Not_Recognised
 
-
+(** Checks if the pair is valid as specified by 23/ZMTP *)
 let if_valid_socket_pair a b =
     match (a,b) with 
         | (REQ, REP) | (REQ, ROUTER)
@@ -56,19 +60,26 @@ let if_valid_socket_pair a b =
         | (PAIR, PAIR) -> true
         | _ -> false 
 
+(** Convert a series of big-endian bytes to int *)
 let rec network_order_to_int bytes = 
     let length = Bytes.length bytes in
         if length = 1 then Char.code (Bytes.get bytes 0)
         else (Char.code (Bytes.get bytes (length - 1))) + (network_order_to_int (Bytes.sub bytes 0 (length - 1))) * 256
 
+(** Convert a int to big-endian bytes of length n *)
 let int_to_network_order n length =
     Bytes.init length (fun i -> (Char.chr (n lsr (8 * (length - i - 1)) land 255)))
 
+(** Converts a byte buffer to printable string *)
 let buffer_to_string data = 
 let content = ref [] in
     Bytes.iter (fun b -> content := Char.code b :: !content) data;
     String.concat " "  (List.map (fun x -> if (x >= 65 && x <= 90) || (x >= 97 && x <= 122) then String.make 1 (Char.chr x) else string_of_int x)  (List.rev !content))
 
+(** Creates a tag for a TCP connection *)
+let tag_of_tcp_connection ipaddr port =
+    String.concat "." ["TCP"; ipaddr; string_of_int port]
+(* End of helper functions *)
 module Frame : sig
     type t
 
@@ -167,11 +178,17 @@ module Context : sig
 
     (** Create a new context *)
     val create_context : unit -> t
+
+    (** Destroy all sockets initialised by the context. All connections will be closed *)
+    val destroy_context : t -> unit
 end = struct
     type t = {options : int}
+    
     let create_context () = {options = 0}
-end
 
+(* TODO close all connections of sockets in the context *)
+    let destroy_context t = ()
+end
 
 module rec Socket_base : sig
     type t
@@ -196,6 +213,9 @@ module rec Socket_base : sig
     
     (** Set password list for PLAIN server *)
     val set_plain_user_list : t -> (string * string) list -> unit
+
+    (** Set identity string of a socket if applicable *)
+    val set_identity : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
     val recv : t -> string
@@ -205,12 +225,27 @@ module rec Socket_base : sig
 
     val add_connection : t -> Connection.t -> unit
 end = struct
+    type socket_states =
+        | NONE
+        | Rep of {if_received : bool;}
+        | Req
+        | Dealer
+        | Router
+        | Pub
+        | Sub
+        | Xpub
+        | Xsub
+        | Push
+        | Pull
+        | Pair
+
     type t = {
         socket_type : socket_type;
-        metadata : socket_metadata;
+        mutable metadata : socket_metadata;
         security_mechanism : mechanism_type;
         mutable security_info : security_data;
         mutable connections : Connection.t list;
+        mutable socket_states : socket_states
     }
 
     let get_socket_type t = t.socket_type
@@ -223,10 +258,40 @@ end = struct
 
     let create_socket context ?(mechanism=NULL) socket_type = 
         match socket_type with 
-            | REP -> {socket_type = socket_type; metadata = [("Socket-Type","REP")]; security_mechanism = mechanism; security_info = Null; connections = []}
-            | REQ -> {socket_type = socket_type; metadata = [("Socket-Type","REQ")]; security_mechanism = mechanism; security_info = Null; connections = []}
-            | DEALER -> {socket_type = socket_type; metadata = [("Socket-Type","DEALER");("Identity","")]; security_mechanism = mechanism; security_info = Null; connections = []}
-            | ROUTER -> {socket_type = socket_type; metadata = [("Socket-Type","ROUTER")]; security_mechanism = mechanism; security_info = Null; connections = []}
+            | REP -> {
+                socket_type = socket_type; 
+                metadata = [("Socket-Type","REP")]; 
+                security_mechanism = mechanism; 
+                security_info = Null; 
+                connections = [];
+                socket_states = Rep({
+                    if_received = false;
+                    });
+                }
+            | REQ -> {
+                socket_type = socket_type; 
+                metadata = [("Socket-Type","REQ")]; 
+                security_mechanism = mechanism; 
+                security_info = Null; 
+                connections = [];
+                socket_states = Req;
+                }
+            | DEALER -> {
+                socket_type = socket_type; 
+                metadata = [("Socket-Type","DEALER");("Identity","")]; 
+                security_mechanism = mechanism; 
+                security_info = Null; 
+                connections = [];
+                socket_states = Dealer;
+                }
+            | ROUTER -> {
+                socket_type = socket_type; 
+                metadata = [("Socket-Type","ROUTER")]; 
+                security_mechanism = mechanism; 
+                security_info = Null; 
+                connections = [];
+                socket_states = Router
+                }
             | _ -> raise Not_Implemented
     
     let set_plain_credentials t name password = 
@@ -237,11 +302,33 @@ end = struct
         if t.security_mechanism = PLAIN then t.security_info <- Plain_server(list)
         else raise Not_Able_To_Set_Credentials
 
+    let set_identity t identity =
+        if t.socket_type = DEALER then (
+            let set (name, value) = if name = "Identity" then (name, identity) else (name, value) in
+                t.metadata <- List.map set t.metadata
+        )
+        else ()
+
     let recv t = match t.socket_type with 
-        | REP -> 
+        | REP -> (let state = t.socket_states in
+                    match state with
+                        | Rep({if_received = if_received}) -> (
+                            "Hi"
+                        )
+                        | _ -> raise (Internal_Error "Socket states mismatches with socket type")
+                )
         | _ -> raise Not_Implemented
 
-    let send t msg = raise Not_Implemented
+    let send t msg = match t.socket_type with
+        | REP -> (let state = t.socket_states in
+                    match state with
+                        | Rep({if_received = if_received}) -> (
+                            if not if_received then raise (Incorrect_use_of_API "Need to receive from a REP before sending a message")
+                            else ()
+                        )
+                        | _ -> raise (Internal_Error "Socket states mismatches with socket type")
+                )
+        | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
 
@@ -556,8 +643,12 @@ and Connection : sig
     | Close of string
 
     (** Create a new connection for socket with specified security mechanism *)
-    val init : Socket_base.t -> Security_mechanism.t -> t
+    val init : Socket_base.t -> Security_mechanism.t -> string -> t
 
+    (** Get the unique tag used to identify the connection *)
+    val get_tag : t -> string
+
+    (** Get the stage of the connection. It is considered usable if in TRAFFIC *)
     val get_stage : t -> connection_stage
     
     (** FSM for handing raw bytes transmission *)
@@ -567,6 +658,7 @@ end = struct
     type action = | Write of bytes | Continue | Close of string
     
     type t = {
+        tag : string;
         socket : Socket_base.t;
         greeting_state : Greeting.t;
         handshake_state : Security_mechanism.t;
@@ -579,8 +671,9 @@ end = struct
         push_function : Frame.t option -> unit;
     }
 
-    let init socket security_mechanism  = 
+    let init socket security_mechanism tag = 
     let stream, pf = Lwt_stream.create () in {
+        tag = tag;
         socket = socket;
         greeting_state = Greeting.init security_mechanism;
         handshake_state = security_mechanism;
@@ -592,6 +685,8 @@ end = struct
         read_buffer = stream;
         push_function = pf;
     }
+
+    let get_tag t = t.tag
 
     let get_stage t = t.stage
 
@@ -694,7 +789,7 @@ end = struct
 end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
-    let listen s port connection =
+    let listen s port socket =
     let rec read_and_print flow t = 
         S.TCPV4.read flow >>= (function
         | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
@@ -721,7 +816,8 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
             fun flow ->
                 let dst, dst_port = S.TCPV4.dst flow in
                 Logs.info (fun f -> f "new tcp connection from IP %s on port %d" (Ipaddr.V4.to_string dst) dst_port);
-                
+                let connection = Connection.init socket (Security_mechanism.init (Socket_base.get_security_data socket) (Socket_base.get_metadata socket)) (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port)in
+                Socket_base.add_connection socket connection;
                 (* create a stream and pass the ref to the socket
                 let stream, push_function = Lwt_stream.create () in 
                 
@@ -781,6 +877,9 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
     
     (** Set password list for PLAIN server *)
     val set_plain_user_list : t -> (string * string) list -> unit
+
+    (** Set identity string of a socket if applicable *)
+    val set_identity : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the  semantics of the socket type *)
     val recv : t -> string
@@ -809,6 +908,9 @@ end = struct
 
     let set_plain_user_list t list = 
         Socket_base.set_plain_user_list t.socket list
+
+    let set_identity t identity =
+        Socket_base.set_identity t.socket identity
     
     let recv t =
         Socket_base.recv t.socket
@@ -818,9 +920,11 @@ end = struct
     
     let bind t port s = 
     let module C_tcp = Connection_tcp (S) in
-    let connection = Connection.init t.socket (Security_mechanism.init (Socket_base.get_security_data t.socket) (Socket_base.get_metadata t.socket)) in
-        Socket_base.add_connection t.socket connection;
-        Lwt.async (fun () -> C_tcp.listen s port connection)
+        Lwt.async (fun () -> C_tcp.listen s port t.socket)
 
-    let connect t ipaddr port s = raise Not_Implemented
+    let connect t ipaddr port s = 
+    let module C_tcp = Connection_tcp (S) in
+    let connection = Connection.init t.socket (Security_mechanism.init (Socket_base.get_security_data t.socket) (Socket_base.get_metadata t.socket)) (tag_of_tcp_connection ipaddr port) in
+        Socket_base.add_connection t.socket connection;
+        raise Not_Implemented
 end

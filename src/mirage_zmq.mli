@@ -21,6 +21,9 @@ module Socket_tcp : functor (S : Mirage_stack_lwt.V4) -> sig
     
     (** Set password list for PLAIN server *)
     val set_plain_user_list : t -> (string * string) list -> unit
+
+    (** Set identity string of a socket if applicable *)
+    val set_identity : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
     val recv : t -> string
