@@ -11,6 +11,8 @@ type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH 
 (* CURVE not implemented *)
 type mechanism_type = NULL | PLAIN
 type socket_metadata = (string * string) list
+type security_data = Null | Plain_client of string * string | Plain_server of (string * string) list
+type connection_stage = | GREETING | HANDSHAKE | TRAFFIC | ERROR
 
 let string_of_socket_type = function
     | REQ -> "REQ"
@@ -72,14 +74,19 @@ module Frame : sig
 
     (** make_frame body ifMore ifCommand *)
     val make_frame : bytes -> if_more : bool -> if_command : bool -> t
+    
     (** Convert a frame to raw bytes *)
     val to_bytes : t -> bytes
+    
     (** Construct a frame from raw bytes *)
     val of_bytes : bytes -> t
+    
     (** Get if_more field from a frame *)
     val get_if_more : t -> bool
+    
     (** Get if_command field from a frame *)
     val get_if_command : t -> bool
+    
     (** Get body from a frame *)
     val get_body : t -> bytes
 end = struct
@@ -129,12 +136,16 @@ module Command : sig
 
     (** Convert a command to a frame *)
     val to_frame : t -> Frame.t
+    
     (** Get name of the command (without length byte) *)
     val get_name : t -> string
+    
     (** Get data of the command *)
     val get_data : t -> bytes
+    
     (** Construct a command from the enclosing frame *)
     val of_frame : Frame.t -> t
+    
     (** Construct a command from given name and data *)
     val make_command : string -> bytes -> t
 end = struct
@@ -162,33 +173,44 @@ end = struct
 end
 
 
-module Socket_base : sig
+module rec Socket_base : sig
     type t
 
     (** Get the type of the socket *)
     val get_socket_type : t -> socket_type
+    
     (** Get the metadata of the socket for handshake *)
     val get_metadata : t -> socket_metadata
+    
     (** Get the security mechanism of the socket *)
     val get_mechanism : t -> mechanism_type
+
+    (** Get the security credentials of the socket *)
+    val get_security_data : t -> security_data
+    
     (** Create a socket from the given context, mechanism and type *)
     val create_socket : Context.t -> ?mechanism:mechanism_type -> socket_type -> t
+    
     (** Set username and password for PLAIN client *)
     val set_plain_credentials : t -> string -> string -> unit
+    
     (** Set password list for PLAIN server *)
     val set_plain_user_list : t -> (string * string) list -> unit
+    
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
     val recv : t -> string
+    
     (** Send a msg to the underlying connections, according to the semantics of the socket type *)
     val send : t -> string -> unit
 
+    val add_connection : t -> Connection.t -> unit
 end = struct
-    type security_info = NA | PLAIN_CLIENT of string * string | PLAIN_SERVER of (string * string) list
     type t = {
         socket_type : socket_type;
         metadata : socket_metadata;
         security_mechanism : mechanism_type;
-        mutable security_info : security_info;
+        mutable security_info : security_data;
+        mutable connections : Connection.t list;
     }
 
     let get_socket_type t = t.socket_type
@@ -197,48 +219,58 @@ end = struct
 
     let get_mechanism t = t.security_mechanism
     
+    let get_security_data t = t.security_info
+
     let create_socket context ?(mechanism=NULL) socket_type = 
         match socket_type with 
-            | REP -> {socket_type = socket_type; metadata = [("Socket-Type","REP")]; security_mechanism = mechanism; security_info = NA;}
-            | REQ -> {socket_type = socket_type; metadata = [("Socket-Type","REQ")]; security_mechanism = mechanism; security_info = NA;}
-            | DEALER -> {socket_type = socket_type; metadata = [("Socket-Type","DEALER");("Identity","")]; security_mechanism = mechanism; security_info = NA;}
-            | ROUTER -> {socket_type = socket_type; metadata = [("Socket-Type","ROUTER")]; security_mechanism = mechanism; security_info = NA;}
+            | REP -> {socket_type = socket_type; metadata = [("Socket-Type","REP")]; security_mechanism = mechanism; security_info = Null; connections = []}
+            | REQ -> {socket_type = socket_type; metadata = [("Socket-Type","REQ")]; security_mechanism = mechanism; security_info = Null; connections = []}
+            | DEALER -> {socket_type = socket_type; metadata = [("Socket-Type","DEALER");("Identity","")]; security_mechanism = mechanism; security_info = Null; connections = []}
+            | ROUTER -> {socket_type = socket_type; metadata = [("Socket-Type","ROUTER")]; security_mechanism = mechanism; security_info = Null; connections = []}
             | _ -> raise Not_Implemented
     
     let set_plain_credentials t name password = 
-        if t.security_mechanism = PLAIN then t.security_info <- PLAIN_CLIENT(name, password)
+        if t.security_mechanism = PLAIN then t.security_info <- Plain_client(name, password)
         else raise Not_Able_To_Set_Credentials
     
     let set_plain_user_list t list = 
-        if t.security_mechanism = PLAIN then t.security_info <- PLAIN_SERVER(list)
+        if t.security_mechanism = PLAIN then t.security_info <- Plain_server(list)
         else raise Not_Able_To_Set_Credentials
 
-    let recv t = raise Not_Implemented
+    let recv t = match t.socket_type with 
+        | REP -> 
+        | _ -> raise Not_Implemented
 
     let send t msg = raise Not_Implemented
+
+    let add_connection t connection = t.connections <- (t.connections@[connection])
+
 end
 
-module Security_mechanism : sig
+and Security_mechanism : sig
     type t
     type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
-    type security_data = Null | Client of string * string | Server of (string * string) list
-
+    
     (** Get the string description of the mechanism *)
     val get_name_string : t -> string
+    
     (** Whether the socket is a PLAIN server (always false if mechanism is NULL) *)
     val get_as_server : t -> bool
+    
     (** Whether the socket is a PLAIN client (always false if mechanism is NULL) *)
     val get_as_client : t -> bool
+    
     (** Initialise a t from security mechanism data and socket metadata *)
     val init : security_data -> socket_metadata -> t
+    
     (** If the socket is a PLAIN mechanism client, it needs to send the HELLO command first *)
     val client_first_message : t -> bytes
+    
     (** FSM for handling the handshake *)
     val fsm : t -> Command.t -> t * action list
 end = struct
     type state = START | START_SERVER | START_CLIENT | WELCOME | INITIATE | OK
     type action = Write of bytes | Continue | Close | Received_property of string * string | Ok
-    type security_data = Null | Client of string * string | Server of (string * string) list
 
     type t = {
         mechanism_type : mechanism_type;
@@ -282,7 +314,7 @@ end = struct
         Frame.to_bytes (Command.to_frame (Command.make_command "HELLO" (Bytes.concat Bytes.empty [Bytes.make 1 (Char.chr (String.length username));Bytes.of_string username;Bytes.make 1 (Char.chr (String.length password));Bytes.of_string password])))
 
     (** Makes a new handshake for NULL mechanism *)
-    let new_handshake_null = 
+    let new_handshake_null metadata = 
     let bytes_of_metadata (name, property) = (
         let name_length = String.length name in
         let property_length = String.length property in
@@ -294,7 +326,7 @@ end = struct
         | [] -> Bytes.empty
         | hd::tl -> Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
     in
-        Frame.to_bytes (Command.to_frame (Command.make_command "READY" (convert_metadata S.metadata)))
+        Frame.to_bytes (Command.to_frame (Command.make_command "READY" (convert_metadata metadata)))
 
     (** Makes a metadata command (command = "INITIATE"/"READY") for PLAIN mechanism *)
     let metadata_command command metadata = 
@@ -321,15 +353,15 @@ end = struct
 
     let init security_data socket_metadata = match security_data with
         | Null -> {mechanism_type = NULL; socket_metadata = socket_metadata; state = START; data = security_data; as_server = false; as_client = false;}
-        | Client(_) -> {mechanism_type = PLAIN; socket_metadata = socket_metadata; state = START_CLIENT; data = security_data; as_server = false; as_client = true;}
-        | Server(_) -> {mechanism_type = PLAIN; socket_metadata = socket_metadata; state = START_SERVER; data = security_data; as_server = true; as_client = false;}
+        | Plain_client(_) -> {mechanism_type = PLAIN; socket_metadata = socket_metadata; state = START_CLIENT; data = security_data; as_server = false; as_client = true;}
+        | Plain_server(_) -> {mechanism_type = PLAIN; socket_metadata = socket_metadata; state = START_SERVER; data = security_data; as_server = true; as_client = false;}
 
     let client_first_message t =
         match t.mechanism_type with 
             | NULL -> Bytes.empty
             | PLAIN -> if t. as_client then 
                             match t.data with 
-                                | Client(u, p) -> hello u p
+                                | Plain_client(u, p) -> hello u p
                                 | _ -> raise (Internal_Error "Security mechanism mismatch")
                         else Bytes.empty
 
@@ -339,7 +371,7 @@ end = struct
         match t.mechanism_type with 
             | NULL -> (match t.state with 
                         | START -> (match name with
-                                    | "READY" -> ({t with state = OK}, (List.map (fun (name, property) -> Received_property(name, property)) (extract_metadata data)) @ [Write(new_handshake_null); Ok])
+                                    | "READY" -> ({t with state = OK}, (List.map (fun (name, property) -> Received_property(name, property)) (extract_metadata data)) @ [Write(new_handshake_null t.socket_metadata); Ok])
                                     | "ERROR" -> ({t with state = OK}, [Write(error "ERROR command received"); Close])
                                     | _ -> ({t with state = OK}, [Write(error "unknown command received"); Close]))
                         | _ -> raise Should_Not_Reach)
@@ -348,8 +380,8 @@ end = struct
                                 if name = "HELLO" then (
                                     let (username, password) = extract_username_password data in
                                         match t.data with 
-                                            | Client(_) -> raise (Internal_Error "Server data expected")
-                                            | Server(list) ->  
+                                            | Plain_client(_) -> raise (Internal_Error "Server data expected")
+                                            | Plain_server(list) ->  
                                                 if search (Bytes.to_string username) (Bytes.to_string password) list then ({t with state = WELCOME}, [Write(welcome)])
                                                 else ({t with state = OK}, [Write(error "Handshake error"); Close])
                                             | _ -> raise (Internal_Error "Security type mismatch")
@@ -369,7 +401,7 @@ end = struct
     let get_as_client t = t.as_client
 end
 
-module Greeting : sig 
+and Greeting : sig 
     type t
     type event =
         | Recv_sig of bytes
@@ -389,8 +421,10 @@ module Greeting : sig
 
     (** Initialise a t from a security mechanism to be used *)
     val init : Security_mechanism.t -> t
+    
     (** FSM call for handling a single event *)
     val fsm_single : t -> event -> t * action
+    
     (** FSM call for handling a list of events. *)
     val fsm : t -> event list -> t * action list
 end = struct
@@ -463,6 +497,7 @@ end = struct
 
     (** Makes the filler bytes *)
     let filler = Bytes.make 31 (Char.chr 0)
+    
     (** Generates a new greeting *)
     let new_greeting security = 
         Bytes.concat Bytes.empty [
@@ -470,7 +505,7 @@ end = struct
             version.major; 
             version.minor; 
             pad_mechanism (Security_mechanism.get_name_string security); 
-            if Security_mechanism.as_server security then (Bytes.make 1 (Char.chr 1)) else (Bytes.make 1 (Char.chr 0));
+            if Security_mechanism.get_as_server security then (Bytes.make 1 (Char.chr 1)) else (Bytes.make 1 (Char.chr 0));
             filler
         ]
     (* End of helper functions *)
@@ -513,8 +548,7 @@ end = struct
     in fsm_accumulator t event_list []
 end
 
-module Connection : sig 
-    type stage
+and Connection : sig 
     type t
     type action =
     | Write of bytes
@@ -523,10 +557,12 @@ module Connection : sig
 
     (** Create a new connection for socket with specified security mechanism *)
     val init : Socket_base.t -> Security_mechanism.t -> t
+
+    val get_stage : t -> connection_stage
+    
     (** FSM for handing raw bytes transmission *)
     val fsm : t -> Bytes.t -> t * action list
 end = struct 
-    type stage = | GREETING | HANDSHAKE | TRAFFIC | ERROR
 
     type action = | Write of bytes | Continue | Close of string
     
@@ -534,14 +570,17 @@ end = struct
         socket : Socket_base.t;
         greeting_state : Greeting.t;
         handshake_state : Security_mechanism.t;
-        mutable stage : stage;
+        mutable stage : connection_stage;
         expected_bytes_length : int;
         mutable incoming_as_server : bool;
         mutable incoming_socket_type : socket_type;
         mutable incoming_identity : string;
+        read_buffer : Frame.t Lwt_stream.t;
+        push_function : Frame.t option -> unit;
     }
 
-    let init socket security_mechanism  = {
+    let init socket security_mechanism  = 
+    let stream, pf = Lwt_stream.create () in {
         socket = socket;
         greeting_state = Greeting.init security_mechanism;
         handshake_state = security_mechanism;
@@ -549,8 +588,12 @@ end = struct
         expected_bytes_length = 64; (* A value of 0 means expecting a frame of any length; starting with expectint the whole greeting *)
         incoming_socket_type = REP;
         incoming_as_server = false;
-        incoming_identity = ""
+        incoming_identity = "";
+        read_buffer = stream;
+        push_function = pf;
     }
+
+    let get_stage t = t.stage
 
     let rec fsm t bytes = 
         match t.stage with
@@ -638,7 +681,8 @@ end = struct
                                                     )
                             in
                             ({t with handshake_state = new_state}, convert action))
-            | TRAFFIC -> (t, [])
+            | TRAFFIC -> let frame = Frame.of_bytes in
+                            (t, [])
             | ERROR -> (t, [])
 
     (* 
@@ -650,7 +694,7 @@ end = struct
 end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
-    let listen s port socket =
+    let listen s port connection =
     let rec read_and_print flow t = 
         S.TCPV4.read flow >>= (function
         | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
@@ -693,59 +737,71 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                 lwt.join [read_and_print; check stream]
                 *)
                 (* *)
-                read_and_print flow (Connection.init socket (Socket_base.get_mechanism socket))
+                read_and_print flow connection
         );
         S.listen s
 
-    let connect s addr port =
+    let connect s addr port connection =
     let ipaddr = Ipaddr.V4.of_string_exn addr in
     let rec read_and_print flow t = 
         S.TCPV4.read flow >>= (function
         | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
         | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
         | Ok (`Data b) -> (Logs.info (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
-                                let (new_t, action_list) = C.connection_fsm t (Cstruct.to_bytes b) in
+                                let (new_t, action_list) = Connection.fsm t (Cstruct.to_bytes b) in
                                 let rec act actions = 
                                     (match actions with
                                         | [] -> read_and_print flow new_t
                                         | (hd::tl) -> 
                                         (match hd with
-                                            | C.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                                            | Connection.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
                                                             (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
                                                             | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
                                                             | Ok () -> act tl)
-                                            | C.Continue -> Logs.info (fun f -> f "Connection FSM Continue\n");
+                                            | Connection.Continue -> Logs.info (fun f -> f "Connection FSM Continue\n");
                                                             act tl
-                                            | C.Close(s) -> Logs.info (fun f -> f "Connection FSM Close due to: %s\n" s);
+                                            | Connection.Close(s) -> Logs.info (fun f -> f "Connection FSM Close due to: %s\n" s);
                                                          Lwt.return_unit))
                                 in
                                     act action_list))
     in
         S.TCPV4.create_connection (S.tcpv4 s) (ipaddr, port) >>= function
-            | Ok(f) -> read_and_print f (C.new_connection ())
+            | Ok(f) -> read_and_print f connection
             | Error(e) -> Logs.warn (fun f -> f "Error establishing connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
 end
 
 module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
     type t
+
+    (** Create a socket from the given context, mechanism and type *)
     val create_socket : Context.t -> ?mechanism:mechanism_type -> socket_type -> t
+    
+    (** Set username and password for PLAIN client *)
     val set_plain_credentials : t -> string -> string -> unit
+    
+    (** Set password list for PLAIN server *)
     val set_plain_user_list : t -> (string * string) list -> unit
+    
+    (** Receive a msg from the underlying connections, according to the  semantics of the socket type *)
     val recv : t -> string
+    
+    (** Send a msg to the underlying connections, according to the semantics of the socket type *)
     val send : t -> string -> unit
+    
+    (** Bind a local TCP port to the socket so the socket will accept incoming connections *)
     val bind : t -> int -> S.t -> unit
+    
+    (** Bind a connection to a remote TCP port to the socket *)
     val connect : t -> string -> int -> S.t -> unit
 end = struct
     type transport_info = Tcp of string * int
 
     type t = {
         socket : Socket_base.t;
-        transport_info : transport_info;
     }
 
     let create_socket context ?(mechanism = NULL) socket_type = {
         socket = Socket_base.create_socket context ~mechanism socket_type;
-        transport_info = Tcp("", 0);
     }
         
     let set_plain_credentials t username password = 
@@ -761,30 +817,10 @@ end = struct
         Socket_base.send t.socket msg
     
     let bind t port s = 
-    let module C = 
-        (val (match t.socket_type with
-                | REP ->(match t.security_mechanism with
-                            | NULL -> (module New_Connection (REP_socket) (NULL_mechanism (REP_socket)) : Connection)
-                            | PLAIN -> match t.security_info with
-                                         | PLAIN_CLIENT(name, password) -> (module New_Connection (REP_socket) (PLAIN_mechanism (REP_socket) (
-                                                                            struct 
-                                                                                type data = Client of string * string | Server of (string * string) list
-                                                                                let as_server = false
-                                                                                let data = Client(name, password)
-                                                                            end 
-                                         )) : Connection)
-                                         | PLAIN_SERVER(list) -> (module New_Connection (REP_socket) (PLAIN_mechanism (REP_socket) (
-                                                                            struct 
-                                                                                type data = Client of string * string | Server of (string * string) list
-                                                                                let as_server = true
-                                                                                let data = Server(list)
-                                                                            end )) : Connection)
-                                         | _ -> raise (Internal_Error "security mechanism mismatch")
-                        )
-                | _ -> raise Not_Implemented) 
-            : Connection) in
-    let module C_tcp = Connection_tcp (S) (C) in
-        Lwt.async (fun () -> C_tcp.listen s port s)
+    let module C_tcp = Connection_tcp (S) in
+    let connection = Connection.init t.socket (Security_mechanism.init (Socket_base.get_security_data t.socket) (Socket_base.get_metadata t.socket)) in
+        Socket_base.add_connection t.socket connection;
+        Lwt.async (fun () -> C_tcp.listen s port connection)
 
     let connect t ipaddr port s = raise Not_Implemented
 end
