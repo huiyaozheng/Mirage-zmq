@@ -26,7 +26,7 @@ module Socket_tcp : functor (S : Mirage_stack_lwt.V4) -> sig
     val set_identity : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
-    val recv : t -> string
+    val recv : t -> string Lwt.t
     
     (** Send a msg to the underlying connections, according to the semantics of the socket type *)
     val send : t -> string -> unit

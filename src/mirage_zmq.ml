@@ -218,7 +218,7 @@ module rec Socket_base : sig
     val set_identity : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
-    val recv : t -> string
+    val recv : t -> string Lwt.t
     
     (** Send a msg to the underlying connections, according to the semantics of the socket type *)
     val send : t -> string -> unit
@@ -227,7 +227,7 @@ module rec Socket_base : sig
 end = struct
     type socket_states =
         | NONE
-        | Rep of {if_received : bool;}
+        | Rep of {if_received : bool; last_received_connection_tag : string;}
         | Req
         | Dealer
         | Router
@@ -266,6 +266,7 @@ end = struct
                 connections = [];
                 socket_states = Rep({
                     if_received = false;
+                    last_received_connection_tag = "";
                     });
                 }
             | REQ -> {
@@ -309,11 +310,20 @@ end = struct
         )
         else ()
 
-    let recv t = match t.socket_type with 
+    let rec recv t = match t.socket_type with 
         | REP -> (let state = t.socket_states in
                     match state with
-                        | Rep({if_received = if_received}) -> (
-                            "Hi"
+                        | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
+                          (* Need to receive in a fair-queuing manner *)
+                          (* If no connection in the list, wait for an incoming connection *)
+                          if t.connections = [] then Lwt.pause() >>= fun () -> recv t else 
+                          (* Go through the list of connections and check buffer *)
+                          let check_buffer connection = 
+                            (let buffer = Connection.get_buffer connection in
+                                Lwt_stream.peek buffer >>= fun x -> Lwt.return x 
+                            )
+                          in 
+                          Lwt.return ""
                         )
                         | _ -> raise (Internal_Error "Socket states mismatches with socket type")
                 )
@@ -322,7 +332,7 @@ end = struct
     let send t msg = match t.socket_type with
         | REP -> (let state = t.socket_states in
                     match state with
-                        | Rep({if_received = if_received}) -> (
+                        | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
                             if not if_received then raise (Incorrect_use_of_API "Need to receive from a REP before sending a message")
                             else ()
                         )
@@ -648,6 +658,9 @@ and Connection : sig
     (** Get the unique tag used to identify the connection *)
     val get_tag : t -> string
 
+    (** Get the read buffer of the connection *)
+    val get_buffer : t -> Frame.t Lwt_stream.t
+
     (** Get the stage of the connection. It is considered usable if in TRAFFIC *)
     val get_stage : t -> connection_stage
     
@@ -689,6 +702,8 @@ end = struct
     let get_tag t = t.tag
 
     let get_stage t = t.stage
+
+    let get_buffer t = t.read_buffer
 
     let rec fsm t bytes = 
         match t.stage with
@@ -882,7 +897,7 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
     val set_identity : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the  semantics of the socket type *)
-    val recv : t -> string
+    val recv : t -> string Lwt.t
     
     (** Send a msg to the underlying connections, according to the semantics of the socket type *)
     val send : t -> string -> unit
