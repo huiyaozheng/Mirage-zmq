@@ -2,7 +2,6 @@ open Lwt.Infix
 
 exception Not_Implemented
 exception Should_Not_Reach
-exception Frame_Not_Complete
 exception Socket_Name_Not_Recognised
 exception Not_Able_To_Set_Credentials
 exception Internal_Error of string
@@ -91,6 +90,9 @@ module Frame : sig
     
     (** Construct a frame from raw bytes *)
     val of_bytes : bytes -> t
+
+    (** Construct a list of frames from raw bytes; used when potentially many frames in received buffer *)
+    val list_of_bytes : bytes -> t list
     
     (** Get if_more field from a frame *)
     val get_if_more : t -> bool
@@ -125,6 +127,7 @@ end = struct
 
     let of_bytes bytes = 
     let flag = Char.code (Bytes.get bytes 0) in
+    let total_length = Bytes.length bytes in
     let if_long = (flag land 2) = 2 in
         if if_long then
             (* long-size *)
@@ -132,10 +135,22 @@ end = struct
             raise Not_Implemented
         else
             (* short-size *)
-            let length = Char.code (Bytes.get bytes 1) in
+            let content_length = Char.code (Bytes.get bytes 1) in
                 (* check length *)
-                if (Bytes.length bytes) <> length + 2 then raise Frame_Not_Complete;
-                {flag = Char.chr flag; size = length; body = Bytes.sub bytes 2 length}
+                if total_length < content_length + 2 then raise (Internal_Error "Not a complete frame buffer")
+                else if total_length > content_length + 2 then raise (Internal_Error "More than one frame in the buffer")
+                else {flag = Char.chr flag; size = content_length; body = Bytes.sub bytes 2 content_length}
+
+    let list_of_bytes bytes = 
+    let rec list_of_bytes_accumu bytes list = (
+        let total_length = Bytes.length bytes in
+        let content_length = Char.code (Bytes.get bytes 1) in
+            if total_length < content_length + 2 then raise (Internal_Error "Not a complete frame buffer")
+            else list_of_bytes_accumu (Bytes.sub bytes (content_length + 2) (total_length - content_length - 2)) (of_bytes (Bytes.sub bytes 0 (content_length + 2))::list)
+        )
+    in
+        List.rev (list_of_bytes_accumu bytes [])
+
     
     let get_if_more t = (Char.code(t.flag) land 1) = 1
     let get_if_command t = (Char.code(t.flag) land 4) = 4
@@ -320,7 +335,9 @@ end = struct
                           (* Go through the list of connections and check buffer *)
                           let check_buffer connection = 
                             (let buffer = Connection.get_buffer connection in
-                                Lwt_stream.peek buffer >>= fun x -> Lwt.return x 
+                                Lwt_stream.peek buffer >>= function
+                                    | None ->
+                                    | Some(frame) -> 
                             )
                           in 
                           Lwt.return ""
@@ -666,6 +683,15 @@ and Connection : sig
     
     (** FSM for handing raw bytes transmission *)
     val fsm : t -> Bytes.t -> t * action list
+
+    (** Send the list of frames to underlying connection *)
+    val send : t -> Frame.t list -> unit
+
+    (** Set the the send buffer *)
+    val set_send_buffer : t -> Bytes.t Lwt_stream.t -> unit
+
+    (** Set the push function of the send buffer *)
+    val set_send_pf : t -> (Bytes.t option -> unit) -> unit
 end = struct 
 
     type action = | Write of bytes | Continue | Close of string
@@ -681,7 +707,9 @@ end = struct
         mutable incoming_socket_type : socket_type;
         mutable incoming_identity : string;
         read_buffer : Frame.t Lwt_stream.t;
-        push_function : Frame.t option -> unit;
+        read_buffer_pf : Frame.t option -> unit;
+        mutable send_buffer : Bytes.t Lwt_stream.t;
+        mutable send_buffer_pf : Bytes.t option -> unit;
     }
 
     let init socket security_mechanism tag = 
@@ -696,7 +724,9 @@ end = struct
         incoming_as_server = false;
         incoming_identity = "";
         read_buffer = stream;
-        push_function = pf;
+        read_buffer_pf = pf;
+        send_buffer = Lwt_stream.of_list [];
+        send_buffer_pf = fun x -> ();
     }
 
     let get_tag t = t.tag
@@ -791,16 +821,20 @@ end = struct
                                                     )
                             in
                             ({t with handshake_state = new_state}, convert action))
-            | TRAFFIC -> let frame = Frame.of_bytes in
-                            (t, [])
-            | ERROR -> (t, [])
+            | TRAFFIC -> let frames = Frame.list_of_bytes bytes in
+                            (* Put the received frames into the buffer *)
+                            List.iter (fun x -> t.read_buffer_pf (Some(x))) frames;
+                            (t, [Continue])
+            | ERROR -> (t, [Close "Connection FSM error"])
 
-    (* 
-    let send msg = 
-        push_function msg
-    
-    *)        
+    let send t msg_list = 
+        List.iter (fun x -> t.send_buffer_pf (Some(Frame.to_bytes x))) msg_list
 
+    let set_send_buffer t buffer =
+        t.send_buffer <- buffer
+
+    let set_send_pf t pf =
+        t.send_buffer_pf <- pf
 end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
@@ -826,29 +860,24 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                                                          Lwt.return_unit))
                                 in
                                     act action_list))
+    in let rec check_and_send_buffer buffer flow = (
+        Lwt_stream.peek buffer >>= function
+            | None -> Lwt.pause () >>= fun x -> check_and_send_buffer buffer flow
+            | Some(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                         S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
+                            | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
+                            | Ok () -> check_and_send_buffer buffer flow
+    )
     in
         S.listen_tcpv4 s ~port (
             fun flow ->
                 let dst, dst_port = S.TCPV4.dst flow in
                 Logs.info (fun f -> f "new tcp connection from IP %s on port %d" (Ipaddr.V4.to_string dst) dst_port);
-                let connection = Connection.init socket (Security_mechanism.init (Socket_base.get_security_data socket) (Socket_base.get_metadata socket)) (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port)in
-                Socket_base.add_connection socket connection;
-                (* create a stream and pass the ref to the socket
-                let stream, push_function = Lwt_stream.create () in 
-                
-                Connection.add_mailbox socket (stream, push_function);
-                let process_stream stream = Lwt_stream.get stream >>= function
-                    | Some (action) -> (match action with 
-                                            | Write(b) -> Logs.info (fun f -> f "Connection async Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
-                                                            (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
-                                                            | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
-                                                            | Ok () -> act tl)
-                                            | Close -> S.disconnect s)
-                    | None -> process_stream stream
-                lwt.join [read_and_print; check stream]
-                *)
-                (* *)
-                read_and_print flow connection
+                let connection = Connection.init socket (Security_mechanism.init (Socket_base.get_security_data socket) (Socket_base.get_metadata socket)) (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port) in
+                let stream, pf = Lwt_stream.create () in 
+                    Connection.set_send_pf connection pf;
+                    Socket_base.add_connection socket connection;
+                    Lwt.join[read_and_print flow connection; check_and_send_buffer stream flow]
         );
         S.listen s
 
