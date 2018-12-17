@@ -12,7 +12,7 @@ type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH 
 type mechanism_type = NULL | PLAIN
 type socket_metadata = (string * string) list
 type security_data = Null | Plain_client of string * string | Plain_server of (string * string) list
-type connection_stage = | GREETING | HANDSHAKE | TRAFFIC | ERROR
+type connection_stage = | GREETING | HANDSHAKE | TRAFFIC | CLOSED
 
 (* Start of helper functions *)
 (** Returns the string of the socket type *)
@@ -105,6 +105,9 @@ module Frame : sig
 
     (** A helper function checking whether a frame is empty (delimiter) *)
     val is_empty_frame : t -> bool
+
+    (** A helper function that takes a list of message frames and returns the reconstructed message *)
+    val splice_message_frames : t list -> string
 end = struct
     type t = {
         flag : char; 
@@ -156,9 +159,22 @@ end = struct
 
     
     let get_if_more t = (Char.code(t.flag) land 1) = 1
+
     let get_if_command t = (Char.code(t.flag) land 4) = 4
+
     let get_body t = t.body
+
     let is_empty_frame t = not (get_if_more t) && (t.size = 0)
+
+    let splice_message_frames list = 
+    let rec splice_message_frames_accumu list s = match list with 
+        | [] -> s
+        | hd::tl -> match tl with
+                        | [] -> if get_if_more hd then raise (Internal_Error "Missing frames")
+                                else splice_message_frames_accumu tl (s ^ (Bytes.to_string (get_body hd)))
+                        | _ -> if not (get_if_more hd) then raise (Internal_Error "Too many  frames")
+                               else splice_message_frames_accumu tl (s ^ (Bytes.to_string (get_body hd)))
+    in splice_message_frames_accumu list ""
 end
 
 module Command : sig
@@ -350,25 +366,40 @@ end = struct
                                                                                 last_received_connection_tag = Connection.get_tag hd;
                                                                                 };
                                                                  Lwt_stream.junk buffer >>= fun () ->
-                                                                 Lwt.return (Some(frame))
+                                                                 Lwt.return (Some((frame, Connection.get_tag hd)))
                                          else check_buffer tl
                                         )
                           in check_buffer t.connections >>= function
                                 | None -> Lwt.pause() >>= fun () -> recv t
-                                | Some(frame) -> (
-                                    (* Reconstruct message from the frame buffer; messages are separated by an empty delimiter *)
+                                | Some((frame,tag)) -> (
+                                    (* Messages are separated by an empty delimiter *)
                                     if Frame.is_empty_frame frame then    
                                         (* Find the tagged connection *)
+                                        let connection = List.find (fun x -> Connection.get_tag x = tag) t.connections in
                                         (* Reconstruct message from the connection *)
-                                        (* Put the connection at the end of the queue *)
-                                    Lwt.return ""
+                                        let rec frame_list list = 
+                                            Lwt_stream.get (Connection.get_buffer connection) >>= function
+                                                | None -> raise Not_Implemented
+                                                | Some(next_frame) -> if Frame.get_if_more next_frame then frame_list (list@[next_frame]) 
+                                                                      else Lwt.return (list@[next_frame]) 
+                                        in
+                                            frame_list [] >>= fun x -> 
+                                            (* Put the received connection at the end of the queue *)
+                                            let rec reorder list accumu =
+                                                match list with
+                                                    | [] -> accumu @ [connection]
+                                                    | hd::tl -> if Connection.get_tag hd = tag then reorder tl accumu 
+                                                                else reorder tl (accumu@[hd]) 
+                                            in
+                                            t.connections <- (reorder t.connections []);
+                                            Lwt.return (Frame.splice_message_frames x)                
                                     else (* Protocol error, close the connection *) 
                                         raise Not_Implemented
-                                
                                 )
                         )
                         | _ -> raise (Internal_Error "Socket states mismatches with socket type")
                 )
+(* TODO implement other sockets' behaviour *)
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
@@ -712,6 +743,9 @@ and Connection : sig
     (** Send the list of frames to underlying connection *)
     val send : t -> Frame.t list -> unit
 
+    (** Force close connection *)
+    val close : t -> unit
+
     (** Set the the send buffer *)
     val set_send_buffer : t -> Bytes.t Lwt_stream.t -> unit
 
@@ -850,7 +884,10 @@ end = struct
                             (* Put the received frames into the buffer *)
                             List.iter (fun x -> t.read_buffer_pf (Some(x))) frames;
                             (t, [Continue])
-            | ERROR -> (t, [Close "Connection FSM error"])
+            | CLOSED -> (t, [Close "Connection FSM error"])
+
+(* TODO close underlying connection *)
+    let close t = t.stage <- CLOSED
 
     let send t msg_list = 
         List.iter (fun x -> t.send_buffer_pf (Some(Frame.to_bytes x))) msg_list
