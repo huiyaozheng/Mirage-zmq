@@ -88,7 +88,7 @@ module Frame : sig
     (** Convert a frame to raw bytes *)
     val to_bytes : t -> bytes
     
-    (** Construct a frame from raw bytes *)
+    (** Construct a frame from raw bytes of a complete frame *)
     val of_bytes : bytes -> t
 
     (** Construct a list of frames from raw bytes; used when potentially many frames in received buffer *)
@@ -115,10 +115,9 @@ end = struct
         body : bytes
     }
 
-(* TODO network bytes order *)
-    let size_to_bytes size = 
-        if size < 255 then Bytes.make 1 (Char.chr size)
-        else Bytes.init 8 (fun i -> Char.chr ((size land (255 lsl (i - 1) * 8)) lsr ((i - 1) * 8)))
+    let size_to_bytes size if_long = 
+        if if_long then Bytes.make 1 (Char.chr size)
+        else int_to_network_order size 8
 
     let make_frame body ~if_more ~if_command = 
         let f = ref 0 in
@@ -129,7 +128,7 @@ end = struct
             {flag = (Char.chr (!f)); size = len; body}
 
     let to_bytes t =
-        Bytes.concat Bytes.empty [Bytes.make 1 t.flag; size_to_bytes t.size; t.body]
+        Bytes.concat Bytes.empty [Bytes.make 1 t.flag; size_to_bytes t.size (((Char.code t.flag) land 2) = 2); t.body]
 
     let of_bytes bytes = 
     let flag = Char.code (Bytes.get bytes 0) in
@@ -137,8 +136,11 @@ end = struct
     let if_long = (flag land 2) = 2 in
         if if_long then
             (* long-size *)
-(* TODO implement long *)
-            raise Not_Implemented
+(* TODO test long *)
+            let content_length = network_order_to_int (Bytes.sub bytes 1 8) in
+                if total_length < content_length + 9 then raise (Internal_Error "Not a complete frame buffer")
+                else if total_length > content_length + 9 then raise (Internal_Error "More than one frame in the buffer")
+                else {flag = Char.chr flag; size = content_length; body = Bytes.sub bytes 9 content_length}
         else
             (* short-size *)
             let content_length = Char.code (Bytes.get bytes 1) in
