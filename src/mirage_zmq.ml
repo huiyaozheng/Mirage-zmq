@@ -102,6 +102,9 @@ module Frame : sig
     
     (** Get body from a frame *)
     val get_body : t -> bytes
+
+    (** A helper function checking whether a frame is empty (delimiter) *)
+    val is_empty_frame : t -> bool
 end = struct
     type t = {
         flag : char; 
@@ -155,6 +158,7 @@ end = struct
     let get_if_more t = (Char.code(t.flag) land 1) = 1
     let get_if_command t = (Char.code(t.flag) land 4) = 4
     let get_body t = t.body
+    let is_empty_frame t = not (get_if_more t) && (t.size = 0)
 end
 
 module Command : sig
@@ -242,7 +246,8 @@ module rec Socket_base : sig
 end = struct
     type socket_states =
         | NONE
-        | Rep of {if_received : bool; last_received_connection_tag : string;}
+        | Rep of {if_received : bool; 
+                  last_received_connection_tag : string;}
         | Req
         | Dealer
         | Router
@@ -328,19 +333,39 @@ end = struct
     let rec recv t = match t.socket_type with 
         | REP -> (let state = t.socket_states in
                     match state with
-                        | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
+                        | Rep({if_received = if_received;
+                               last_received_connection_tag = tag;
+                             }) -> (
                           (* Need to receive in a fair-queuing manner *)
-                          (* If no connection in the list, wait for an incoming connection *)
-                          if t.connections = [] then Lwt.pause() >>= fun () -> recv t else 
                           (* Go through the list of connections and check buffer *)
-                          let check_buffer connection = 
-                            (let buffer = Connection.get_buffer connection in
-                                Lwt_stream.peek buffer >>= function
-                                    | None ->
-                                    | Some(frame) -> 
-                            )
-                          in 
-                          Lwt.return ""
+                          if t.connections = [] then Lwt.pause() >>= fun () -> recv t
+                          else let rec check_buffer connections = match connections with
+                            (* If no connection in the list, wait for an incoming connection *)
+                            | [] -> Lwt.return None
+                            | hd::tl -> (if Connection.get_stage hd = TRAFFIC then
+                                         let buffer = Connection.get_buffer hd in
+                                            Lwt_stream.peek buffer >>= function
+                                                | None -> (check_buffer tl)
+                                                | Some(frame) -> t.socket_states <- Rep{if_received = true; 
+                                                                                last_received_connection_tag = Connection.get_tag hd;
+                                                                                };
+                                                                 Lwt_stream.junk buffer >>= fun () ->
+                                                                 Lwt.return (Some(frame))
+                                         else check_buffer tl
+                                        )
+                          in check_buffer t.connections >>= function
+                                | None -> Lwt.pause() >>= fun () -> recv t
+                                | Some(frame) -> (
+                                    (* Reconstruct message from the frame buffer; messages are separated by an empty delimiter *)
+                                    if Frame.is_empty_frame frame then    
+                                        (* Find the tagged connection *)
+                                        (* Reconstruct message from the connection *)
+                                        (* Put the connection at the end of the queue *)
+                                    Lwt.return ""
+                                    else (* Protocol error, close the connection *) 
+                                        raise Not_Implemented
+                                
+                                )
                         )
                         | _ -> raise (Internal_Error "Socket states mismatches with socket type")
                 )
