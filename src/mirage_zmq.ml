@@ -12,7 +12,8 @@ type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH 
 type mechanism_type = NULL | PLAIN
 type socket_metadata = (string * string) list
 type security_data = Null | Plain_client of string * string | Plain_server of (string * string) list
-type connection_stage = | GREETING | HANDSHAKE | TRAFFIC | CLOSED
+type connection_stage = GREETING | HANDSHAKE | TRAFFIC | CLOSED
+type connection_buffer_object = Data of Bytes.t | Command_close
 
 (* Start of helper functions *)
 (** Returns the string of the socket type *)
@@ -394,9 +395,13 @@ end = struct
                                                                 else reorder tl (accumu@[hd]) 
                                             in
                                             t.connections <- (reorder t.connections []);
+(* TODO check error *)
                                             Lwt.return (Frame.splice_message_frames x)                
-                                    else (* Protocol error, close the connection *) 
-                                        raise Not_Implemented
+                                    else (* Protocol error, close the connection and try again *) 
+                                        let connection = List.find (fun x -> Connection.get_tag x = tag) t.connections in
+                                            Connection.close connection;
+(* TODO remove connection *)
+                                            Lwt.pause() >>= fun () -> recv t
                                 )
                         )
                         | _ -> raise (Internal_Error "Socket states mismatches with socket type")
@@ -749,10 +754,10 @@ and Connection : sig
     val close : t -> unit
 
     (** Set the the send buffer *)
-    val set_send_buffer : t -> Bytes.t Lwt_stream.t -> unit
+    val set_send_buffer : t -> connection_buffer_object Lwt_stream.t -> unit
 
     (** Set the push function of the send buffer *)
-    val set_send_pf : t -> (Bytes.t option -> unit) -> unit
+    val set_send_pf : t -> (connection_buffer_object option -> unit) -> unit
 end = struct 
 
     type action = | Write of bytes | Continue | Close of string
@@ -769,8 +774,8 @@ end = struct
         mutable incoming_identity : string;
         read_buffer : Frame.t Lwt_stream.t;
         read_buffer_pf : Frame.t option -> unit;
-        mutable send_buffer : Bytes.t Lwt_stream.t;
-        mutable send_buffer_pf : Bytes.t option -> unit;
+        mutable send_buffer : connection_buffer_object Lwt_stream.t;
+        mutable send_buffer_pf : connection_buffer_object option -> unit;
     }
 
     let init socket security_mechanism tag = 
@@ -888,11 +893,10 @@ end = struct
                             (t, [Continue])
             | CLOSED -> (t, [Close "Connection FSM error"])
 
-(* TODO close underlying connection *)
-    let close t = t.stage <- CLOSED
+    let close t = t.stage <- CLOSED; t.send_buffer_pf (Some(Command_close))
 
     let send t msg_list = 
-        List.iter (fun x -> t.send_buffer_pf (Some(Frame.to_bytes x))) msg_list
+        List.iter (fun x -> t.send_buffer_pf (Some(Data(Frame.to_bytes x)))) msg_list
 
     let set_send_buffer t buffer =
         t.send_buffer <- buffer
@@ -927,10 +931,13 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
     in let rec check_and_send_buffer buffer flow = (
         Lwt_stream.peek buffer >>= function
             | None -> Lwt.pause () >>= fun x -> check_and_send_buffer buffer flow
-            | Some(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
-                         S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
-                            | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
-                            | Ok () -> check_and_send_buffer buffer flow
+            | Some(data) -> match data with
+                            | Data(b) -> (Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                                S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
+                                   | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
+                                   | Ok () -> check_and_send_buffer buffer flow)
+                            | Command_close -> Logs.info (fun f -> f "Connection instructed to close");
+                                               S.TCPV4.close flow
     )
     in
         S.listen_tcpv4 s ~port (
