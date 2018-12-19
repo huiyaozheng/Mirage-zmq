@@ -117,7 +117,7 @@ end = struct
     }
 
     let size_to_bytes size if_long = 
-        if if_long then Bytes.make 1 (Char.chr size)
+        if not if_long then Bytes.make 1 (Char.chr size)
         else int_to_network_order size 8
 
     let make_frame body ~if_more ~if_command = 
@@ -155,7 +155,8 @@ end = struct
         let total_length = Bytes.length bytes in
         let content_length = Char.code (Bytes.get bytes 1) in
             if total_length < content_length + 2 then raise (Internal_Error "Not a complete frame buffer")
-            else list_of_bytes_accumu (Bytes.sub bytes (content_length + 2) (total_length - content_length - 2)) (of_bytes (Bytes.sub bytes 0 (content_length + 2))::list)
+            else if total_length > content_length + 2 then list_of_bytes_accumu (Bytes.sub bytes (content_length + 2) (total_length - content_length - 2)) ((of_bytes (Bytes.sub bytes 0 (content_length + 2)))::list)
+            else (of_bytes (Bytes.sub bytes 0 (content_length + 2)))::list
         )
     in
         List.rev (list_of_bytes_accumu bytes [])
@@ -349,7 +350,8 @@ end = struct
         )
         else ()
 
-    let rec recv t = match t.socket_type with 
+    let rec recv t = 
+        match t.socket_type with 
         | REP -> (let state = t.socket_states in
                     match state with
                         | Rep({if_received = if_received;
@@ -357,12 +359,14 @@ end = struct
                              }) -> (
                           (* Need to receive in a fair-queuing manner *)
                           (* Go through the list of connections and check buffer *)
-                          if t.connections = [] then Lwt.pause() >>= fun () -> recv t
+                          if t.connections = [] then (
+                              (*Logs.info (fun f -> f "No available connection\n"); *)
+                              Lwt.pause() >>= fun () -> recv t)
                           else let rec check_buffer connections = match connections with
                             (* If no connection in the list, wait for an incoming connection *)
                             | [] -> Lwt.return None
                             | hd::tl -> (if Connection.get_stage hd = TRAFFIC then
-                                         let buffer = Connection.get_buffer hd in
+                                         let buffer = !(Connection.get_buffer hd) in
                                             Lwt_stream.peek buffer >>= function
                                                 | None -> (check_buffer tl)
                                                 | Some(frame) -> t.socket_states <- Rep{if_received = true; 
@@ -373,15 +377,18 @@ end = struct
                                          else check_buffer tl
                                         )
                           in check_buffer t.connections >>= function
-                                | None -> Lwt.pause() >>= fun () -> recv t
+                                | None -> 
+                                    (*Logs.info (fun f -> f "Connections' buffers are empty\n"); *)
+                                    Lwt.pause() >>= fun () -> recv t
                                 | Some((frame,tag)) -> (
+                                    Logs.info (fun f -> f "buffer read\n");
                                     (* Messages are separated by an empty delimiter *)
                                     if Frame.is_empty_frame frame then    
                                         (* Find the tagged connection *)
                                         let connection = List.find (fun x -> Connection.get_tag x = tag) t.connections in
                                         (* Reconstruct message from the connection *)
                                         let rec frame_list list = 
-                                            Lwt_stream.get (Connection.get_buffer connection) >>= function
+                                            Lwt_stream.get (!(Connection.get_buffer connection)) >>= function
                                                 | None -> raise Not_Implemented
                                                 | Some(next_frame) -> if Frame.get_if_more next_frame then frame_list (list@[next_frame]) 
                                                                       else Lwt.return (list@[next_frame]) 
@@ -739,7 +746,7 @@ and Connection : sig
     val get_tag : t -> string
 
     (** Get the read buffer of the connection *)
-    val get_buffer : t -> Frame.t Lwt_stream.t
+    val get_buffer : t -> Frame.t Lwt_stream.t ref
 
     (** Get the stage of the connection. It is considered usable if in TRAFFIC *)
     val get_stage : t -> connection_stage
@@ -772,14 +779,16 @@ end = struct
         mutable incoming_as_server : bool;
         mutable incoming_socket_type : socket_type;
         mutable incoming_identity : string;
-        read_buffer : Frame.t Lwt_stream.t;
-        read_buffer_pf : Frame.t option -> unit;
+        read_buffer : Frame.t Lwt_stream.t ref;
+        read_buffer_pf : (Frame.t option -> unit) ref;
         mutable send_buffer : connection_buffer_object Lwt_stream.t;
         mutable send_buffer_pf : connection_buffer_object option -> unit;
     }
 
     let init socket security_mechanism tag = 
-    let stream, pf = Lwt_stream.create () in {
+    let stream, pf = Lwt_stream.create () in 
+    let ref_stream = ref stream in 
+    let ref_pf = ref pf in {
         tag = tag;
         socket = socket;
         greeting_state = Greeting.init security_mechanism;
@@ -789,8 +798,8 @@ end = struct
         incoming_socket_type = REP;
         incoming_as_server = false;
         incoming_identity = "";
-        read_buffer = stream;
-        read_buffer_pf = pf;
+        read_buffer = ref_stream;
+        read_buffer_pf = ref_pf;
         send_buffer = Lwt_stream.of_list [];
         send_buffer_pf = fun x -> ();
     }
@@ -803,7 +812,8 @@ end = struct
 
     let rec fsm t bytes = 
         match t.stage with
-            | GREETING ->  (let len = Bytes.length bytes in
+            | GREETING ->  (Logs.info (fun f -> f "Greeting -> FSM\n");
+                            let len = Bytes.length bytes in
                             let rec convert greeting_action_list =
                                 match greeting_action_list with
                                     | [] -> []
@@ -868,8 +878,9 @@ end = struct
                                             let (new_t_2, action_list_2) = fsm new_t_1 (Bytes.sub bytes expected_length (n - expected_length)) in
                                                 (new_t_2, action_list_1 @ action_list_2))
                         )
-            | HANDSHAKE -> (let command = Command.of_frame (Frame.of_bytes bytes) in
-                            let (new_state, action) = Security_mechanism.fsm t.handshake_state command in
+            | HANDSHAKE -> (Logs.info (fun f -> f "Handshake -> FSM\n");
+                let command = Command.of_frame (Frame.of_bytes bytes) in
+                            let (new_state, actions) = Security_mechanism.fsm t.handshake_state command in
                             let rec convert handshake_action_list = 
                                 match handshake_action_list with 
                                     | [] -> []
@@ -885,11 +896,13 @@ end = struct
                                                             | "Identity" -> t.incoming_identity <- value; convert tl
                                                             | _ -> Logs.info (fun f -> f "Ignore unknown identity %s\n" name); convert tl
                                                     )
-                            in
-                            ({t with handshake_state = new_state}, convert action))
-            | TRAFFIC -> let frames = Frame.list_of_bytes bytes in
+                            in let actions = convert actions in
+                            ({t with handshake_state = new_state}, actions))
+            | TRAFFIC -> Logs.info (fun f -> f "TRAFFIC -> FSM\n");
+                        let frames = Frame.list_of_bytes bytes in
                             (* Put the received frames into the buffer *)
-                            List.iter (fun x -> t.read_buffer_pf (Some(x))) frames;
+                            Logs.info (fun f -> f "Frames enqueued\n");
+                            List.iter (fun x -> !(t.read_buffer_pf) (Some(x))) frames;
                             (t, [Continue])
             | CLOSED -> (t, [Close "Connection FSM error"])
 
@@ -927,6 +940,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                                             | Connection.Close(s) -> Logs.info (fun f -> f "Connection FSM Close due to: %s\n" s);
                                                          Lwt.return_unit))
                                 in
+                                    Logs.info(fun f -> f "Action list length = %d" (List.length action_list));
                                     act action_list))
     in let rec check_and_send_buffer buffer flow = (
         Lwt_stream.peek buffer >>= function
@@ -958,7 +972,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
         S.TCPV4.read flow >>= (function
         | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
         | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
-        | Ok (`Data b) -> (Logs.info (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
+        | Ok (`Data b) -> (Logs.info (fun f -> f "Read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
                                 let (new_t, action_list) = Connection.fsm t (Cstruct.to_bytes b) in
                                 let rec act actions = 
                                     (match actions with
