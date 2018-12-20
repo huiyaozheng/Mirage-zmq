@@ -112,6 +112,7 @@ module Frame : sig
 end = struct
     type t = {
         flag : char; 
+(* Known issue: size is limited by max_int; may not be able to reach 2^63-1 *)
         size : int; 
         body : bytes
     }
@@ -210,6 +211,46 @@ end = struct
         {name = Bytes.sub_string data 1 name_length; data = Bytes.sub data (name_length + 1) ((Bytes.length data) - 1 - name_length)}
 
     let make_command command_name data = {name = command_name; data = data}
+end
+
+module Message : sig
+    type t
+
+    (** Make a message from the string *)
+    val of_string : string -> ?if_long : bool -> t
+
+    (** Make a list of messages from the string to send *)
+    val list_of_string : string -> t list
+
+    (** Convert a message to a frame *)
+    val to_frame : t -> Frame.t
+
+end = struct
+    type t = {size : int; if_long : bool; body : bytes}
+
+    let of_string msg ?(if_long = false) =
+    let length = String.length msg in
+        if length > 255 && (not if_long) then raise (Internal_Error "Must be long message")
+        else {size = length; if_long = if_long; body = Bytes.of_string msg}
+
+    let list_of_string msg = 
+    let length = String.length msg in
+        (* Assume Sys.max_string_length < max_int *)
+        if length > 1020 then
+            (* Make a LONG message *)
+            [of_string msg ~if_long=true]
+        else
+            (* Make short messages *)
+            let rec make msg list = 
+            let length = String.length msg in
+                if length > 255 then
+                    make (String.sub msg 255 (length - 255)) ((of_string (String.sub msg 0 255) ~if_long=false)::list)
+                else
+                    (of_string msg ~if_long=false)::list
+            in 
+                List.rev (make msg [])
+
+    let to_frame t = raise Not_Implemented
 end
 
 module Context : sig 
@@ -371,6 +412,7 @@ end = struct
                                          let buffer = !(Connection.get_buffer (!hd)) in
                                             Lwt_stream.peek buffer >>= function
                                                 | None -> (Logs.info (fun f -> f "Module Socket_base: Xonnection %s's buffer empty\n" (Connection.get_tag (!hd))); check_buffer tl)
+(* TODO move the assignment downwards *)
                                                 | Some(frame) -> t.socket_states <- Rep{if_received = true; 
                                                                                 last_received_connection_tag = Connection.get_tag (!hd);
                                                                                 };
@@ -424,7 +466,15 @@ end = struct
                     match state with
                         | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
                             if not if_received then raise (Incorrect_use_of_API "Need to receive from a REP before sending a message")
-                            else ()
+                            else let rec find connections = match connections with
+                                    (* Discard the message if peer no longer connected *)
+                                    | [] -> ()
+                                    | hd::tl -> if tag = Connection.get_tag (!hd) then
+                                                    if Connection.get_stage (!hd) = TRAFFIC then
+                                                        Connection.send (!hd) []
+                                                    else ()
+                                                else find tl
+                                in find t.connections
                         )
                         | _ -> raise (Internal_Error "Socket states mismatches with socket type")
                 )
