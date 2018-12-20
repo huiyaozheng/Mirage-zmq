@@ -226,31 +226,31 @@ module Message : sig
     val to_frame : t -> Frame.t
 
 end = struct
-    type t = {size : int; if_long : bool; body : bytes}
+    type t = {size : int; if_long : bool; if_more : bool; body : bytes}
 
-    let of_string msg ?(if_long = false) =
+    let of_string msg ?(if_long = false) ?(if_more = false) =
     let length = String.length msg in
         if length > 255 && (not if_long) then raise (Internal_Error "Must be long message")
-        else {size = length; if_long = if_long; body = Bytes.of_string msg}
+        else {size = length; if_long = if_long; if_more = if_more; body = Bytes.of_string msg}
 
     let list_of_string msg = 
     let length = String.length msg in
         (* Assume Sys.max_string_length < max_int *)
         if length > 1020 then
             (* Make a LONG message *)
-            [of_string msg ~if_long=true]
+            [of_string msg ~if_long=true ~if_more=false]
         else
             (* Make short messages *)
             let rec make msg list = 
             let length = String.length msg in
                 if length > 255 then
-                    make (String.sub msg 255 (length - 255)) ((of_string (String.sub msg 0 255) ~if_long=false)::list)
+                    make (String.sub msg 255 (length - 255)) ((of_string (String.sub msg 0 255) ~if_long=false ~if_more=true)::list)
                 else
-                    (of_string msg ~if_long=false)::list
+                    (of_string msg ~if_long=false ~if_more=false)::list
             in 
                 List.rev (make msg [])
 
-    let to_frame t = raise Not_Implemented
+    let to_frame t = Frame.make_frame t.body ~if_more=t.if_more ~if_command=false
 end
 
 module Context : sig 
@@ -471,7 +471,7 @@ end = struct
                                     | [] -> ()
                                     | hd::tl -> if tag = Connection.get_tag (!hd) then
                                                     if Connection.get_stage (!hd) = TRAFFIC then
-                                                        Connection.send (!hd) []
+                                                        Connection.send (!hd) (List.map (fun x -> Message.to_frame x) (Message.list_of_string msg))
                                                     else ()
                                                 else find tl
                                 in find t.connections
