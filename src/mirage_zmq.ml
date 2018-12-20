@@ -262,7 +262,7 @@ module rec Socket_base : sig
     (** Send a msg to the underlying connections, according to the semantics of the socket type *)
     val send : t -> string -> unit
 
-    val add_connection : t -> Connection.t -> unit
+    val add_connection : t -> Connection.t ref -> unit
 end = struct
     type socket_states =
         | NONE
@@ -284,7 +284,7 @@ end = struct
         mutable metadata : socket_metadata;
         security_mechanism : mechanism_type;
         mutable security_info : security_data;
-        mutable connections : Connection.t list;
+        mutable connections : (Connection.t ref) list;
         mutable socket_states : socket_states
     }
 
@@ -365,15 +365,20 @@ end = struct
                           else let rec check_buffer connections = match connections with
                             (* If no connection in the list, wait for an incoming connection *)
                             | [] -> Lwt.return None
-                            | hd::tl -> (if Connection.get_stage hd = TRAFFIC then
-                                         let buffer = !(Connection.get_buffer hd) in
+                            | hd::tl -> (
+(* TODO update connection.t *)
+                                        if Connection.get_stage (!hd) = TRAFFIC then
+                                        (Logs.info (fun f -> f "available connection\n");
+                                         let buffer = !(Connection.get_buffer (!hd)) in
                                             Lwt_stream.peek buffer >>= function
-                                                | None -> (check_buffer tl)
-                                                | Some(frame) -> t.socket_states <- Rep{if_received = true; 
-                                                                                last_received_connection_tag = Connection.get_tag hd;
+                                                | None -> (Logs.info (fun f -> f "%s's buffer empty\n" (Connection.get_tag (!hd))); check_buffer tl)
+                                                | Some(frame) -> Logs.info (fun f -> f "Delimiter read from a buffer\n");
+                                                                 t.socket_states <- Rep{if_received = true; 
+                                                                                last_received_connection_tag = Connection.get_tag (!hd);
                                                                                 };
                                                                  Lwt_stream.junk buffer >>= fun () ->
-                                                                 Lwt.return (Some((frame, Connection.get_tag hd)))
+                                                                 Lwt.return (Some((frame, Connection.get_tag (!hd))))
+                                        )
                                          else check_buffer tl
                                         )
                           in check_buffer t.connections >>= function
@@ -385,10 +390,10 @@ end = struct
                                     (* Messages are separated by an empty delimiter *)
                                     if Frame.is_empty_frame frame then    
                                         (* Find the tagged connection *)
-                                        let connection = List.find (fun x -> Connection.get_tag x = tag) t.connections in
+                                        let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
                                         (* Reconstruct message from the connection *)
                                         let rec frame_list list = 
-                                            Lwt_stream.get (!(Connection.get_buffer connection)) >>= function
+                                            Lwt_stream.get (!(Connection.get_buffer (!connection))) >>= function
                                                 | None -> raise Not_Implemented
                                                 | Some(next_frame) -> if Frame.get_if_more next_frame then frame_list (list@[next_frame]) 
                                                                       else Lwt.return (list@[next_frame]) 
@@ -398,15 +403,15 @@ end = struct
                                             let rec reorder list accumu =
                                                 match list with
                                                     | [] -> accumu @ [connection]
-                                                    | hd::tl -> if Connection.get_tag hd = tag then reorder tl accumu 
+                                                    | hd::tl -> if Connection.get_tag (!hd) = tag then reorder tl accumu 
                                                                 else reorder tl (accumu@[hd]) 
                                             in
                                             t.connections <- (reorder t.connections []);
 (* TODO check error *)
                                             Lwt.return (Frame.splice_message_frames x)                
                                     else (* Protocol error, close the connection and try again *) 
-                                        let connection = List.find (fun x -> Connection.get_tag x = tag) t.connections in
-                                            Connection.close connection;
+                                        let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
+                                            Connection.close (!connection);
 (* TODO remove connection *)
                                             Lwt.pause() >>= fun () -> recv t
                                 )
@@ -901,7 +906,7 @@ end = struct
             | TRAFFIC -> Logs.info (fun f -> f "TRAFFIC -> FSM\n");
                         let frames = Frame.list_of_bytes bytes in
                             (* Put the received frames into the buffer *)
-                            Logs.info (fun f -> f "Frames enqueued\n");
+                            Logs.info (fun f -> f "%d frames enqueued\n" (List.length frames));
                             List.iter (fun x -> !(t.read_buffer_pf) (Some(x))) frames;
                             (t, [Continue])
             | CLOSED -> (t, [Close "Connection FSM error"])
@@ -920,15 +925,15 @@ end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
     let listen s port socket =
-    let rec read_and_print flow t = 
+    let rec read_and_print flow connection = 
         S.TCPV4.read flow >>= (function
         | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
         | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
         | Ok (`Data b) -> (Logs.info (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
-                                let (new_t, action_list) = Connection.fsm t (Cstruct.to_bytes b) in
+                                let (new_connection, action_list) = Connection.fsm connection (Cstruct.to_bytes b) in
                                 let rec act actions = 
                                     (match actions with
-                                        | [] -> read_and_print flow new_t
+                                        | [] -> Lwt.pause() >>= fun () -> read_and_print flow new_connection
                                         | (hd::tl) -> 
                                         (match hd with
                                             | Connection.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
@@ -961,7 +966,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                 let connection = Connection.init socket (Security_mechanism.init (Socket_base.get_security_data socket) (Socket_base.get_metadata socket)) (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port) in
                 let stream, pf = Lwt_stream.create () in 
                     Connection.set_send_pf connection pf;
-                    Socket_base.add_connection socket connection;
+                    Socket_base.add_connection socket (ref connection);
                     Lwt.join[read_and_print flow connection; check_and_send_buffer stream flow]
         );
         S.listen s
@@ -976,7 +981,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                                 let (new_t, action_list) = Connection.fsm t (Cstruct.to_bytes b) in
                                 let rec act actions = 
                                     (match actions with
-                                        | [] -> read_and_print flow new_t
+                                        | [] -> Lwt.pause() >>= fun () -> read_and_print flow new_t
                                         | (hd::tl) -> 
                                         (match hd with
                                             | Connection.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
@@ -1054,6 +1059,6 @@ end = struct
     let connect t ipaddr port s = 
     let module C_tcp = Connection_tcp (S) in
     let connection = Connection.init t.socket (Security_mechanism.init (Socket_base.get_security_data t.socket) (Socket_base.get_metadata t.socket)) (tag_of_tcp_connection ipaddr port) in
-        Socket_base.add_connection t.socket connection;
+        Socket_base.add_connection t.socket (ref connection);
         raise Not_Implemented
 end

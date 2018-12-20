@@ -42,3 +42,6 @@ src/dune-project
 
 test/**/mirage_zmq.ml
 test/**/mirage_zmq.mli
+test/REQ-REP/client/hw_client
+test/REQ-REP/server/network
+src/.merlin
