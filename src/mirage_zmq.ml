@@ -105,7 +105,7 @@ module Frame : sig
     val get_body : t -> bytes
 
     (** A helper function checking whether a frame is empty (delimiter) *)
-    val is_empty_frame : t -> bool
+    val is_delimiter_frame : t -> bool
 
     (** A helper function that takes a list of message frames and returns the reconstructed message *)
     val splice_message_frames : t list -> string
@@ -168,7 +168,7 @@ end = struct
 
     let get_body t = t.body
 
-    let is_empty_frame t = not (get_if_more t) && (t.size = 0)
+    let is_delimiter_frame t = (get_if_more t) && (t.size = 0)
 
     let splice_message_frames list = 
     let rec splice_message_frames_accumu list s = match list with 
@@ -360,20 +360,18 @@ end = struct
                           (* Need to receive in a fair-queuing manner *)
                           (* Go through the list of connections and check buffer *)
                           if t.connections = [] then (
-                              (*Logs.info (fun f -> f "No available connection\n"); *)
+                              (*Logs.info (fun f -> f "Module Socket_base: No available connection\n"); *)
                               Lwt.pause() >>= fun () -> recv t)
                           else let rec check_buffer connections = match connections with
                             (* If no connection in the list, wait for an incoming connection *)
                             | [] -> Lwt.return None
                             | hd::tl -> (
-(* TODO update connection.t *)
                                         if Connection.get_stage (!hd) = TRAFFIC then
-                                        (Logs.info (fun f -> f "available connection\n");
+                                        (Logs.info (fun f -> f "Module Socket_base: Set-up connections available\n");
                                          let buffer = !(Connection.get_buffer (!hd)) in
                                             Lwt_stream.peek buffer >>= function
-                                                | None -> (Logs.info (fun f -> f "%s's buffer empty\n" (Connection.get_tag (!hd))); check_buffer tl)
-                                                | Some(frame) -> Logs.info (fun f -> f "Delimiter read from a buffer\n");
-                                                                 t.socket_states <- Rep{if_received = true; 
+                                                | None -> (Logs.info (fun f -> f "Module Socket_base: Xonnection %s's buffer empty\n" (Connection.get_tag (!hd))); check_buffer tl)
+                                                | Some(frame) -> t.socket_states <- Rep{if_received = true; 
                                                                                 last_received_connection_tag = Connection.get_tag (!hd);
                                                                                 };
                                                                  Lwt_stream.junk buffer >>= fun () ->
@@ -383,12 +381,12 @@ end = struct
                                         )
                           in check_buffer t.connections >>= function
                                 | None -> 
-                                    (*Logs.info (fun f -> f "Connections' buffers are empty\n"); *)
+                                    (*Logs.info (fun f -> f "Module Socket_base: Connections' buffers are empty\n"); *)
                                     Lwt.pause() >>= fun () -> recv t
                                 | Some((frame,tag)) -> (
-                                    Logs.info (fun f -> f "buffer read\n");
+                                    Logs.info (fun f -> f "Module Socket_base: Delimiter frame read from buffer: %s\n" (buffer_to_string (Frame.to_bytes frame)));
                                     (* Messages are separated by an empty delimiter *)
-                                    if Frame.is_empty_frame frame then    
+                                    if Frame.is_delimiter_frame frame then    
                                         (* Find the tagged connection *)
                                         let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
                                         (* Reconstruct message from the connection *)
@@ -757,7 +755,7 @@ and Connection : sig
     val get_stage : t -> connection_stage
     
     (** FSM for handing raw bytes transmission *)
-    val fsm : t -> Bytes.t -> t * action list
+    val fsm : t -> Bytes.t -> action list
 
     (** Send the list of frames to underlying connection *)
     val send : t -> Frame.t list -> unit
@@ -777,10 +775,10 @@ end = struct
     type t = {
         tag : string;
         socket : Socket_base.t;
-        greeting_state : Greeting.t;
-        handshake_state : Security_mechanism.t;
+        mutable greeting_state : Greeting.t;
+        mutable handshake_state : Security_mechanism.t;
         mutable stage : connection_stage;
-        expected_bytes_length : int;
+        mutable expected_bytes_length : int;
         mutable incoming_as_server : bool;
         mutable incoming_socket_type : socket_type;
         mutable incoming_identity : string;
@@ -817,7 +815,7 @@ end = struct
 
     let rec fsm t bytes = 
         match t.stage with
-            | GREETING ->  (Logs.info (fun f -> f "Greeting -> FSM\n");
+            | GREETING ->  (Logs.info (fun f -> f "Module Connection: Greeting -> FSM\n");
                             let len = Bytes.length bytes in
                             let rec convert greeting_action_list =
                                 match greeting_action_list with
@@ -833,7 +831,7 @@ end = struct
                                             | Greeting.Check_mechanism(s) -> if s <> (Security_mechanism.get_name_string t.handshake_state) then [Close("Security Policy mismatch")]
                                                                              else convert tl
                                             | Greeting.Continue -> convert tl
-                                            | Greeting.Ok -> Logs.info (fun f -> f "Greeting OK\n"); t.stage <- HANDSHAKE; 
+                                            | Greeting.Ok -> Logs.info (fun f -> f "Module Connection: Greeting OK\n"); t.stage <- HANDSHAKE; 
                                                              if (Security_mechanism.get_as_client t.handshake_state) then Write(Security_mechanism.client_first_message t.handshake_state)::(convert tl)
                                                              else convert tl
                                             | Greeting.Error(s) -> [Close("Greeting FSM error: " ^ s)] 
@@ -849,13 +847,16 @@ end = struct
                                              Greeting.Recv_filler  
                                             ] in
                                         let connection_action = convert action_list in 
-                                        ({t with greeting_state = state; expected_bytes_length = 0}, connection_action)
+                                        t.greeting_state <- state; t.expected_bytes_length <- 0; 
+                                        connection_action
                                 (* Signature + version major *)
                                 | 11 -> let (state, action_list) = Greeting.fsm t.greeting_state [Greeting.Recv_sig(Bytes.sub bytes 0 10); Greeting.Recv_Vmajor(Bytes.sub bytes 10 1)] in
-                                        ({t with greeting_state = state; expected_bytes_length = 53}, convert action_list)
+                                        t.greeting_state <- state; t.expected_bytes_length <- 53;
+                                        convert action_list
                                 (* Signature *)
                                 | 10 -> let (state, action) = Greeting.fsm_single t.greeting_state (Greeting.Recv_sig(bytes)) in
-                                        ({t with greeting_state = state; expected_bytes_length = 54}, convert [action])
+                                        t.greeting_state <- state; t.expected_bytes_length <- 54;
+                                        convert [action]
                                 (* version minor + rest *)
                                 | 53 -> let (state, action_list) = Greeting.fsm t.greeting_state 
                                             [Greeting.Recv_Vminor(Bytes.sub bytes 0 1);
@@ -864,7 +865,8 @@ end = struct
                                              Greeting.Recv_filler   
                                             ] in
                                         let connection_action = convert action_list in 
-                                        ({t with greeting_state = state; expected_bytes_length = 0}, connection_action)
+                                        t.greeting_state <- state; t.expected_bytes_length <- 0;
+                                        connection_action
                                 (* version major + rest *)
                                 | 54 -> let (state, action_list) = Greeting.fsm t.greeting_state 
                                             [Greeting.Recv_Vmajor(Bytes.sub bytes 0 1);
@@ -874,16 +876,17 @@ end = struct
                                              Greeting.Recv_filler   
                                             ] in
                                         let connection_action = convert action_list in 
-                                        ({t with greeting_state = state; expected_bytes_length = 0}, connection_action)
-                                | n -> if n < t.expected_bytes_length then (t, [Close("Message too short")])
+                                        t.greeting_state <- state; t.expected_bytes_length <- 0;
+                                        connection_action
+                                | n -> if n < t.expected_bytes_length then [Close("Message too short")]
                                        else (let expected_length = t.expected_bytes_length in
                                             (* Handle greeting part *)
-                                            let (new_t_1, action_list_1) = fsm t (Bytes.sub bytes 0 expected_length) in
+                                            let action_list_1 = fsm t (Bytes.sub bytes 0 expected_length) in
                                             (* Handle handshake part *)
-                                            let (new_t_2, action_list_2) = fsm new_t_1 (Bytes.sub bytes expected_length (n - expected_length)) in
-                                                (new_t_2, action_list_1 @ action_list_2))
-                        )
-            | HANDSHAKE -> (Logs.info (fun f -> f "Handshake -> FSM\n");
+                                            let action_list_2 = fsm t (Bytes.sub bytes expected_length (n - expected_length)) in
+                                                (action_list_1 @ action_list_2)
+                        ))
+            | HANDSHAKE -> (Logs.info (fun f -> f "Module Connection: Handshake -> FSM\n");
                 let command = Command.of_frame (Frame.of_bytes bytes) in
                             let (new_state, actions) = Security_mechanism.fsm t.handshake_state command in
                             let rec convert handshake_action_list = 
@@ -892,24 +895,25 @@ end = struct
                                     | (hd::tl) -> (match hd with
                                                     | Security_mechanism.Write(b) -> Write(b)::(convert tl)
                                                     | Security_mechanism.Continue -> Continue::(convert tl)
-                                                    | Security_mechanism.Ok -> Logs.info (fun f -> f "Handshake OK\n"); t.stage <- TRAFFIC; convert tl
+                                                    | Security_mechanism.Ok -> Logs.info (fun f -> f "Module Connection: Handshake OK\n"); t.stage <- TRAFFIC; convert tl
                                                     | Security_mechanism.Close -> [Close("Handshake FSM error")]
                                                     | Security_mechanism.Received_property(name, value) -> 
                                                         match name with
                                                             | "Socket-Type" -> (if if_valid_socket_pair (Socket_base.get_socket_type t.socket) (socket_type_from_string value) 
                                                                                then (t.incoming_socket_type <- (socket_type_from_string value); convert tl) else [Close("Socket type mismatch")])
                                                             | "Identity" -> t.incoming_identity <- value; convert tl
-                                                            | _ -> Logs.info (fun f -> f "Ignore unknown identity %s\n" name); convert tl
+                                                            | _ -> Logs.info (fun f -> f "Module Connection: Ignore unknown identity %s\n" name); convert tl
                                                     )
                             in let actions = convert actions in
-                            ({t with handshake_state = new_state}, actions))
-            | TRAFFIC -> Logs.info (fun f -> f "TRAFFIC -> FSM\n");
+                            t.handshake_state <- new_state;
+                            actions)
+            | TRAFFIC -> Logs.info (fun f -> f "Module Connection: TRAFFIC -> FSM\n");
                         let frames = Frame.list_of_bytes bytes in
                             (* Put the received frames into the buffer *)
-                            Logs.info (fun f -> f "%d frames enqueued\n" (List.length frames));
+                            Logs.info (fun f -> f "Module Connection: %d frames enqueued\n" (List.length frames));
                             List.iter (fun x -> !(t.read_buffer_pf) (Some(x))) frames;
-                            (t, [Continue])
-            | CLOSED -> (t, [Close "Connection FSM error"])
+                            [Continue]
+            | CLOSED -> [Close "Connection FSM error"]
 
     let close t = t.stage <- CLOSED; t.send_buffer_pf (Some(Command_close))
 
@@ -927,42 +931,40 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
     let listen s port socket =
     let rec read_and_print flow connection = 
         S.TCPV4.read flow >>= (function
-        | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
-        | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
-        | Ok (`Data b) -> (Logs.info (fun f -> f "read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
-                                let (new_connection, action_list) = Connection.fsm connection (Cstruct.to_bytes b) in
+        | Ok `Eof -> Logs.info (fun f -> f "Module Connection_tcp: Closing connection!");  Lwt.return_unit
+        | Error e -> Logs.warn (fun f -> f "Module Connection_tcp: Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
+        | Ok (`Data b) -> (Logs.info (fun f -> f "Module Connection_tcp: Read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
+                                let action_list = Connection.fsm connection (Cstruct.to_bytes b) in
                                 let rec act actions = 
                                     (match actions with
-                                        | [] -> Lwt.pause() >>= fun () -> read_and_print flow new_connection
+                                        | [] -> Lwt.pause() >>= fun () -> read_and_print flow connection
                                         | (hd::tl) -> 
                                         (match hd with
-                                            | Connection.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                                            | Connection.Write(b) -> Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
                                                             (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
-                                                            | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
+                                                            | Error _ -> (Logs.warn (fun f -> f "Module Connection_tcp: Error writing data to established connection."); Lwt.return_unit)
                                                             | Ok () -> act tl)
-                                            | Connection.Continue -> Logs.info (fun f -> f "Connection FSM Continue\n");
+                                            | Connection.Continue -> Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Continue\n");
                                                             act tl
-                                            | Connection.Close(s) -> Logs.info (fun f -> f "Connection FSM Close due to: %s\n" s);
+                                            | Connection.Close(s) -> Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Close due to: %s\n" s);
                                                          Lwt.return_unit))
-                                in
-                                    Logs.info(fun f -> f "Action list length = %d" (List.length action_list));
-                                    act action_list))
+                                in act action_list))
     in let rec check_and_send_buffer buffer flow = (
         Lwt_stream.peek buffer >>= function
             | None -> Lwt.pause () >>= fun x -> check_and_send_buffer buffer flow
             | Some(data) -> match data with
-                            | Data(b) -> (Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                            | Data(b) -> (Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
                                 S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
-                                   | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
+                                   | Error _ -> (Logs.warn (fun f -> f "Module Connection_tcp: Error writing data to established connection."); Lwt.return_unit)
                                    | Ok () -> check_and_send_buffer buffer flow)
-                            | Command_close -> Logs.info (fun f -> f "Connection instructed to close");
+                            | Command_close -> Logs.info (fun f -> f "Module Connection_tcp: Connection was instructed to close");
                                                S.TCPV4.close flow
     )
     in
         S.listen_tcpv4 s ~port (
             fun flow ->
                 let dst, dst_port = S.TCPV4.dst flow in
-                Logs.info (fun f -> f "new tcp connection from IP %s on port %d" (Ipaddr.V4.to_string dst) dst_port);
+                Logs.info (fun f -> f "Module Connection_tcp: New tcp connection from IP %s on port %d" (Ipaddr.V4.to_string dst) dst_port);
                 let connection = Connection.init socket (Security_mechanism.init (Socket_base.get_security_data socket) (Socket_base.get_metadata socket)) (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port) in
                 let stream, pf = Lwt_stream.create () in 
                     Connection.set_send_pf connection pf;
@@ -973,31 +975,31 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
 
     let connect s addr port connection =
     let ipaddr = Ipaddr.V4.of_string_exn addr in
-    let rec read_and_print flow t = 
+    let rec read_and_print flow connection = 
         S.TCPV4.read flow >>= (function
-        | Ok `Eof -> Logs.info (fun f -> f "Closing connection!");  Lwt.return_unit
-        | Error e -> Logs.warn (fun f -> f "Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
-        | Ok (`Data b) -> (Logs.info (fun f -> f "Read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
-                                let (new_t, action_list) = Connection.fsm t (Cstruct.to_bytes b) in
+        | Ok `Eof -> Logs.info (fun f -> f "Module Connection_tcp: Closing connection!");  Lwt.return_unit
+        | Error e -> Logs.warn (fun f -> f "Module Connection_tcp: Error reading data from established connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
+        | Ok (`Data b) -> (Logs.info (fun f -> f "Module Connection_tcp: Read: %d bytes:\n%s" (Cstruct.len b)  (buffer_to_string (Cstruct.to_bytes b))); 
+                                let action_list = Connection.fsm connection (Cstruct.to_bytes b) in
                                 let rec act actions = 
                                     (match actions with
-                                        | [] -> Lwt.pause() >>= fun () -> read_and_print flow new_t
+                                        | [] -> Lwt.pause() >>= fun () -> read_and_print flow connection
                                         | (hd::tl) -> 
                                         (match hd with
-                                            | Connection.Write(b) -> Logs.info (fun f -> f "Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                                            | Connection.Write(b) -> Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
                                                             (S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
-                                                            | Error _ -> (Logs.warn (fun f -> f "Error writing data to established connection."); Lwt.return_unit)
+                                                            | Error _ -> (Logs.warn (fun f -> f "Module Connection_tcp: Error writing data to established connection."); Lwt.return_unit)
                                                             | Ok () -> act tl)
-                                            | Connection.Continue -> Logs.info (fun f -> f "Connection FSM Continue\n");
+                                            | Connection.Continue -> Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Continue\n");
                                                             act tl
-                                            | Connection.Close(s) -> Logs.info (fun f -> f "Connection FSM Close due to: %s\n" s);
+                                            | Connection.Close(s) -> Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Close due to: %s\n" s);
                                                          Lwt.return_unit))
                                 in
                                     act action_list))
     in
         S.TCPV4.create_connection (S.tcpv4 s) (ipaddr, port) >>= function
             | Ok(f) -> read_and_print f connection
-            | Error(e) -> Logs.warn (fun f -> f "Error establishing connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
+            | Error(e) -> Logs.warn (fun f -> f "Module Connection_tcp: Error establishing connection: %a" S.TCPV4.pp_error e); Lwt.return_unit
 end
 
 module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
