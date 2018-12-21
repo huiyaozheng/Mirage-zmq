@@ -298,9 +298,12 @@ module rec Socket_base : sig
 end = struct
     type socket_states =
         | NONE
-        | Rep of {if_received : bool; 
-                  last_received_connection_tag : string;}
-        | Req
+        | Rep of {
+            if_received : bool; 
+            last_received_connection_tag : string;}
+        | Req of {
+            if_sent : bool;
+            last_sent_connection_tag : string;}
         | Dealer
         | Router
         | Pub
@@ -331,6 +334,7 @@ end = struct
                             reorder_accumu tl accumu 
                         else reorder_accumu tl (hd::accumu) 
     in List.rev (reorder_accumu list [])
+    
     (* End of helper functions *)
 
     let get_socket_type t = t.socket_type
@@ -448,27 +452,70 @@ end = struct
                         )
                 )
                 | _ -> raise Should_Not_Reach)
+        | REQ -> let state = t.socket_states in
+            match state with
+                | Req({if_sent = if_sent; last_sent_connection_tag = tag;}) -> (
+                    if not if_sent then raise (Incorrect_use_of_API "Need to send a request before receiving")
+                    else let find connections = match connections with
+                        | [] -> ()
+                        | hd::tl -> 
+                            if tag = Connection.get_tag (!hd) then
+                                if Connection.get_stage (!hd) = TRAFFIC then
+
+                                else ()
+                            else find tl
+                    in find t.connections
+
+                )
+                | _ -> raise Should_Not_Reach
 (* TODO implement other sockets' behaviour *)
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
-        | REP -> (let state = t.socket_states in
-                    match state with
-                        | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
-                            if not if_received then raise (Incorrect_use_of_API "Need to receive from a REP before sending a message")
-                            else let rec find connections = match connections with
-                                    (* Discard the message if peer no longer connected *)
-                                    | [] -> ()
-                                    | hd::tl -> if tag = Connection.get_tag (!hd) then
-                                                    if Connection.get_stage (!hd) = TRAFFIC then
-                                                        (Connection.send (!hd) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)));
-                                                        t.socket_states <- Rep({if_received = false; last_received_connection_tag = "";}))
-                                                    else ()
-                                                else find tl
-                                in find t.connections
-                        )
-                        | _ -> raise Should_Not_Reach
+(* TODO investigate identity in address envelope *)
+        | REP -> (
+            let state = t.socket_states in
+                match state with
+                    | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
+                        if not if_received then raise (Incorrect_use_of_API "Need to receive a request before sending a message")
+                        else let rec find connections = match connections with
+                                (* Discard the message if peer no longer connected *)
+                                | [] -> ()
+                                | hd::tl -> if tag = Connection.get_tag (!hd) then
+                                                if Connection.get_stage (!hd) = TRAFFIC then
+                                                    (Connection.send (!hd) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)));
+                                                    t.socket_states <- Rep({if_received = false; last_received_connection_tag = "";}))
+                                                else ()
+                                            else find tl
+                            in find t.connections
+                    )
+                    | _ -> raise Should_Not_Reach
                 )
+        | REQ -> (
+            let state = t.socket_states in
+                match state with
+                    | Req({if_sent = if_sent; last_sent_connection_tag = tag;}) -> (
+                        if if_sent then raise (Incorrect_use_of_API "Need to receive a reply before sending another message")
+                        else if t.connections = [] then
+(* TODO make sure the error message is returned back *)
+                            raise Not_Implemented
+                        else let rec check_available_connections connections = match connections with
+                            | [] -> None
+                            | hd::tl -> 
+                                if Connection.get_stage (!hd) = TRAFFIC then 
+                                    Some(hd)
+                                else check_available_connections tl
+                            in check_available_connections t.connections |> function
+(* TODO make sure the error message is returned back *)
+                                | None -> raise Not_Implemented
+                                | Some(connection) -> 
+(* TODO check re-send is working *)
+                                    Connection.send (!connection) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)));
+                                    t.connections <- reorder t.connections connection false;
+                                    t.socket_states <- Req({if_sent = true; last_sent_connection_tag = Connection.get_tag (!connection)})
+                    )
+                    | _ -> raise Should_Not_Reach
+        )
         | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
