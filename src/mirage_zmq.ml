@@ -107,6 +107,9 @@ module Frame : sig
     (** A helper function checking whether a frame is empty (delimiter) *)
     val is_delimiter_frame : t -> bool
 
+    (** Make a delimiter frame*)
+    val delimiter_frame : t
+
     (** A helper function that takes a list of message frames and returns the reconstructed message *)
     val splice_message_frames : t list -> string
 end = struct
@@ -171,6 +174,8 @@ end = struct
 
     let is_delimiter_frame t = (get_if_more t) && (t.size = 0)
 
+    let delimiter_frame = {flag = Char.chr 1; size = 0; body = Bytes.empty}
+
     let splice_message_frames list = 
     let rec splice_message_frames_accumu list s = match list with 
         | [] -> s
@@ -217,7 +222,7 @@ module Message : sig
     type t
 
     (** Make a message from the string *)
-    val of_string : string -> ?if_long : bool -> t
+    val of_string : string -> ?if_long : bool -> ?if_more : bool -> t
 
     (** Make a list of messages from the string to send *)
     val list_of_string : string -> t list
@@ -238,19 +243,19 @@ end = struct
         (* Assume Sys.max_string_length < max_int *)
         if length > 1020 then
             (* Make a LONG message *)
-            [of_string msg ~if_long=true ~if_more=false]
+            [of_string msg ~if_long:true ~if_more:false]
         else
             (* Make short messages *)
             let rec make msg list = 
             let length = String.length msg in
                 if length > 255 then
-                    make (String.sub msg 255 (length - 255)) ((of_string (String.sub msg 0 255) ~if_long=false ~if_more=true)::list)
+                    make (String.sub msg 255 (length - 255)) ((of_string (String.sub msg 0 255) ~if_long:false ~if_more:true)::list)
                 else
-                    (of_string msg ~if_long=false ~if_more=false)::list
+                    (of_string msg ~if_long:false ~if_more:false)::list
             in 
                 List.rev (make msg [])
 
-    let to_frame t = Frame.make_frame t.body ~if_more=t.if_more ~if_command=false
+    let to_frame t = Frame.make_frame t.body ~if_more:t.if_more ~if_command:false
 end
 
 module Context : sig 
@@ -471,7 +476,8 @@ end = struct
                                     | [] -> ()
                                     | hd::tl -> if tag = Connection.get_tag (!hd) then
                                                     if Connection.get_stage (!hd) = TRAFFIC then
-                                                        Connection.send (!hd) (List.map (fun x -> Message.to_frame x) (Message.list_of_string msg))
+                                                        (Connection.send (!hd) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)));
+                                                        t.socket_states <- Rep({if_received = false; last_received_connection_tag = "";}))
                                                     else ()
                                                 else find tl
                                 in find t.connections
@@ -1006,7 +1012,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                             | Data(b) -> (Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
                                 S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
                                    | Error _ -> (Logs.warn (fun f -> f "Module Connection_tcp: Error writing data to established connection."); Lwt.return_unit)
-                                   | Ok () -> check_and_send_buffer buffer flow)
+                                   | Ok () -> Lwt_stream.junk buffer >>= fun () -> check_and_send_buffer buffer flow)
                             | Command_close -> Logs.info (fun f -> f "Module Connection_tcp: Connection was instructed to close");
                                                S.TCPV4.close flow
     )
