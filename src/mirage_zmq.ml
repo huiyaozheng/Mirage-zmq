@@ -334,6 +334,18 @@ end = struct
                             reorder_accumu tl accumu 
                         else reorder_accumu tl (hd::accumu) 
     in List.rev (reorder_accumu list [])
+
+    (** Get the next list of frames containing a complete message/command from the read buffer *)
+    let get_frame_list connection = 
+    let rec get_reverse_frame_list_accumu list = 
+        Lwt_stream.get (!(Connection.get_buffer (!connection))) >>= function
+            | None -> (* Received data not complete *) Lwt.return None
+            | Some(next_frame) -> 
+                if Frame.get_if_more next_frame then get_reverse_frame_list_accumu (next_frame::list) 
+                else Lwt.return (Some(next_frame::list))
+    in  get_reverse_frame_list_accumu [] >>= function
+        | None -> Lwt.return_none
+        | Some(frames) -> Lwt.return_some (List.rev frames)
     
     (* End of helper functions *)
 
@@ -364,7 +376,10 @@ end = struct
                 security_mechanism = mechanism; 
                 security_info = Null; 
                 connections = [];
-                socket_states = Req;
+                socket_states = Req({
+                    if_sent = false;
+                    last_sent_connection_tag = "";
+                    });
                 }
             | DEALER -> {
                 socket_type = socket_type; 
@@ -428,13 +443,7 @@ end = struct
                                   (* Find the tagged connection *)
                                   let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
                                   (* Reconstruct message from the connection *)
-                                  let rec get_reverse_frame_list list = 
-                                      Lwt_stream.get (!(Connection.get_buffer (!connection))) >>= function
-                                          | None -> (* Received data not complete *) Lwt.return None
-                                          | Some(next_frame) -> if Frame.get_if_more next_frame then get_reverse_frame_list (next_frame::list) 
-                                                                else Lwt.return (Some(next_frame::list))
-                                  in
-                                      get_reverse_frame_list [] >>= function 
+                                      get_frame_list connection >>= function 
                                       | None -> 
                                         Connection.close (!connection); 
                                         t.connections <- (reorder t.connections connection true);
@@ -442,8 +451,8 @@ end = struct
                                       | Some(frames) -> 
                                       (* Put the received connection at the end of the queue *)
                                       t.connections <- (reorder t.connections connection false);
-                                      t.socket_states <- Rep{if_received = true; last_received_connection_tag = Connection.get_tag (!connection);};
-                                        Lwt.return (Frame.splice_message_frames (List.rev frames))                
+                                      t.socket_states <- Rep({if_received = true; last_received_connection_tag = Connection.get_tag (!connection);});
+                                        Lwt.return (Frame.splice_message_frames  frames)                
                                 else (* Protocol error, close the connection and try again *) 
                                     let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
                                         Connection.close (!connection);
@@ -452,22 +461,35 @@ end = struct
                         )
                 )
                 | _ -> raise Should_Not_Reach)
-        | REQ -> let state = t.socket_states in
+        | REQ -> (let state = t.socket_states in
             match state with
                 | Req({if_sent = if_sent; last_sent_connection_tag = tag;}) -> (
                     if not if_sent then raise (Incorrect_use_of_API "Need to send a request before receiving")
-                    else let find connections = match connections with
-                        | [] -> ()
+                    else 
+                        let result = ref None in
+                        let rec find connections = match connections with
+                        | [] -> Lwt.return_some(!result)
                         | hd::tl -> 
                             if tag = Connection.get_tag (!hd) then
-                                if Connection.get_stage (!hd) = TRAFFIC then
-
-                                else ()
-                            else find tl
-                    in find t.connections
-
+                                if Connection.get_stage (!hd) = TRAFFIC then 
+                                    get_frame_list hd >>= function
+                                        | None -> Lwt.return_none
+                                        | Some(frames) -> 
+                                            t.socket_states <- Req({if_sent = false; last_sent_connection_tag = "";});
+                                            result := Some(Frame.splice_message_frames frames);
+                                            find tl
+                                else 
+(* TODO recover from a closed connection? *)
+                                    raise (Internal_Error "Connection closed")
+                            else 
+                                (* Discard all frames from the connection *)
+                                Lwt_stream.junk_old (!(Connection.get_buffer (!hd))) >>= fun () -> find tl
+                    in find t.connections >>= function
+                        | Some(result) ->  (match result with Some(result) -> Lwt.return result | None -> recv t)
+                        | None -> recv t
                 )
                 | _ -> raise Should_Not_Reach
+            )
 (* TODO implement other sockets' behaviour *)
         | _ -> raise Not_Implemented
 
@@ -1067,7 +1089,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
         );
         S.listen s
 
-    let connect s addr port connection =
+    let rec connect s addr port connection =
     let ipaddr = Ipaddr.V4.of_string_exn addr in
         S.TCPV4.create_connection (S.tcpv4 s) (ipaddr, port) >>= function
             | Ok(flow) -> 
@@ -1075,8 +1097,8 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                     Connection.set_send_pf connection pf;
                     Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]
             | Error(e) -> 
-                Logs.warn (fun f -> f "Module Connection_tcp: Error establishing connection: %a" S.TCPV4.pp_error e); 
-                Lwt.return_unit
+                Logs.warn (fun f -> f "Module Connection_tcp: Error establishing connection: %a, retrying" S.TCPV4.pp_error e); 
+                connect s addr port connection
 end
 
 module Socket_tcp (S : Mirage_stack_lwt.V4) : sig

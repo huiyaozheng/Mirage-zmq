@@ -5,6 +5,6 @@ let main = foreign "Unikernel.Main" (stackv4 @-> job)
 let stack = generic_stackv4 default_network
 
 let () =
-  register "network"  [
+  register "req_client"  [
     main $ stack
   ]
