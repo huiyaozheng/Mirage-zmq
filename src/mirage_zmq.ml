@@ -1095,7 +1095,9 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
             | Ok(flow) -> 
                 let stream, pf = Lwt_stream.create () in 
                     Connection.set_send_pf connection pf;
-                    Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]
+                    Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]);
+(* TODO wait until TRAFFIC then return? *)
+                    Lwt.return_unit
             | Error(e) -> 
                 Logs.warn (fun f -> f "Module Connection_tcp: Error establishing connection: %a, retrying" S.TCPV4.pp_error e); 
                 connect s addr port connection
@@ -1126,7 +1128,7 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
     val bind : t -> int -> S.t -> unit
     
     (** Bind a connection to a remote TCP port to the socket *)
-    val connect : t -> string -> int -> S.t -> unit
+    val connect : t -> string -> int -> S.t -> unit Lwt.t
 end = struct
     type transport_info = Tcp of string * int
 
@@ -1161,6 +1163,6 @@ end = struct
     let module C_tcp = Connection_tcp (S) in
     let connection = Connection.init t.socket (Security_mechanism.init (Socket_base.get_security_data t.socket) (Socket_base.get_metadata t.socket)) (tag_of_tcp_connection ipaddr port) in
         Socket_base.add_connection t.socket (ref connection);
-        Lwt.async (fun () -> C_tcp.connect s ipaddr port connection)
+        C_tcp.connect s ipaddr port connection
     
 end

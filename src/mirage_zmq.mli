@@ -35,6 +35,6 @@ module Socket_tcp : functor (S : Mirage_stack_lwt.V4) -> sig
     val bind : t -> int -> S.t -> unit
     
     (** Bind a connection to a remote TCP port to the socket *)
-    val connect : t -> string -> int -> S.t -> unit
+    val connect : t -> string -> int -> S.t -> unit Lwt.t
 end
 
