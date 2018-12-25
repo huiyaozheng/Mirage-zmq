@@ -1096,8 +1096,10 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                 let stream, pf = Lwt_stream.create () in 
                     Connection.set_send_pf connection pf;
                     Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]);
-(* TODO wait until TRAFFIC then return? *)
-                    Lwt.return_unit
+                let rec wait_until_traffic () =
+                    if Connection.get_stage connection <> TRAFFIC then Lwt.pause() >>= fun () -> wait_until_traffic ()
+                    else Lwt.return_unit
+                in wait_until_traffic ()
             | Error(e) -> 
                 Logs.warn (fun f -> f "Module Connection_tcp: Error establishing connection: %a, retrying" S.TCPV4.pp_error e); 
                 connect s addr port connection
