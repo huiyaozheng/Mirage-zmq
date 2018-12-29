@@ -1,5 +1,7 @@
 open Lwt.Infix
 
+let default_queue_size = 10
+
 exception Not_Implemented
 exception Should_Not_Reach
 exception Socket_Name_Not_Recognised
@@ -287,6 +289,12 @@ module rec Socket_base : sig
 
     (** Set identity string of a socket if applicable *)
     val set_identity : t -> string -> unit
+
+    (** Set the maximum capacity of the incoming queue *)
+    val set_incoming_queue_size: t -> int -> unit
+
+    (** Set the maximum capacity of the outgoing queue *)
+    val set_outgoing_queue_size: t -> int -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
     val recv : t -> string Lwt.t
@@ -320,7 +328,9 @@ end = struct
         security_mechanism : mechanism_type;
         mutable security_info : security_data;
         mutable connections : (Connection.t ref) list;
-        mutable socket_states : socket_states
+        mutable socket_states : socket_states;
+        mutable incoming_queue_size : int;
+        mutable outgoing_queue_size : int;
     }
 
     (* Start of helper functions *)
@@ -369,6 +379,8 @@ end = struct
                     if_received = false;
                     last_received_connection_tag = "";
                     });
+                incoming_queue_size = 0;
+                outgoing_queue_size = 0;
                 }
             | REQ -> {
                 socket_type = socket_type; 
@@ -380,6 +392,8 @@ end = struct
                     if_sent = false;
                     last_sent_connection_tag = "";
                     });
+                incoming_queue_size = 0;
+                outgoing_queue_size = 0;
                 }
             | DEALER -> {
                 socket_type = socket_type; 
@@ -388,6 +402,8 @@ end = struct
                 security_info = Null; 
                 connections = [];
                 socket_states = Dealer;
+                incoming_queue_size = default_queue_size;
+                outgoing_queue_size = default_queue_size;
                 }
             | ROUTER -> {
                 socket_type = socket_type; 
@@ -395,7 +411,9 @@ end = struct
                 security_mechanism = mechanism; 
                 security_info = Null; 
                 connections = [];
-                socket_states = Router
+                socket_states = Router;
+                incoming_queue_size = default_queue_size;
+                outgoing_queue_size = default_queue_size;
                 }
             | _ -> raise Not_Implemented
     
@@ -413,6 +431,10 @@ end = struct
                 t.metadata <- List.map set t.metadata
         )
         else ()
+
+    let set_incoming_queue_size t size = t.incoming_queue_size <- size
+
+    let set_outgoing_queue_size t size = t.outgoing_queue_size <- size
 
     let rec recv t = 
         match t.socket_type with 
@@ -1119,6 +1141,12 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
 
     (** Set identity string of a socket if applicable *)
     val set_identity : t -> string -> unit
+
+    (** Set the maximum capacity of the incoming queue *)
+    val set_incoming_queue_size: t -> int -> unit
+
+    (** Set the maximum capacity of the outgoing queue *)
+    val set_outgoing_queue_size: t -> int -> unit
     
     (** Receive a msg from the underlying connections, according to the  semantics of the socket type *)
     val recv : t -> string Lwt.t
@@ -1150,6 +1178,12 @@ end = struct
 
     let set_identity t identity =
         Socket_base.set_identity t.socket identity
+
+    let set_incoming_queue_size t size =
+        Socket_base.set_incoming_queue_size t.socket size
+
+    let set_outgoing_queue_size t size =
+        Socket_base.set_outgoing_queue_size t.socket size
     
     let recv t =
         Socket_base.recv t.socket
