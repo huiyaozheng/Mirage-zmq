@@ -24,6 +24,12 @@ module Socket_tcp : functor (S : Mirage_stack_lwt.V4) -> sig
 
     (** Set identity string of a socket if applicable *)
     val set_identity : t -> string -> unit
+
+    (** Set the maximum capacity of the incoming queue in terms of messages *)
+    val set_incoming_queue_size: t -> int -> unit
+
+    (** Set the maximum capacity of the outgoing queue in terms of messages *)
+    val set_outgoing_queue_size: t -> int -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
     val recv : t -> string Lwt.t

@@ -67,6 +67,14 @@ let content = ref [] in
 (** Creates a tag for a TCP connection *)
 let tag_of_tcp_connection ipaddr port =
     String.concat "." ["TCP"; ipaddr; string_of_int port]
+
+(** Whether the socket type has connections with limited-size queues *)
+(* TODO complete checking all socket types*)
+let if_queue_size_limited socket =
+    match socket with 
+        | REP | REQ -> false
+        | DEALER | ROUTER -> true
+        | _ -> false
 (* End of helper functions *)
 module Frame : sig
     type t
@@ -329,8 +337,8 @@ end = struct
         mutable security_info : security_data;
         mutable connections : (Connection.t ref) list;
         mutable socket_states : socket_states;
-        mutable incoming_queue_size : int;
-        mutable outgoing_queue_size : int;
+        mutable incoming_queue_size : int option;
+        mutable outgoing_queue_size : int option;
     }
 
     (* Start of helper functions *)
@@ -379,8 +387,8 @@ end = struct
                     if_received = false;
                     last_received_connection_tag = "";
                     });
-                incoming_queue_size = 0;
-                outgoing_queue_size = 0;
+                incoming_queue_size = None;
+                outgoing_queue_size = None;
                 }
             | REQ -> {
                 socket_type = socket_type; 
@@ -392,8 +400,8 @@ end = struct
                     if_sent = false;
                     last_sent_connection_tag = "";
                     });
-                incoming_queue_size = 0;
-                outgoing_queue_size = 0;
+                incoming_queue_size = None;
+                outgoing_queue_size = None;
                 }
             | DEALER -> {
                 socket_type = socket_type; 
@@ -402,8 +410,8 @@ end = struct
                 security_info = Null; 
                 connections = [];
                 socket_states = Dealer;
-                incoming_queue_size = default_queue_size;
-                outgoing_queue_size = default_queue_size;
+                incoming_queue_size = None;
+                outgoing_queue_size = None;
                 }
             | ROUTER -> {
                 socket_type = socket_type; 
@@ -412,8 +420,8 @@ end = struct
                 security_info = Null; 
                 connections = [];
                 socket_states = Router;
-                incoming_queue_size = default_queue_size;
-                outgoing_queue_size = default_queue_size;
+                incoming_queue_size = None;
+                outgoing_queue_size = None;
                 }
             | _ -> raise Not_Implemented
     
@@ -432,9 +440,13 @@ end = struct
         )
         else ()
 
-    let set_incoming_queue_size t size = t.incoming_queue_size <- size
+    let set_incoming_queue_size t size = t.incoming_queue_size <- Some(size)
 
-    let set_outgoing_queue_size t size = t.outgoing_queue_size <- size
+    let get_incoming_queue_size t = t.incoming_queue_size
+
+    let set_outgoing_queue_size t size = t.outgoing_queue_size <- Some(size)
+
+    let get_outgoing_queue_size t = t.outgoing_queue_size
 
     let rec recv t = 
         match t.socket_type with 
@@ -918,12 +930,14 @@ end = struct
         read_buffer_pf : (Frame.t option -> unit) ref;
         mutable send_buffer : connection_buffer_object Lwt_stream.t;
         mutable send_buffer_pf : connection_buffer_object option -> unit;
+        mutable send_buffer_pf_bounded : connection_buffer_object option Lwt_stream.bounded_push ref;
     }
 
     let init socket security_mechanism tag = 
-    let stream, pf = Lwt_stream.create () in 
-    let ref_stream = ref stream in 
-    let ref_pf = ref pf in {
+    let read_stream, read_pf = Lwt_stream.create () in 
+    let ref_stream = ref read_stream in 
+    let ref_pf = ref read_pf in 
+    let _ , send_buffer_pf = Lwt_stream.create_bounded 1 in {
         tag = tag;
         socket = socket;
         greeting_state = Greeting.init security_mechanism;
@@ -937,7 +951,8 @@ end = struct
         read_buffer_pf = ref_pf;
         send_buffer = Lwt_stream.of_list [];
         send_buffer_pf = fun x -> ();
-    }
+        send_buffer_pf_bounded = ref send_buffer_pf;
+    } 
 
     let get_tag t = t.tag
 
@@ -1050,13 +1065,26 @@ end = struct
     let close t = t.stage <- CLOSED; t.send_buffer_pf (Some(Command_close))
 
     let send t msg_list = 
-        List.iter (fun x -> t.send_buffer_pf (Some(Data(Frame.to_bytes x)))) msg_list
+        if not (if_queue_size_limited (Socket_base.get_socket_type t.socket)) then
+            (* Unbounded sending queue *)
+            List.iter (fun x -> t.send_buffer_pf (Some(Data(Frame.to_bytes x)))) msg_list
+        else
+            (* Sending queue of limited size *)
+            let rec f x = 
+                try
+                    t.send_buffer_pf_bounded#push (Some(Data(Frame.to_bytes x))) 
+                with Lwt_stream.Full -> Lwt.pause () >>= fun () -> f x
+            in
+            Lwt.async(fun () -> Lwt_list.iter_s f msg_list)
 
     let set_send_buffer t buffer =
         t.send_buffer <- buffer
 
     let set_send_pf t pf =
         t.send_buffer_pf <- pf
+
+    let set_send_pf_bounded t pf =
+        t.send_buffer_pf_bounded <- pf
 end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
