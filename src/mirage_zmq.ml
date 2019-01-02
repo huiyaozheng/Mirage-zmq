@@ -286,6 +286,12 @@ module rec Socket_base : sig
 
     (** Get the security credentials of the socket *)
     val get_security_data : t -> security_data
+
+    (** Get the maximum capacity of the incoming queue *)
+    val get_incoming_queue_size: t -> int
+
+    (** Get the maximum capacity of the outgoing queue *)
+    val get_outgoing_queue_size: t -> int
     
     (** Create a socket from the given context, mechanism and type *)
     val create_socket : Context.t -> ?mechanism:mechanism_type -> socket_type -> t
@@ -376,6 +382,14 @@ end = struct
     
     let get_security_data t = t.security_info
 
+    let get_incoming_queue_size t = match t.incoming_queue_size with
+        | Some(x) -> x
+        | None -> raise (Internal_Error "Incoming queue size is not defined")
+
+    let get_outgoing_queue_size t = match t.outgoing_queue_size with
+        | Some(x) -> x
+        | None -> raise (Internal_Error "Incoming queue size is not defined")
+
     let create_socket context ?(mechanism=NULL) socket_type = 
         match socket_type with 
             | REP -> {
@@ -443,11 +457,7 @@ end = struct
 
     let set_incoming_queue_size t size = t.incoming_queue_size <- Some(size)
 
-    let get_incoming_queue_size t = t.incoming_queue_size
-
     let set_outgoing_queue_size t size = t.outgoing_queue_size <- Some(size)
-
-    let get_outgoing_queue_size t = t.outgoing_queue_size
 
     let rec recv t = 
         match t.socket_type with 
@@ -526,6 +536,8 @@ end = struct
                 | _ -> raise Should_Not_Reach
             )
 (* TODO implement other sockets' behaviour *)
+        | DEALER ->
+        | ROUTER ->
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
@@ -573,6 +585,8 @@ end = struct
                     )
                     | _ -> raise Should_Not_Reach
         )
+        | DEALER ->
+        | ROUTER ->
         | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
@@ -913,6 +927,9 @@ and Connection : sig
 
     (** Set the push function of the send buffer *)
     val set_send_pf : t -> (connection_buffer_object option -> unit) -> unit
+
+    (** Set the push function of the bounded send buffer *)
+    val set_send_pf_bounded : t -> connection_buffer_object Lwt_stream.bounded_push  -> unit 
 end = struct 
 
     type action = | Write of bytes | Continue | Close of string
@@ -931,7 +948,7 @@ end = struct
         read_buffer_pf : (Frame.t option -> unit) ref;
         mutable send_buffer : connection_buffer_object Lwt_stream.t;
         mutable send_buffer_pf : connection_buffer_object option -> unit;
-        mutable send_buffer_pf_bounded : (connection_buffer_object option) Lwt_stream.bounded_push ref option;
+        mutable send_buffer_pf_bounded : connection_buffer_object Lwt_stream.bounded_push ref option;
     }
 
     let init socket security_mechanism tag = 
@@ -1076,7 +1093,7 @@ end = struct
                     | Some(ref_f) -> 
                         let rec f x =
                             try
-                                (!ref_f#push) (Some(Data(Frame.to_bytes x))) 
+                                (!ref_f#push) (Data(Frame.to_bytes x))
                             with Lwt_stream.Full -> Lwt.pause () >>= fun () -> f x
                         in
                         Lwt_list.iter_s f msg_list
@@ -1089,7 +1106,7 @@ end = struct
         t.send_buffer_pf <- pf
 
     let set_send_pf_bounded t pf =
-        t.send_buffer_pf_bounded <- pf
+        t.send_buffer_pf_bounded <- Some(ref pf)
 end
 
 module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
@@ -1137,10 +1154,16 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                 let dst, dst_port = S.TCPV4.dst flow in
                 Logs.info (fun f -> f "Module Connection_tcp: New tcp connection from IP %s on port %d" (Ipaddr.V4.to_string dst) dst_port);
                 let connection = Connection.init socket (Security_mechanism.init (Socket_base.get_security_data socket) (Socket_base.get_metadata socket)) (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port) in
-                let stream, pf = Lwt_stream.create () in 
-                    Connection.set_send_pf connection pf;
-                    Socket_base.add_connection socket (ref connection);
-                    Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]
+                    if if_queue_size_limited (Socket_base.get_socket_type socket) then (
+                        let stream, pf = Lwt_stream.create_bounded (Socket_base.get_outgoing_queue_size socket) in 
+                            Connection.set_send_pf_bounded connection pf;
+                            Socket_base.add_connection socket (ref connection);
+                            Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow])
+                    else (
+                        let stream, pf = Lwt_stream.create () in 
+                            Connection.set_send_pf connection pf;
+                            Socket_base.add_connection socket (ref connection);
+                            Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow])
         );
         S.listen s
 
@@ -1148,9 +1171,16 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
     let ipaddr = Ipaddr.V4.of_string_exn addr in
         S.TCPV4.create_connection (S.tcpv4 s) (ipaddr, port) >>= function
             | Ok(flow) -> 
-                let stream, pf = Lwt_stream.create () in 
-                    Connection.set_send_pf connection pf;
-                    Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]);
+                if if_queue_size_limited (Socket_base.get_socket_type socket) then (
+                    let stream, pf = Lwt_stream.create_bounded (Socket_base.get_outgoing_queue_size socket) in 
+                        Connection.set_send_pf_bounded connection pf;
+                        Socket_base.add_connection socket (ref connection);
+                        Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]))
+                else (
+                    let stream, pf = Lwt_stream.create () in 
+                        Connection.set_send_pf connection pf;
+                        Socket_base.add_connection socket (ref connection);
+                        Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]));
                 let rec wait_until_traffic () =
                     if Connection.get_stage connection <> TRAFFIC then Lwt.pause() >>= fun () -> wait_until_traffic ()
                     else Lwt.return_unit
