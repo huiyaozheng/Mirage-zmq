@@ -497,7 +497,7 @@ end = struct
                                       (* Put the received connection at the end of the queue *)
                                       t.connections <- (reorder t.connections connection false);
                                       t.socket_states <- Rep({if_received = true; last_received_connection_tag = Connection.get_tag (!connection);});
-                                        Lwt.return (Frame.splice_message_frames  frames)                
+                                        Lwt.return (Frame.splice_message_frames frames)                
                                 else (* Protocol error, close the connection and try again *) 
                                     let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
                                         Connection.close (!connection);
@@ -529,15 +529,47 @@ end = struct
                             else 
                                 (* Discard all frames from the connection *)
                                 Lwt_stream.junk_old (!(Connection.get_buffer (!hd))) >>= fun () -> find tl
-                    in find t.connections >>= function
-                        | Some(result) ->  (match result with Some(result) -> Lwt.return result | None -> recv t)
-                        | None -> recv t
+                        in find t.connections >>= function
+                            | Some(result) ->  (match result with Some(result) -> Lwt.return result | None -> recv t)
+                            | None -> recv t
                 )
                 | _ -> raise Should_Not_Reach
             )
+        | DEALER -> (let state = t.socket_states in
+                    match state with
+                        | Dealer -> 
+                            (if t.connections = [] then (Lwt.pause() >>= fun () -> recv t)
+                            else let rec check_buffer connections = match connections with
+                              (* If no connection in the list, wait for an incoming connection *)
+                              | [] -> Lwt.return None
+                              | hd::tl -> 
+                                  if Connection.get_stage (!hd) = TRAFFIC then
+                                      (let buffer = !(Connection.get_buffer (!hd)) in
+                                          Lwt_stream.is_empty buffer >>= function
+                                              | true -> check_buffer tl
+                                              | false -> Lwt.return (Some(Connection.get_tag (!hd)))
+                                      )
+                                  else check_buffer tl
+                            in check_buffer t.connections >>= function
+                                  | None -> Lwt.pause() >>= fun () -> recv t
+                                  | Some(tag) -> (
+                                          (* Find the tagged connection *)
+                                          let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
+                                          (* Reconstruct message from the connection *)
+                                              get_frame_list connection >>= function 
+                                              | None -> 
+                                                Connection.close (!connection); 
+                                                t.connections <- (reorder t.connections connection true);
+                                                Lwt.pause() >>= fun () -> recv t
+                                              | Some(frames) -> 
+                                              (* Put the received connection at the end of the queue *)
+                                              t.connections <- (reorder t.connections connection false);
+                                              Lwt.return (Frame.splice_message_frames frames)                
+
+                                ))
+                        | _ -> raise Should_Not_Reach)
+        | ROUTER -> raise Not_Implemented
 (* TODO implement other sockets' behaviour *)
-        | DEALER ->
-        | ROUTER ->
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
@@ -585,8 +617,8 @@ end = struct
                     )
                     | _ -> raise Should_Not_Reach
         )
-        | DEALER ->
-        | ROUTER ->
+        | DEALER -> raise Not_Implemented
+        | ROUTER -> raise Not_Implemented
         | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
