@@ -16,6 +16,7 @@ type socket_metadata = (string * string) list
 type security_data = Null | Plain_client of string * string | Plain_server of (string * string) list
 type connection_stage = GREETING | HANDSHAKE | TRAFFIC | CLOSED
 type connection_buffer_object = Data of Bytes.t | Command_close
+type io_buffer_pf_bounded = Applicable of ((connection_buffer_object option) Lwt_stream.bounded_push ref) | NA
 
 (* Start of helper functions *)
 (** Returns the socket type from string *)
@@ -930,14 +931,13 @@ end = struct
         read_buffer_pf : (Frame.t option -> unit) ref;
         mutable send_buffer : connection_buffer_object Lwt_stream.t;
         mutable send_buffer_pf : connection_buffer_object option -> unit;
-        mutable send_buffer_pf_bounded : connection_buffer_object option Lwt_stream.bounded_push ref;
+        mutable send_buffer_pf_bounded : (connection_buffer_object option) Lwt_stream.bounded_push ref option;
     }
 
     let init socket security_mechanism tag = 
     let read_stream, read_pf = Lwt_stream.create () in 
     let ref_stream = ref read_stream in 
-    let ref_pf = ref read_pf in 
-    let _ , send_buffer_pf = Lwt_stream.create_bounded 1 in {
+    let ref_pf = ref read_pf in {
         tag = tag;
         socket = socket;
         greeting_state = Greeting.init security_mechanism;
@@ -950,9 +950,9 @@ end = struct
         read_buffer = ref_stream;
         read_buffer_pf = ref_pf;
         send_buffer = Lwt_stream.of_list [];
-        send_buffer_pf = fun x -> ();
-        send_buffer_pf_bounded = ref send_buffer_pf;
-    } 
+        send_buffer_pf = (fun x -> ());
+        send_buffer_pf_bounded = None;
+    }
 
     let get_tag t = t.tag
 
@@ -1070,12 +1070,17 @@ end = struct
             List.iter (fun x -> t.send_buffer_pf (Some(Data(Frame.to_bytes x)))) msg_list
         else
             (* Sending queue of limited size *)
-            let rec f x = 
-                try
-                    t.send_buffer_pf_bounded#push (Some(Data(Frame.to_bytes x))) 
-                with Lwt_stream.Full -> Lwt.pause () >>= fun () -> f x
-            in
-            Lwt.async(fun () -> Lwt_list.iter_s f msg_list)
+            Lwt.async (fun () -> 
+                match t.send_buffer_pf_bounded with
+                    | None -> raise (Internal_Error "")
+                    | Some(ref_f) -> 
+                        let rec f x =
+                            try
+                                (!ref_f#push) (Some(Data(Frame.to_bytes x))) 
+                            with Lwt_stream.Full -> Lwt.pause () >>= fun () -> f x
+                        in
+                        Lwt_list.iter_s f msg_list
+            )
 
     let set_send_buffer t buffer =
         t.send_buffer <- buffer
