@@ -944,6 +944,8 @@ and Connection : sig
 
     (** Get the stage of the connection. It is considered usable if in TRAFFIC *)
     val get_stage : t -> connection_stage
+
+    val get_socket : t -> Socket_base.t
     
     (** FSM for handing raw bytes transmission *)
     val fsm : t -> Bytes.t -> action list
@@ -1008,6 +1010,8 @@ end = struct
     let get_stage t = t.stage
 
     let get_buffer t = t.read_buffer
+
+    let get_socket t = t.socket
 
     let rec fsm t bytes = 
         match t.stage with
@@ -1203,15 +1207,16 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
     let ipaddr = Ipaddr.V4.of_string_exn addr in
         S.TCPV4.create_connection (S.tcpv4 s) (ipaddr, port) >>= function
             | Ok(flow) -> 
-                if if_queue_size_limited (Socket_base.get_socket_type socket) then (
-                    let stream, pf = Lwt_stream.create_bounded (Socket_base.get_outgoing_queue_size socket) in 
+                if if_queue_size_limited (Socket_base.get_socket_type (Connection.get_socket connection)) then (
+                    let stream, pf = Lwt_stream.create_bounded (Socket_base.get_outgoing_queue_size (Connection.get_socket connection)) in 
                         Connection.set_send_pf_bounded connection pf;
-                        Socket_base.add_connection socket (ref connection);
+(* !!! TODO make sure the connection is added to the original copy of socket_base *)
+                        Socket_base.add_connection (Connection.get_socket connection) (ref connection);
                         Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]))
                 else (
                     let stream, pf = Lwt_stream.create () in 
                         Connection.set_send_pf connection pf;
-                        Socket_base.add_connection socket (ref connection);
+                        Socket_base.add_connection (Connection.get_socket connection) (ref connection);
                         Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]));
                 let rec wait_until_traffic () =
                     if Connection.get_stage connection <> TRAFFIC then Lwt.pause() >>= fun () -> wait_until_traffic ()
