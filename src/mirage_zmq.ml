@@ -12,10 +12,12 @@ exception Incorrect_use_of_API of string
 type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH | PULL | PAIR
 (* CURVE not implemented *)
 type mechanism_type = NULL | PLAIN
+type message_component = Data of string | Identity of string
+type message = message_component list
 type socket_metadata = (string * string) list
 type security_data = Null | Plain_client of string * string | Plain_server of (string * string) list
 type connection_stage = GREETING | HANDSHAKE | TRAFFIC | CLOSED
-type connection_buffer_object = Data of Bytes.t | Command_close
+type connection_buffer_object = Command_data of Bytes.t | Command_close
 type io_buffer_pf_bounded = Applicable of ((connection_buffer_object option) Lwt_stream.bounded_push ref) | NA
 
 (* Start of helper functions *)
@@ -312,10 +314,10 @@ module rec Socket_base : sig
     val set_outgoing_queue_size: t -> int -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
-    val recv : t -> string Lwt.t
+    val recv : t -> message Lwt.t
     
     (** Send a msg to the underlying connections, according to the semantics of the socket type *)
-    val send : t -> string -> unit
+    val send : t -> message -> unit
 
     val add_connection : t -> Connection.t ref -> unit
 end = struct
@@ -449,11 +451,12 @@ end = struct
         else raise Not_Able_To_Set_Credentials
 
     let set_identity t identity =
-        if t.socket_type = DEALER then (
-            let set (name, value) = if name = "Identity" then (name, identity) else (name, value) in
-                t.metadata <- List.map set t.metadata
-        )
-        else ()
+    let set (name, value) = if name = "Identity" then (name, identity) else (name, value) in
+        if List.fold_left (fun b (name, _) -> b || (name = "Identity")) false t.metadata then
+            t.metadata <- List.map set t.metadata
+        else 
+            t.metadata <- (t.metadata @ [("Identity", identity)])
+       
 
     let set_incoming_queue_size t size = t.incoming_queue_size <- Some(size)
 
@@ -483,6 +486,7 @@ end = struct
                     in check_buffer t.connections >>= function
                           | None -> Lwt.pause() >>= fun () -> recv t
                           | Some((frame,tag)) -> (
+(* TODO remove and save address frames *)
                               (* Messages are separated by an empty delimiter *)
                               if Frame.is_delimiter_frame frame then    
                                   (* Find the tagged connection *)
@@ -497,7 +501,7 @@ end = struct
                                       (* Put the received connection at the end of the queue *)
                                       t.connections <- (reorder t.connections connection false);
                                       t.socket_states <- Rep({if_received = true; last_received_connection_tag = Connection.get_tag (!connection);});
-                                        Lwt.return (Frame.splice_message_frames frames)                
+                                        Lwt.return ([Data(Frame.splice_message_frames frames)])                
                                 else (* Protocol error, close the connection and try again *) 
                                     let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
                                         Connection.close (!connection);
@@ -530,7 +534,7 @@ end = struct
                                 (* Discard all frames from the connection *)
                                 Lwt_stream.junk_old (!(Connection.get_buffer (!hd))) >>= fun () -> find tl
                         in find t.connections >>= function
-                            | Some(result) ->  (match result with Some(result) -> Lwt.return result | None -> recv t)
+                            | Some(result) ->  (match result with Some(result) -> Lwt.return [Data(result)] | None -> recv t)
                             | None -> recv t
                 )
                 | _ -> raise Should_Not_Reach
@@ -564,7 +568,7 @@ end = struct
                                               | Some(frames) -> 
                                               (* Put the received connection at the end of the queue *)
                                               t.connections <- (reorder t.connections connection false);
-                                              Lwt.return (Frame.splice_message_frames frames)                
+                                              Lwt.return [Data(Frame.splice_message_frames frames)]              
 
                                 ))
                         | _ -> raise Should_Not_Reach)
@@ -573,8 +577,7 @@ end = struct
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
-(* TODO investigate identity in address envelope *)
-        | REP -> (
+        | REP -> (match msg with | [Data(msg)] -> (
             let state = t.socket_states in
                 match state with
                     | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
@@ -584,6 +587,7 @@ end = struct
                                 | [] -> ()
                                 | hd::tl -> if tag = Connection.get_tag (!hd) then
                                                 if Connection.get_stage (!hd) = TRAFFIC then
+(* TODO prepend address frames *)
                                                     (Connection.send (!hd) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)));
                                                     t.socket_states <- Rep({if_received = false; last_received_connection_tag = "";}))
                                                 else ()
@@ -592,7 +596,8 @@ end = struct
                     )
                     | _ -> raise Should_Not_Reach
                 )
-        | REQ -> (
+                | _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]"))
+        | REQ -> (match msg with | [Data(msg)] -> (
             let state = t.socket_states in
                 match state with
                     | Req({if_sent = if_sent; last_sent_connection_tag = tag;}) -> (
@@ -616,9 +621,12 @@ end = struct
                                     t.socket_states <- Req({if_sent = true; last_sent_connection_tag = Connection.get_tag (!connection)})
                     )
                     | _ -> raise Should_Not_Reach
-        )
+            )| _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]"))
         | DEALER -> raise Not_Implemented
-        | ROUTER -> raise Not_Implemented
+        | ROUTER -> (match msg with | [Identity(id); Data(msg)] -> (
+
+        ) | _ -> raise Not_Implemented
+        )
         | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
@@ -1120,7 +1128,7 @@ end = struct
     let send t msg_list = 
         if not (if_queue_size_limited (Socket_base.get_socket_type t.socket)) then
             (* Unbounded sending queue *)
-            List.iter (fun x -> t.send_buffer_pf (Some(Data(Frame.to_bytes x)))) msg_list
+            List.iter (fun x -> t.send_buffer_pf (Some(Command_data(Frame.to_bytes x)))) msg_list
         else
             (* Sending queue of limited size *)
             Lwt.async (fun () -> 
@@ -1129,7 +1137,7 @@ end = struct
                     | Some(ref_f) -> 
                         let rec f x =
                             try
-                                (!ref_f#push) (Data(Frame.to_bytes x))
+                                (!ref_f#push) (Command_data(Frame.to_bytes x))
                             with Lwt_stream.Full -> Lwt.pause () >>= fun () -> f x
                         in
                         Lwt_list.iter_s f msg_list
@@ -1176,7 +1184,7 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
         Lwt_stream.peek buffer >>= function
             | None -> Lwt.pause () >>= fun x -> check_and_send_buffer buffer flow
             | Some(data) -> match data with
-                            | Data(b) -> (Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
+                            | Command_data(b) -> (Logs.info (fun f -> f "Module Connection_tcp: Connection FSM Write %d bytes\n%s\n" (Bytes.length b) (buffer_to_string b));
                                 S.TCPV4.write flow (Cstruct.of_bytes b) >>= function
                                    | Error _ -> (Logs.warn (fun f -> f "Module Connection_tcp: Error writing data to established connection."); Lwt.return_unit)
                                    | Ok () -> Lwt_stream.junk buffer >>= fun () -> check_and_send_buffer buffer flow)
@@ -1210,13 +1218,10 @@ module Connection_tcp (S: Mirage_stack_lwt.V4) = struct
                 if if_queue_size_limited (Socket_base.get_socket_type (Connection.get_socket connection)) then (
                     let stream, pf = Lwt_stream.create_bounded (Socket_base.get_outgoing_queue_size (Connection.get_socket connection)) in 
                         Connection.set_send_pf_bounded connection pf;
-(* !!! TODO make sure the connection is added to the original copy of socket_base *)
-                        Socket_base.add_connection (Connection.get_socket connection) (ref connection);
                         Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]))
                 else (
                     let stream, pf = Lwt_stream.create () in 
                         Connection.set_send_pf connection pf;
-                        Socket_base.add_connection (Connection.get_socket connection) (ref connection);
                         Lwt.async (fun () -> Lwt.join [read_and_print flow connection; check_and_send_buffer stream flow]));
                 let rec wait_until_traffic () =
                     if Connection.get_stage connection <> TRAFFIC then Lwt.pause() >>= fun () -> wait_until_traffic ()
@@ -1249,10 +1254,10 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
     val set_outgoing_queue_size: t -> int -> unit
     
     (** Receive a msg from the underlying connections, according to the  semantics of the socket type *)
-    val recv : t -> string Lwt.t
+    val recv : t -> message Lwt.t
     
     (** Send a msg to the underlying connections, according to the semantics of the socket type *)
-    val send : t -> string -> unit
+    val send : t -> message -> unit
     
     (** Bind a local TCP port to the socket so the socket will accept incoming connections *)
     val bind : t -> int -> S.t -> unit
