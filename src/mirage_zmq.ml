@@ -325,7 +325,8 @@ end = struct
         | NONE
         | Rep of {
             if_received : bool; 
-            last_received_connection_tag : string;}
+            last_received_connection_tag : string;
+            address_envelope : Frame.t list; }
         | Req of {
             if_sent : bool;
             last_sent_connection_tag : string;}
@@ -373,6 +374,19 @@ end = struct
     in  get_reverse_frame_list_accumu [] >>= function
         | None -> Lwt.return_none
         | Some(frames) -> Lwt.return_some (List.rev frames)
+
+    (** Get the address envelope from the read buffer, stop when the empty delimiter is encountered and discard the delimiter *)
+    let get_address_envelope connection = 
+    let rec get_reverse_frame_list_accumu list = 
+        Lwt_stream.get (!(Connection.get_buffer (!connection))) >>= function
+            | None -> (* Received data not complete *) Lwt.return None
+            | Some(next_frame) -> 
+                if Frame.is_delimiter_frame next_frame then Lwt.return (Some(list))
+                else if Frame.get_if_more next_frame then get_reverse_frame_list_accumu (next_frame::list) 
+                else Lwt.return (Some(next_frame::list))
+    in  get_reverse_frame_list_accumu [] >>= function
+        | None -> Lwt.return_none
+        | Some(frames) -> Lwt.return_some (List.rev frames)
     
     (* End of helper functions *)
 
@@ -403,6 +417,7 @@ end = struct
                 socket_states = Rep({
                     if_received = false;
                     last_received_connection_tag = "";
+                    address_envelope = [];
                     });
                 incoming_queue_size = None;
                 outgoing_queue_size = None;
@@ -467,7 +482,7 @@ end = struct
         | REP -> (
             let state = t.socket_states in
             match state with
-                | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
+                | Rep({if_received = if_received; last_received_connection_tag = tag; address_envelope = envelope;}) -> (
                     (* Need to receive in a fair-queuing manner *)
                     (* Go through the list of connections and check buffer *)
                     if t.connections = [] then (
@@ -478,35 +493,33 @@ end = struct
                       | hd::tl -> 
                           if Connection.get_stage (!hd) = TRAFFIC then
                               (let buffer = !(Connection.get_buffer (!hd)) in
-                                  Lwt_stream.get buffer >>= function
-                                      | None -> check_buffer tl
-                                      | Some(frame) -> Lwt.return (Some((frame, Connection.get_tag (!hd))))
+                                  Lwt_stream.is_empty buffer >>= function
+                                      | false -> check_buffer tl
+                                      | true -> Lwt.return (Some(Connection.get_tag (!hd)))
                               )
                           else check_buffer tl
                     in check_buffer t.connections >>= function
                           | None -> Lwt.pause() >>= fun () -> recv t
-                          | Some((frame,tag)) -> (
-(* TODO remove and save address frames *)
-                              (* Messages are separated by an empty delimiter *)
-                              if Frame.is_delimiter_frame frame then    
-                                  (* Find the tagged connection *)
-                                  let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
-                                  (* Reconstruct message from the connection *)
-                                      get_frame_list connection >>= function 
-                                      | None -> 
-                                        Connection.close (!connection); 
-                                        t.connections <- (reorder t.connections connection true);
-                                        Lwt.pause() >>= fun () -> recv t
-                                      | Some(frames) -> 
-                                      (* Put the received connection at the end of the queue *)
-                                      t.connections <- (reorder t.connections connection false);
-                                      t.socket_states <- Rep({if_received = true; last_received_connection_tag = Connection.get_tag (!connection);});
-                                        Lwt.return ([Data(Frame.splice_message_frames frames)])                
-                                else (* Protocol error, close the connection and try again *) 
-                                    let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
-                                        Connection.close (!connection);
-                                        t.connections <- (reorder t.connections connection true);
-                                        Lwt.pause() >>= fun () -> recv t
+                          | Some(tag) -> (            
+                              (* Find the tagged connection *)
+                              let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
+                              (* Reconstruct message from the connection *)
+                                  get_address_envelope connection >>= function
+                                  | None -> Connection.close (!connection); 
+                                    t.connections <- (reorder t.connections connection true);
+                                    Lwt.pause() >>= fun () -> recv t
+                                    | Some(address_envelope) -> (
+                                  get_frame_list connection >>= function 
+                                  | None -> 
+                                    Connection.close (!connection); 
+                                    t.connections <- (reorder t.connections connection true);
+                                    Lwt.pause() >>= fun () -> recv t
+                                  | Some(frames) -> 
+                                  (* Put the received connection at the end of the queue *)
+                                  t.connections <- (reorder t.connections connection false);
+                                  t.socket_states <- Rep({if_received = true; last_received_connection_tag = Connection.get_tag (!connection); address_envelope = address_envelope;});
+                                    Lwt.return ([Data(Frame.splice_message_frames frames)])                
+                                    )
                         )
                 )
                 | _ -> raise Should_Not_Reach)
@@ -572,7 +585,38 @@ end = struct
 
                                 ))
                         | _ -> raise Should_Not_Reach)
-        | ROUTER -> raise Not_Implemented
+        | ROUTER -> (let state = t.socket_states in
+                    match state with
+                        | Router -> 
+                            (if t.connections = [] then (Lwt.pause() >>= fun () -> recv t)
+                            else let rec check_buffer connections = match connections with
+                              (* If no connection in the list, wait for an incoming connection *)
+                              | [] -> Lwt.return None
+                              | hd::tl -> 
+                                  if Connection.get_stage (!hd) = TRAFFIC then
+                                      (let buffer = !(Connection.get_buffer (!hd)) in
+                                          Lwt_stream.is_empty buffer >>= function
+                                              | true -> check_buffer tl
+                                              | false -> Lwt.return (Some(Connection.get_tag (!hd)))
+                                      )
+                                  else check_buffer tl
+                            in check_buffer t.connections >>= function
+                                  | None -> Lwt.pause() >>= fun () -> recv t
+                                  | Some(tag) -> (
+                                          (* Find the tagged connection *)
+                                          let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
+                                          (* Reconstruct message from the connection *)
+                                              get_frame_list connection >>= function 
+                                              | None -> 
+                                                Connection.close (!connection); 
+                                                t.connections <- (reorder t.connections connection true);
+                                                Lwt.pause() >>= fun () -> recv t
+                                              | Some(frames) -> 
+                                              (* Put the received connection at the end of the queue *)
+                                              t.connections <- (reorder t.connections connection false);
+                                              Lwt.return [Identity(Connection.get_identity !connection);Data(Frame.splice_message_frames frames)]              
+                                ))
+                        | _ -> raise Should_Not_Reach)
 (* TODO implement other sockets' behaviour *)
         | _ -> raise Not_Implemented
 
@@ -580,16 +624,15 @@ end = struct
         | REP -> (match msg with | [Data(msg)] -> (
             let state = t.socket_states in
                 match state with
-                    | Rep({if_received = if_received; last_received_connection_tag = tag;}) -> (
+                    | Rep({if_received = if_received; last_received_connection_tag = tag; address_envelope = address_envelope;}) -> (
                         if not if_received then raise (Incorrect_use_of_API "Need to receive a request before sending a message")
                         else let rec find connections = match connections with
                                 (* Discard the message if peer no longer connected *)
                                 | [] -> ()
                                 | hd::tl -> if tag = Connection.get_tag (!hd) then
                                                 if Connection.get_stage (!hd) = TRAFFIC then
-(* TODO prepend address frames *)
-                                                    (Connection.send (!hd) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)));
-                                                    t.socket_states <- Rep({if_received = false; last_received_connection_tag = "";}))
+                                                    (Connection.send (!hd) (address_envelope @ (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg))));
+                                                    t.socket_states <- Rep({if_received = false; last_received_connection_tag = ""; address_envelope = [];}))
                                                 else ()
                                             else find tl
                             in find t.connections
@@ -597,6 +640,7 @@ end = struct
                     | _ -> raise Should_Not_Reach
                 )
                 | _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]"))
+(* TODO check sync *)
         | REQ -> (match msg with | [Data(msg)] -> (
             let state = t.socket_states in
                 match state with
@@ -622,9 +666,45 @@ end = struct
                     )
                     | _ -> raise Should_Not_Reach
             )| _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]"))
-        | DEALER -> raise Not_Implemented
+        | DEALER -> (match msg with | [Data(msg)] -> (
+(* TODO check async *)
+            let state = t.socket_states in
+                match state with
+                    | Req({if_sent = if_sent; last_sent_connection_tag = tag;}) -> (
+                        if if_sent then raise (Incorrect_use_of_API "Need to receive a reply before sending another message")
+                        else if t.connections = [] then
+(* TODO make sure the error message is returned back *)
+                            raise Not_Implemented
+                        else let rec check_available_connections connections = match connections with
+                            | [] -> None
+                            | hd::tl -> 
+                                if Connection.get_stage (!hd) = TRAFFIC then 
+                                    Some(hd)
+                                else check_available_connections tl
+                            in check_available_connections t.connections |> function
+(* TODO make sure the error message is returned back *)
+                                | None -> raise Not_Implemented
+                                | Some(connection) -> 
+(* TODO check re-send is working *)
+                                    Connection.send (!connection) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)));
+                                    t.connections <- reorder t.connections connection false;
+                                    t.socket_states <- Req({if_sent = true; last_sent_connection_tag = Connection.get_tag (!connection)})
+                    )
+                    | _ -> raise Should_Not_Reach
+            )| _ -> raise (Incorrect_use_of_API "DEALER sends [Data(string)]"))
         | ROUTER -> (match msg with | [Identity(id); Data(msg)] -> (
-
+            let state = t.socket_states in
+                match state with | Router -> (
+                    let rec find_connection connections = match connections with
+                        | hd::tl -> 
+                            if Connection.get_identity (!hd) = id then 
+                                Connection.send (!hd) (List.map (fun x -> Message.to_frame x) (Message.list_of_string msg))
+                            else find_connection tl
+                        | [] -> ()
+                    in
+                        find_connection t.connections
+                )
+            | _ -> raise Should_Not_Reach
         ) | _ -> raise Not_Implemented
         )
         | _ -> raise Not_Implemented
@@ -954,6 +1034,8 @@ and Connection : sig
     val get_stage : t -> connection_stage
 
     val get_socket : t -> Socket_base.t
+
+    val get_identity : t -> string
     
     (** FSM for handing raw bytes transmission *)
     val fsm : t -> Bytes.t -> action list
@@ -1005,7 +1087,7 @@ end = struct
         expected_bytes_length = 64; (* A value of 0 means expecting a frame of any length; starting with expectint the whole greeting *)
         incoming_socket_type = REP;
         incoming_as_server = false;
-        incoming_identity = "";
+        incoming_identity = tag;
         read_buffer = ref_stream;
         read_buffer_pf = ref_pf;
         send_buffer = Lwt_stream.of_list [];
@@ -1020,6 +1102,8 @@ end = struct
     let get_buffer t = t.read_buffer
 
     let get_socket t = t.socket
+
+    let get_identity t = t.incoming_identity
 
     let rec fsm t bytes = 
         match t.stage with
@@ -1110,7 +1194,7 @@ end = struct
                                                             | "Socket-Type" -> (if if_valid_socket_pair (Socket_base.get_socket_type t.socket) (socket_type_from_string value) 
                                                                                then (t.incoming_socket_type <- (socket_type_from_string value); convert tl) else [Close("Socket type mismatch")])
                                                             | "Identity" -> t.incoming_identity <- value; convert tl
-                                                            | _ -> Logs.info (fun f -> f "Module Connection: Ignore unknown identity %s\n" name); convert tl
+                                                            | _ -> Logs.info (fun f -> f "Module Connection: Ignore unknown property %s\n" name); convert tl
                                                     )
                             in let actions = convert actions in
                             t.handshake_state <- new_state;
