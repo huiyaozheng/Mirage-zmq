@@ -76,7 +76,7 @@ let tag_of_tcp_connection ipaddr port =
 let if_queue_size_limited socket =
     match socket with 
         | REP | REQ -> false
-        | DEALER | ROUTER -> true
+        | DEALER | ROUTER | PUB | SUB -> true
         | _ -> false
 (* End of helper functions *)
 module Frame : sig
@@ -312,6 +312,10 @@ module rec Socket_base : sig
 
     (** Set the maximum capacity of the outgoing queue *)
     val set_outgoing_queue_size: t -> int -> unit
+
+    val subscribe : t -> string -> unit
+
+    val unsubscribe : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
     val recv : t -> message Lwt.t
@@ -333,9 +337,9 @@ end = struct
         | Dealer
         | Router
         | Pub
-        | Sub
+        | Sub of {subscriptions : string list;}
         | Xpub
-        | Xsub
+        | Xsub of {subscriptions : string list;}
         | Push
         | Pull
         | Pair
@@ -455,6 +459,26 @@ end = struct
                 incoming_queue_size = None;
                 outgoing_queue_size = None;
                 }
+            | SUB -> {
+                socket_type = socket_type; 
+                metadata = [("Socket-Type","SUB")]; 
+                security_mechanism = mechanism; 
+                security_info = Null; 
+                connections = [];
+                socket_states = Sub({subscriptions = []});
+                incoming_queue_size = None;
+                outgoing_queue_size = None;
+                }
+            | XSUB -> {
+                socket_type = socket_type; 
+                metadata = [("Socket-Type","XSUB")]; 
+                security_mechanism = mechanism; 
+                security_info = Null; 
+                connections = [];
+                socket_states = Xsub({subscriptions = []});
+                incoming_queue_size = None;
+                outgoing_queue_size = None;
+                }
             | _ -> raise Not_Implemented
     
     let set_plain_credentials t name password = 
@@ -476,6 +500,40 @@ end = struct
     let set_incoming_queue_size t size = t.incoming_queue_size <- Some(size)
 
     let set_outgoing_queue_size t size = t.outgoing_queue_size <- Some(size)
+
+    let subscribe t (subscription : string) = 
+    let check_and_add subscriptions = 
+        if List.fold_left (fun flag x -> flag || (x = subscription)) false subscriptions then 
+            subscriptions 
+        else subscription::subscriptions
+    in
+    match t.socket_type with 
+        | SUB | XSUB -> (
+            match t.socket_states with
+(* TODO send subscription message *)
+                | Sub({subscriptions = subscriptions}) -> 
+                    t.socket_states <- Sub({subscriptions = check_and_add subscriptions;})
+                | Xsub({subscriptions = subscriptions}) -> 
+                    t.socket_states <- Xsub({subscriptions = check_and_add subscriptions;})
+                | _ -> raise Should_Not_Reach
+        )
+        | _ -> raise (Incorrect_use_of_API "This socket does not support subscription!")
+
+    let unsubscribe t subscription = 
+    let check_and_remove subscriptions = 
+        List.filter (fun x -> x <> subscription) subscriptions
+    in
+    match t.socket_type with 
+        | SUB | XSUB -> (
+            match t.socket_states with
+(* TODO send unsubscription message *)
+                | Sub({subscriptions = subscriptions}) -> 
+                    t.socket_states <- Sub({subscriptions = check_and_remove subscriptions})
+                | Xsub({subscriptions = subscriptions}) -> 
+                    t.socket_states <- Xsub({subscriptions = check_and_remove subscriptions})
+                | _ -> raise Should_Not_Reach
+        )
+        | _ -> raise (Incorrect_use_of_API "This socket does not support unsubscription!")
 
     let rec recv t = 
         match t.socket_type with 
@@ -618,6 +676,7 @@ end = struct
                                 ))
                         | _ -> raise Should_Not_Reach)
 (* TODO implement other sockets' behaviour *)
+        | PUB -> raise (Incorrect_use_of_API "Cannot receive from PUB")
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
@@ -705,8 +764,9 @@ end = struct
                         find_connection t.connections
                 )
             | _ -> raise Should_Not_Reach
-        ) | _ -> raise Not_Implemented
-        )
+            ) | _ -> raise Not_Implemented
+            )
+        | SUB -> raise (Incorrect_use_of_API "Cannot send via SUB")
         | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
@@ -1336,6 +1396,10 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
 
     (** Set the maximum capacity of the outgoing queue *)
     val set_outgoing_queue_size: t -> int -> unit
+
+    val subscribe : t -> string -> unit
+
+    val unsubscribe : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the  semantics of the socket type *)
     val recv : t -> message Lwt.t
@@ -1373,6 +1437,10 @@ end = struct
 
     let set_outgoing_queue_size t size =
         Socket_base.set_outgoing_queue_size t.socket size
+
+    let subscribe t subscription = Socket_base.subscribe t.socket subscription
+
+    let unsubscribe t subscription = Socket_base.unsubscribe t.socket subscription
     
     let recv t =
         Socket_base.recv t.socket

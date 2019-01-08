@@ -34,6 +34,12 @@ module Socket_tcp : functor (S : Mirage_stack_lwt.V4) -> sig
 
     (** Set the maximum capacity of the outgoing queue in terms of messages *)
     val set_outgoing_queue_size: t -> int -> unit
+
+    (** Add a subscription filter to SUB/XSUB socket *)
+    val subscribe : t -> string -> unit
+
+    (** Remove a subscription filter from SUB/XSUB socket *)
+    val unsubscribe : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
     val recv : t -> message Lwt.t
