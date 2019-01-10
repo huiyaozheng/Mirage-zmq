@@ -572,8 +572,7 @@ end = struct
     let rec recv t = 
         match t.socket_type with 
         | REP -> (
-            let state = t.socket_states in
-            match state with
+            match t.socket_states with
                 | Rep({if_received = if_received; last_received_connection_tag = tag; address_envelope = envelope;}) -> (
                     (* Need to receive in a fair-queuing manner *)
                     (* Go through the list of connections and check buffer *)
@@ -615,8 +614,8 @@ end = struct
                         )
                 )
                 | _ -> raise Should_Not_Reach)
-        | REQ -> (let state = t.socket_states in
-            match state with
+        | REQ -> (
+            match t.socket_states with
                 | Req({if_sent = if_sent; last_sent_connection_tag = tag;}) -> (
                     if not if_sent then raise (Incorrect_use_of_API "Need to send a request before receiving")
                     else 
@@ -644,8 +643,8 @@ end = struct
                 )
                 | _ -> raise Should_Not_Reach
             )
-        | DEALER -> (let state = t.socket_states in
-                    match state with
+        | DEALER -> (
+                    match t.socket_states with
                         | Dealer -> 
                             (if t.connections = [] then (Lwt.pause() >>= fun () -> recv t)
                             else let rec check_buffer connections = match connections with
@@ -677,8 +676,8 @@ end = struct
 
                                 ))
                         | _ -> raise Should_Not_Reach)
-        | ROUTER -> (let state = t.socket_states in
-                    match state with
+        | ROUTER -> (
+                    match t.socket_states with
                         | Router -> 
                             (if t.connections = [] then (Lwt.pause() >>= fun () -> recv t)
                             else let rec check_buffer connections = match connections with
@@ -711,7 +710,41 @@ end = struct
                         | _ -> raise Should_Not_Reach)
 (* TODO implement other sockets' behaviour *)
         | PUB -> raise (Incorrect_use_of_API "Cannot receive from PUB")
-        | SUB -> raise Not_Implemented
+        | SUB -> (match t.socket_states with
+                | Sub({subscriptions = _}) -> (
+                    (* Need to receive in a fair-queuing manner *)
+                    (* Go through the list of connections and check buffer *)
+                    if t.connections = [] then (
+                        Lwt.pause() >>= fun () -> recv t)
+                    else let rec check_buffer connections = match connections with
+                      (* If no connection in the list, wait for an incoming connection *)
+                      | [] -> Lwt.return None
+                      | hd::tl -> 
+                          if Connection.get_stage (!hd) = TRAFFIC then
+                              (let buffer = !(Connection.get_buffer (!hd)) in
+                                  Lwt_stream.is_empty buffer >>= function
+                                      | false -> check_buffer tl
+                                      | true -> Lwt.return (Some(Connection.get_tag (!hd)))
+                              )
+                          else check_buffer tl
+                    in check_buffer t.connections >>= function
+                          | None -> Lwt.pause() >>= fun () -> recv t
+                          | Some(tag) -> (            
+                              (* Find the tagged connection *)
+                              let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
+                              (* Reconstruct message from the connection *)
+                                get_frame_list connection >>= function 
+                                | None -> 
+                                  Connection.close (!connection); 
+                                  t.connections <- (reorder t.connections connection true);
+                                  Lwt.pause() >>= fun () -> recv t
+                                | Some(frames) -> 
+                                (* Put the received connection at the end of the queue *)
+                                t.connections <- (reorder t.connections connection false);
+                                Lwt.return ([Data(Frame.splice_message_frames frames)])                
+                        )
+                )
+                | _ -> raise Should_Not_Reach)
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
