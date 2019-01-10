@@ -391,7 +391,33 @@ end = struct
     in  get_reverse_frame_list_accumu [] >>= function
         | None -> Lwt.return_none
         | Some(frames) -> Lwt.return_some (List.rev frames)
+
+    (** Check whether the content matches with any entry in the subscriptions *)
+    let match_subscriptions content subscriptions =
+    let match_subscription subscription = 
+        (
+            let content_length = String.length content in
+            let subscription_length = String.length subscription in
+                if subscription_length = 0 then true
+                else if content_length >= subscription_length then
+                    String.sub content 0 subscription_length = subscription
+                else false
+        )
+    in if subscriptions = [] then true 
+    else List.fold_left (fun flag x -> flag || (match_subscription x)) false subscriptions
+
+    let subscription_frame content = 
+        Frame.make_frame (Bytes.cat (Bytes.make 1 '1') (Bytes.of_string content)) ~if_more:false ~if_command:false
+
+    let unsubscription_frame content = 
+        Frame.make_frame (Bytes.cat (Bytes.make 1 '0') (Bytes.of_string content)) ~if_more:false ~if_command:false
     
+    let rec send_message_to_all_active_connections connections frame = match connections with
+        | [] -> ()
+        | hd::tl -> 
+            (if Connection.get_stage (!hd) = TRAFFIC then
+                Connection.send (!hd) ([frame]));
+            send_message_to_all_active_connections tl frame
     (* End of helper functions *)
 
     let get_socket_type t = t.socket_type
@@ -501,36 +527,50 @@ end = struct
 
     let set_outgoing_queue_size t size = t.outgoing_queue_size <- Some(size)
 
+(* TODO send subscription message when connection *)
     let subscribe t (subscription : string) = 
     let check_and_add subscriptions = 
         if List.fold_left (fun flag x -> flag || (x = subscription)) false subscriptions then 
-            subscriptions 
-        else subscription::subscriptions
+            (false, subscriptions)
+        else (true, subscription::subscriptions)
     in
     match t.socket_type with 
         | SUB | XSUB -> (
             match t.socket_states with
-(* TODO send subscription message *)
                 | Sub({subscriptions = subscriptions}) -> 
-                    t.socket_states <- Sub({subscriptions = check_and_add subscriptions;})
+                    let (if_to_send_message, new_subscriptions) = check_and_add subscriptions in
+                        t.socket_states <- Sub({subscriptions = new_subscriptions;});
+                        if if_to_send_message then
+                            send_message_to_all_active_connections t.connections (subscription_frame subscription)
                 | Xsub({subscriptions = subscriptions}) -> 
-                    t.socket_states <- Xsub({subscriptions = check_and_add subscriptions;})
+                    let (if_to_send_message, new_subscriptions) = check_and_add subscriptions in
+                        t.socket_states <- Xsub({subscriptions = new_subscriptions;});
+                        if if_to_send_message then
+                            send_message_to_all_active_connections t.connections (subscription_frame subscription)
                 | _ -> raise Should_Not_Reach
         )
         | _ -> raise (Incorrect_use_of_API "This socket does not support subscription!")
 
     let unsubscribe t subscription = 
     let check_and_remove subscriptions = 
-        List.filter (fun x -> x <> subscription) subscriptions
+        (let if_to_send_message = ref false in
+         let new_subscriptions = 
+            List.filter (fun x -> if x = subscription then if_to_send_message := true; x <> subscription) subscriptions 
+         in (!if_to_send_message, new_subscriptions))
     in
     match t.socket_type with 
         | SUB | XSUB -> (
             match t.socket_states with
-(* TODO send unsubscription message *)
                 | Sub({subscriptions = subscriptions}) -> 
-                    t.socket_states <- Sub({subscriptions = check_and_remove subscriptions})
+                    let (if_to_send_message, new_subscriptions) = check_and_remove subscriptions in
+                        t.socket_states <- Sub({subscriptions = new_subscriptions;});
+                        if if_to_send_message then
+                            send_message_to_all_active_connections t.connections (unsubscription_frame subscription)
                 | Xsub({subscriptions = subscriptions}) -> 
-                    t.socket_states <- Xsub({subscriptions = check_and_remove subscriptions})
+                    let (if_to_send_message, new_subscriptions) = check_and_remove subscriptions in
+                        t.socket_states <- Xsub({subscriptions = new_subscriptions;});
+                        if if_to_send_message then
+                            send_message_to_all_active_connections t.connections (unsubscription_frame subscription)
                 | _ -> raise Should_Not_Reach
         )
         | _ -> raise (Incorrect_use_of_API "This socket does not support unsubscription!")
