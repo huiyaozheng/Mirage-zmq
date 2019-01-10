@@ -324,6 +324,9 @@ module rec Socket_base : sig
     val send : t -> message -> unit
 
     val add_connection : t -> Connection.t ref -> unit
+
+    (** Get the messages to send at the beginning of a connection, e.g. subscriptions *)
+    val initial_traffic_messages : t -> Frame.t list
 end = struct
     type socket_states =
         | NONE
@@ -337,8 +340,10 @@ end = struct
         | Dealer
         | Router
         | Pub
+        (* It may not be necessary to keep a local copy of the subscriptions *)
         | Sub of {subscriptions : string list;}
         | Xpub
+        (* It may not be necessary to keep a local copy of the subscriptions *)
         | Xsub of {subscriptions : string list;}
         | Push
         | Pull
@@ -527,53 +532,37 @@ end = struct
 
     let set_outgoing_queue_size t size = t.outgoing_queue_size <- Some(size)
 
-(* TODO send subscription message when connection *)
     let subscribe t (subscription : string) = 
-    let check_and_add subscriptions = 
-        if List.fold_left (fun flag x -> flag || (x = subscription)) false subscriptions then 
-            (false, subscriptions)
-        else (true, subscription::subscriptions)
-    in
-    match t.socket_type with 
-        | SUB | XSUB -> (
-            match t.socket_states with
-                | Sub({subscriptions = subscriptions}) -> 
-                    let (if_to_send_message, new_subscriptions) = check_and_add subscriptions in
-                        t.socket_states <- Sub({subscriptions = new_subscriptions;});
-                        if if_to_send_message then
-                            send_message_to_all_active_connections t.connections (subscription_frame subscription)
-                | Xsub({subscriptions = subscriptions}) -> 
-                    let (if_to_send_message, new_subscriptions) = check_and_add subscriptions in
-                        t.socket_states <- Xsub({subscriptions = new_subscriptions;});
-                        if if_to_send_message then
-                            send_message_to_all_active_connections t.connections (subscription_frame subscription)
-                | _ -> raise Should_Not_Reach
-        )
-        | _ -> raise (Incorrect_use_of_API "This socket does not support subscription!")
+        match t.socket_type with 
+            | SUB | XSUB -> (
+                match t.socket_states with
+                    | Sub({subscriptions = subscriptions}) -> 
+                        t.socket_states <- Sub({subscriptions = subscription::subscriptions;});
+                        send_message_to_all_active_connections t.connections (subscription_frame subscription)
+                    | Xsub({subscriptions = subscriptions}) -> 
+                        t.socket_states <- Xsub({subscriptions = subscription::subscriptions;});
+                        send_message_to_all_active_connections t.connections (subscription_frame subscription)
+                    | _ -> raise Should_Not_Reach
+            )
+            | _ -> raise (Incorrect_use_of_API "This socket does not support subscription!")
 
     let unsubscribe t subscription = 
-    let check_and_remove subscriptions = 
-        (let if_to_send_message = ref false in
-         let new_subscriptions = 
-            List.filter (fun x -> if x = subscription then if_to_send_message := true; x <> subscription) subscriptions 
-         in (!if_to_send_message, new_subscriptions))
+    let rec check_and_remove subscriptions = match subscriptions with
+        | [] -> []
+        | hd::tl -> if hd = subscription then tl else hd::(check_and_remove tl)
     in
-    match t.socket_type with 
-        | SUB | XSUB -> (
-            match t.socket_states with
-                | Sub({subscriptions = subscriptions}) -> 
-                    let (if_to_send_message, new_subscriptions) = check_and_remove subscriptions in
-                        t.socket_states <- Sub({subscriptions = new_subscriptions;});
-                        if if_to_send_message then
-                            send_message_to_all_active_connections t.connections (unsubscription_frame subscription)
-                | Xsub({subscriptions = subscriptions}) -> 
-                    let (if_to_send_message, new_subscriptions) = check_and_remove subscriptions in
-                        t.socket_states <- Xsub({subscriptions = new_subscriptions;});
-                        if if_to_send_message then
-                            send_message_to_all_active_connections t.connections (unsubscription_frame subscription)
-                | _ -> raise Should_Not_Reach
-        )
-        | _ -> raise (Incorrect_use_of_API "This socket does not support unsubscription!")
+        match t.socket_type with 
+            | SUB | XSUB -> (
+                match t.socket_states with
+                    | Sub({subscriptions = subscriptions}) -> 
+                        t.socket_states <- Sub({subscriptions = check_and_remove subscriptions;});
+                        send_message_to_all_active_connections t.connections (unsubscription_frame subscription)
+                    | Xsub({subscriptions = subscriptions}) -> 
+                        t.socket_states <- Xsub({subscriptions = check_and_remove subscriptions;});
+                        send_message_to_all_active_connections t.connections (unsubscription_frame subscription)
+                    | _ -> raise Should_Not_Reach
+            )
+            | _ -> raise (Incorrect_use_of_API "This socket does not support unsubscription!")
 
     let rec recv t = 
         match t.socket_type with 
@@ -717,6 +706,7 @@ end = struct
                         | _ -> raise Should_Not_Reach)
 (* TODO implement other sockets' behaviour *)
         | PUB -> raise (Incorrect_use_of_API "Cannot receive from PUB")
+        | SUB -> raise Not_Implemented
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
@@ -792,8 +782,7 @@ end = struct
                     | _ -> raise Should_Not_Reach
             )| _ -> raise (Incorrect_use_of_API "DEALER sends [Data(string)]"))
         | ROUTER -> (match msg with | [Identity(id); Data(msg)] -> (
-            let state = t.socket_states in
-                match state with | Router -> (
+                match t.socket_states with | Router -> (
                     let rec find_connection connections = match connections with
                         | hd::tl -> 
                             if Connection.get_identity (!hd) = id then 
@@ -804,12 +793,48 @@ end = struct
                         find_connection t.connections
                 )
             | _ -> raise Should_Not_Reach
-            ) | _ -> raise Not_Implemented
+            ) | _ -> raise (Incorrect_use_of_API "Sending a message via ROUTER needs a specified receiver identity!")
             )
+        | PUB -> (match msg with | [Data(msg)] -> (
+                match t.socket_states with | Pub -> (
+                    let frames_to_send = List.map (fun x -> Message.to_frame x) (Message.list_of_string msg) in
+                    let publish connection =
+                        if match_subscriptions msg (Connection.get_subscriptions connection) then
+                            Connection.send connection frames_to_send
+                        else ()
+                    in List.iter (fun x -> 
+                        if Connection.get_stage !x = TRAFFIC then
+                            publish !x 
+                        else ()
+                    ) t.connections
+                ) 
+                | _ -> raise Should_Not_Reach
+            )
+            | _ -> raise (Incorrect_use_of_API "PUB accepts a message only!")
+        )
         | SUB -> raise (Incorrect_use_of_API "Cannot send via SUB")
         | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
+
+    let initial_traffic_messages t = match t.socket_type with
+        | SUB -> (
+            match t.socket_states with
+                | Sub({subscriptions = subscriptions}) -> 
+                    if subscriptions <> [] then
+                        List.map (fun x -> subscription_frame x) subscriptions
+                    else []
+                | _ -> raise Should_Not_Reach
+        )
+        | XSUB -> (
+            match t.socket_states with
+                | Xsub({subscriptions = subscriptions}) -> 
+                    if subscriptions <> [] then
+                        List.map (fun x -> subscription_frame x) subscriptions
+                    else []
+                | _ -> raise Should_Not_Reach
+        )
+        | _ -> []
 
 end
 
@@ -1136,6 +1161,8 @@ and Connection : sig
     val get_socket : t -> Socket_base.t
 
     val get_identity : t -> string
+
+    val get_subscriptions : t -> string list
     
     (** FSM for handing raw bytes transmission *)
     val fsm : t -> Bytes.t -> action list
@@ -1173,6 +1200,7 @@ end = struct
         mutable send_buffer : connection_buffer_object Lwt_stream.t;
         mutable send_buffer_pf : connection_buffer_object option -> unit;
         mutable send_buffer_pf_bounded : connection_buffer_object Lwt_stream.bounded_push ref option;
+        mutable subscriptions : string list;
     }
 
     let init socket security_mechanism tag = 
@@ -1193,6 +1221,7 @@ end = struct
         send_buffer = Lwt_stream.of_list [];
         send_buffer_pf = (fun x -> ());
         send_buffer_pf_bounded = None;
+        subscriptions = [];
     }
 
     let get_tag t = t.tag
@@ -1204,6 +1233,8 @@ end = struct
     let get_socket t = t.socket
 
     let get_identity t = t.incoming_identity
+
+    let get_subscriptions t = t.subscriptions
 
     let rec fsm t bytes = 
         match t.stage with
@@ -1287,7 +1318,12 @@ end = struct
                                     | (hd::tl) -> (match hd with
                                                     | Security_mechanism.Write(b) -> Write(b)::(convert tl)
                                                     | Security_mechanism.Continue -> Continue::(convert tl)
-                                                    | Security_mechanism.Ok -> Logs.info (fun f -> f "Module Connection: Handshake OK\n"); t.stage <- TRAFFIC; convert tl
+                                                    | Security_mechanism.Ok -> 
+                                                        Logs.info (fun f -> f "Module Connection: Handshake OK\n"); 
+                                                        t.stage <- TRAFFIC; 
+(* TODO check socket reference *)
+                                                        let frames = Socket_base.initial_traffic_messages t.socket in
+                                                        (List.map (fun x -> Write(Frame.to_bytes x)) frames) @ (convert tl)
                                                     | Security_mechanism.Close -> [Close("Handshake FSM error")]
                                                     | Security_mechanism.Received_property(name, value) -> 
                                                         match name with
@@ -1300,11 +1336,18 @@ end = struct
                             t.handshake_state <- new_state;
                             actions)
             | TRAFFIC -> Logs.info (fun f -> f "Module Connection: TRAFFIC -> FSM\n");
-                        let frames = Frame.list_of_bytes bytes in
-                            (* Put the received frames into the buffer *)
-                            Logs.info (fun f -> f "Module Connection: %d frames enqueued\n" (List.length frames));
-                            List.iter (fun x -> !(t.read_buffer_pf) (Some(x))) frames;
-                            [Continue]
+                        let frames = Frame.list_of_bytes bytes in (
+                            match Socket_base.get_socket_type t.socket with
+                                | PUB | XPUB -> 
+                                (* Manage incoming subscriptions/unsubscriptions here *)
+                                
+                                    [Continue]
+                                | _ ->
+                                    (* Put the received frames into the buffer *)
+                                    Logs.info (fun f -> f "Module Connection: %d frames enqueued\n" (List.length frames));
+                                    List.iter (fun x -> !(t.read_buffer_pf) (Some(x))) frames;
+                                    [Continue]
+                        )
             | CLOSED -> [Close "Connection FSM error"]
 
     let close t = t.stage <- CLOSED; t.send_buffer_pf (Some(Command_close))
