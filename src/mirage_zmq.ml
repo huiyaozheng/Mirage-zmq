@@ -94,10 +94,13 @@ module Frame : sig
     (** Construct a list of frames from raw bytes; used when potentially many frames in received buffer *)
     val list_of_bytes : bytes -> t list
     
-    (** Get if_more field from a frame *)
+    (** Get if_more flag from a frame *)
     val get_if_more : t -> bool
+
+    (** Get if_long flag from a frame *)
+    val get_if_long : t -> bool
     
-    (** Get if_command field from a frame *)
+    (** Get if_command flag from a frame *)
     val get_if_command : t -> bool
     
     (** Get body from a frame *)
@@ -166,6 +169,8 @@ end = struct
 
     
     let get_if_more t = (Char.code(t.flag) land 1) = 1
+
+    let get_if_long t = (Char.code(t.flag) land 2) = 2
 
     let get_if_command t = (Char.code(t.flag) land 4) = 4
 
@@ -1339,8 +1344,25 @@ end = struct
                         let frames = Frame.list_of_bytes bytes in (
                             match Socket_base.get_socket_type t.socket with
                                 | PUB | XPUB -> 
-                                (* Manage incoming subscriptions/unsubscriptions here *)
-                                
+                                    let match_subscription_signature frame = 
+                                        if not (Frame.get_if_more frame) && not (Frame.get_if_command frame) && not (Frame.get_if_long frame) then
+                                            (
+                                                if (String.get (Frame.get_body frame) 0) = '1' then 1
+                                                else if (String.get (Frame.get_body frame) 0) = '0' then 0
+                                                else -1
+                                            )
+                                        else -1
+                                    in List.iter (fun x -> match match_subscription_signature x with
+                                        | 0 -> let body = Frame.get_body x in
+                                               let sub = String.sub body 1 (String.length body - 1) in
+                                               let rec check_and_remove subscriptions = match subscriptions with
+                                                    | [] -> []
+                                                    | hd::tl -> if hd = sub then tl else hd::(check_and_remove tl) in
+                                                t.subscriptions <- check_and_remove t.subscriptions
+                                        | 1 -> let body = Frame.get_body x in
+                                            t.subscriptions <- (String.sub body 1 (String.length body - 1))::t.subscriptions
+                                        | _ -> ()
+                                    ) frames;
                                     [Continue]
                                 | _ ->
                                     (* Put the received frames into the buffer *)
