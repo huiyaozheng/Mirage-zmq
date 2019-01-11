@@ -76,7 +76,7 @@ let tag_of_tcp_connection ipaddr port =
 let if_queue_size_limited socket =
     match socket with 
         | REP | REQ -> false
-        | DEALER | ROUTER | PUB | SUB -> true
+        | DEALER | ROUTER | PUB | SUB | XPUB | XSUB -> true
         | _ -> false
 (* End of helper functions *)
 module Frame : sig
@@ -745,6 +745,78 @@ end = struct
                         )
                 )
                 | _ -> raise Should_Not_Reach)
+        | XPUB -> (match t.socket_states with
+            | Xpub -> (
+                    (* Need to receive in a fair-queuing manner *)
+                    (* Go through the list of connections and check buffer *)
+                    if t.connections = [] then (
+                        Lwt.pause() >>= fun () -> recv t)
+                    else let rec check_buffer connections = match connections with
+                      (* If no connection in the list, wait for an incoming connection *)
+                      | [] -> Lwt.return None
+                      | hd::tl -> 
+                          if Connection.get_stage (!hd) = TRAFFIC then
+                              (let buffer = !(Connection.get_buffer (!hd)) in
+                                  Lwt_stream.is_empty buffer >>= function
+                                      | false -> check_buffer tl
+                                      | true -> Lwt.return (Some(Connection.get_tag (!hd)))
+                              )
+                          else check_buffer tl
+                    in check_buffer t.connections >>= function
+                          | None -> Lwt.pause() >>= fun () -> recv t
+                          | Some(tag) -> (            
+                              (* Find the tagged connection *)
+                              let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
+                              (* Reconstruct message from the connection *)
+                                get_frame_list connection >>= function 
+                                | None -> 
+                                  Connection.close (!connection); 
+                                  t.connections <- (reorder t.connections connection true);
+                                  Lwt.pause() >>= fun () -> recv t
+                                | Some(frames) -> 
+                                (* Put the received connection at the end of the queue *)
+                                t.connections <- (reorder t.connections connection false);
+                                Lwt.return ([Data(Frame.splice_message_frames frames)])                
+                        )
+                )
+            | _ -> raise Should_Not_Reach
+        )
+        | XSUB -> (match t.socket_states with
+            | Xsub({subscriptions : string list;}) -> (
+                    (* Need to receive in a fair-queuing manner *)
+                    (* Go through the list of connections and check buffer *)
+                    if t.connections = [] then (
+                        Lwt.pause() >>= fun () -> recv t)
+                    else let rec check_buffer connections = match connections with
+                      (* If no connection in the list, wait for an incoming connection *)
+                      | [] -> Lwt.return None
+                      | hd::tl -> 
+                          if Connection.get_stage (!hd) = TRAFFIC then
+                              (let buffer = !(Connection.get_buffer (!hd)) in
+                                  Lwt_stream.is_empty buffer >>= function
+                                      | false -> check_buffer tl
+                                      | true -> Lwt.return (Some(Connection.get_tag (!hd)))
+                              )
+                          else check_buffer tl
+                    in check_buffer t.connections >>= function
+                          | None -> Lwt.pause() >>= fun () -> recv t
+                          | Some(tag) -> (            
+                              (* Find the tagged connection *)
+                              let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
+                              (* Reconstruct message from the connection *)
+                                get_frame_list connection >>= function 
+                                | None -> 
+                                  Connection.close (!connection); 
+                                  t.connections <- (reorder t.connections connection true);
+                                  Lwt.pause() >>= fun () -> recv t
+                                | Some(frames) -> 
+                                (* Put the received connection at the end of the queue *)
+                                t.connections <- (reorder t.connections connection false);
+                                Lwt.return ([Data(Frame.splice_message_frames frames)])                
+                        )
+                )
+            | _ -> raise Should_Not_Reach
+        )
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
@@ -851,6 +923,37 @@ end = struct
             | _ -> raise (Incorrect_use_of_API "PUB accepts a message only!")
         )
         | SUB -> raise (Incorrect_use_of_API "Cannot send via SUB")
+        | XPUB -> (match msg with | [Data(msg)] -> (
+                match t.socket_states with | Xpub -> (
+                    let frames_to_send = List.map (fun x -> Message.to_frame x) (Message.list_of_string msg) in
+                    let publish connection =
+                        if match_subscriptions msg (Connection.get_subscriptions connection) then
+                            Connection.send connection frames_to_send
+                        else ()
+                    in List.iter (fun x -> 
+                        if Connection.get_stage !x = TRAFFIC then
+                            publish !x 
+                        else ()
+                    ) t.connections
+                ) 
+                | _ -> raise Should_Not_Reach
+            )
+            | _ -> raise (Incorrect_use_of_API "XPUB accepts a message only!")
+        )
+        | XSUB -> (match msg with | [Data(msg)] -> (
+                match t.socket_states with
+                | Xsub({subscriptions : string list;}) -> (
+                    let frames_to_send = List.map (fun x -> Message.to_frame x) (Message.list_of_string msg) 
+                    in List.iter (fun x -> 
+                        if Connection.get_stage !x = TRAFFIC then
+                            Connection.send (!x) frames_to_send 
+                        else ()
+                    ) t.connections
+
+            )
+            | _ -> raise Should_Not_Reach
+        )| _ -> raise (Incorrect_use_of_API "XSUB accepts a message only!")
+        )
         | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
@@ -1053,7 +1156,7 @@ and Greeting : sig
     
     (** FSM call for handling a single event *)
     val fsm_single : t -> event -> t * action
-    
+
     (** FSM call for handling a list of events. *)
     val fsm : t -> event list -> t * action list
 end = struct
@@ -1374,34 +1477,36 @@ end = struct
                             t.handshake_state <- new_state;
                             actions)
             | TRAFFIC -> Logs.info (fun f -> f "Module Connection: TRAFFIC -> FSM\n");
-                        let frames = Frame.list_of_bytes bytes in (
-                            match Socket_base.get_socket_type t.socket with
-                                | PUB | XPUB -> 
-                                    let match_subscription_signature frame = 
-                                        if not (Frame.get_if_more frame) && not (Frame.get_if_command frame) && not (Frame.get_if_long frame) then
-                                            (
-                                                if (String.get (Frame.get_body frame) 0) = '1' then 1
-                                                else if (String.get (Frame.get_body frame) 0) = '0' then 0
-                                                else -1
-                                            )
+                        let frames = Frame.list_of_bytes bytes in 
+                        let manage_subscription () = (
+                            let match_subscription_signature frame = 
+                                if not (Frame.get_if_more frame) && not (Frame.get_if_command frame) && not (Frame.get_if_long frame) then
+                                    (
+                                        if (String.get (Frame.get_body frame) 0) = '1' then 1
+                                        else if (String.get (Frame.get_body frame) 0) = '0' then 0
                                         else -1
-                                    in List.iter (fun x -> match match_subscription_signature x with
-                                        | 0 -> let body = Frame.get_body x in
-                                               let sub = String.sub body 1 (String.length body - 1) in
-                                               let rec check_and_remove subscriptions = match subscriptions with
-                                                    | [] -> []
-                                                    | hd::tl -> if hd = sub then tl else hd::(check_and_remove tl) in
-                                                t.subscriptions <- check_and_remove t.subscriptions
-                                        | 1 -> let body = Frame.get_body x in
-                                            t.subscriptions <- (String.sub body 1 (String.length body - 1))::t.subscriptions
-                                        | _ -> ()
-                                    ) frames;
-                                    [Continue]
-                                | _ ->
-                                    (* Put the received frames into the buffer *)
-                                    Logs.info (fun f -> f "Module Connection: %d frames enqueued\n" (List.length frames));
-                                    List.iter (fun x -> !(t.read_buffer_pf) (Some(x))) frames;
-                                    [Continue]
+                                    )
+                                else -1
+                            in List.iter (fun x -> match match_subscription_signature x with
+                                    | 0 -> let body = Frame.get_body x in
+                                           let sub = String.sub body 1 (String.length body - 1) in
+                                           let rec check_and_remove subscriptions = match subscriptions with
+                                                | [] -> []
+                                                | hd::tl -> if hd = sub then tl else hd::(check_and_remove tl) in
+                                            t.subscriptions <- check_and_remove t.subscriptions
+                                    | 1 -> let body = Frame.get_body x in
+                                        t.subscriptions <- (String.sub body 1 (String.length body - 1))::t.subscriptions
+                                    | _ -> ()
+                                ) frames ) in 
+                        let enqueue () = 
+                            (* Put the received frames into the buffer *)
+                            Logs.info (fun f -> f "Module Connection: %d frames enqueued\n" (List.length frames));
+                            List.iter (fun x -> !(t.read_buffer_pf) (Some(x))) frames;
+                        in (
+                            match Socket_base.get_socket_type t.socket with
+                                | PUB -> manage_subscription (); [Continue]
+                                | XPUB -> manage_subscription (); enqueue (); [Continue]
+                                | _ -> enqueue(); [Continue]
                         )
             | CLOSED -> [Close "Connection FSM error"]
 
