@@ -76,23 +76,23 @@ let tag_of_tcp_connection ipaddr port =
 let if_queue_size_limited socket =
     match socket with 
         | REP | REQ -> false
-        | DEALER | ROUTER | PUB | SUB | XPUB | XSUB -> true
+        | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL -> true
         | _ -> false
 (* End of helper functions *)
 module Frame : sig
     type t
 
     (** make_frame body ifMore ifCommand *)
-    val make_frame : bytes -> if_more : bool -> if_command : bool -> t
+    val make_frame : Bytes.t -> if_more : bool -> if_command : bool -> t
     
     (** Convert a frame to raw bytes *)
-    val to_bytes : t -> bytes
+    val to_bytes : t -> Bytes.t
     
     (** Construct a frame from raw bytes of a complete frame *)
-    val of_bytes : bytes -> t
+    val of_bytes : Bytes.t -> t
 
     (** Construct a list of frames from raw bytes; used when potentially many frames in received buffer *)
-    val list_of_bytes : bytes -> t list
+    val list_of_bytes : Bytes.t -> t list
     
     (** Get if_more flag from a frame *)
     val get_if_more : t -> bool
@@ -104,7 +104,7 @@ module Frame : sig
     val get_if_command : t -> bool
     
     (** Get body from a frame *)
-    val get_body : t -> bytes
+    val get_body : t -> Bytes.t
 
     (** A helper function checking whether a frame is empty (delimiter) *)
     val is_delimiter_frame : t -> bool
@@ -119,7 +119,7 @@ end = struct
         flag : char; 
 (* Known issue: size is limited by max_int; may not be able to reach 2^63-1 *)
         size : int; 
-        body : bytes
+        body : Bytes.t
     }
 
     let size_to_bytes size if_long = 
@@ -276,7 +276,7 @@ end = struct
     let create_context () = {options = 0}
 
 (* TODO close all connections of sockets in the context *)
-    let destroy_context t = ()
+    let destroy_context (t : t) = ()
 end
 
 module rec Socket_base : sig
@@ -817,6 +817,43 @@ end = struct
                 )
             | _ -> raise Should_Not_Reach
         )
+        | PUSH -> raise (Incorrect_use_of_API "Cannot receive from PUSH")
+        | PULL -> (match t.socket_states with
+            | Pull -> (
+                    (* Need to receive in a fair-queuing manner *)
+                    (* Go through the list of connections and check buffer *)
+                    if t.connections = [] then (
+                        Lwt.pause() >>= fun () -> recv t)
+                    else let rec check_buffer connections = match connections with
+                      (* If no connection in the list, wait for an incoming connection *)
+                      | [] -> Lwt.return None
+                      | hd::tl -> 
+                          if Connection.get_stage (!hd) = TRAFFIC then
+                              (let buffer = !(Connection.get_buffer (!hd)) in
+                                  Lwt_stream.is_empty buffer >>= function
+                                      | false -> check_buffer tl
+                                      | true -> Lwt.return (Some(Connection.get_tag (!hd)))
+                              )
+                          else check_buffer tl
+                    in check_buffer t.connections >>= function
+                          | None -> Lwt.pause() >>= fun () -> recv t
+                          | Some(tag) -> (            
+                              (* Find the tagged connection *)
+                              let connection = List.find (fun x -> Connection.get_tag (!x) = tag) t.connections in
+                              (* Reconstruct message from the connection *)
+                                get_frame_list connection >>= function 
+                                | None -> 
+                                  Connection.close (!connection); 
+                                  t.connections <- (reorder t.connections connection true);
+                                  Lwt.pause() >>= fun () -> recv t
+                                | Some(frames) -> 
+                                (* Put the received connection at the end of the queue *)
+                                t.connections <- (reorder t.connections connection false);
+                                Lwt.return ([Data(Frame.splice_message_frames frames)])                
+                        )
+                )
+            | _ -> raise Should_Not_Reach
+        )
         | _ -> raise Not_Implemented
 
     let send t msg = match t.socket_type with
@@ -942,7 +979,7 @@ end = struct
         )
         | XSUB -> (match msg with | [Data(msg)] -> (
                 match t.socket_states with
-                | Xsub({subscriptions : string list;}) -> (
+                | Xsub({subscriptions = _}) -> (
                     let frames_to_send = List.map (fun x -> Message.to_frame x) (Message.list_of_string msg) 
                     in List.iter (fun x -> 
                         if Connection.get_stage !x = TRAFFIC then
@@ -954,6 +991,31 @@ end = struct
             | _ -> raise Should_Not_Reach
         )| _ -> raise (Incorrect_use_of_API "XSUB accepts a message only!")
         )
+        | PUSH -> (match msg with | [Data(msg)] -> (
+            match t.socket_states with
+                | Push -> (if t.connections = [] then
+(* TODO make sure the error message is returned back *)
+                            raise Not_Implemented
+                        else let rec check_available_connections connections = (
+                            match connections with
+                                | [] -> None
+                                | hd::tl -> 
+                                    if Connection.get_stage (!hd) = TRAFFIC && Connection.if_send_queue_full (!hd) then
+                                         Some(hd)
+                                    else check_available_connections tl)
+                            in check_available_connections t.connections |> function
+(* TODO make sure the error message is returned back *)
+                                | None -> raise Not_Implemented
+                                | Some(connection) -> 
+(* TODO check re-send is working *)
+                                    Connection.send (!connection) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)));
+                                    t.connections <- reorder t.connections connection false;
+            )
+                | _ -> raise Should_Not_Reach
+        )
+        | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!")
+        )
+        | PULL -> raise (Incorrect_use_of_API "Cannot send via PULL")
         | _ -> raise Not_Implemented
 
     let add_connection t connection = t.connections <- (t.connections@[connection])
@@ -1322,6 +1384,9 @@ and Connection : sig
 
     (** Set the push function of the bounded send buffer *)
     val set_send_pf_bounded : t -> connection_buffer_object Lwt_stream.bounded_push  -> unit 
+
+    (** Returns whether the send queue is full (always false if unbounded size *)
+    val if_send_queue_full : t -> bool
 end = struct 
 
     type action = | Write of bytes | Continue | Close of string
@@ -1482,19 +1547,20 @@ end = struct
                             let match_subscription_signature frame = 
                                 if not (Frame.get_if_more frame) && not (Frame.get_if_command frame) && not (Frame.get_if_long frame) then
                                     (
-                                        if (String.get (Frame.get_body frame) 0) = '1' then 1
-                                        else if (String.get (Frame.get_body frame) 0) = '0' then 0
+                                        let first_char = (String.get (Bytes.to_string (Frame.get_body frame)) 0) in
+                                        if first_char = '1' then 1
+                                        else if first_char = '0' then 0
                                         else -1
                                     )
                                 else -1
                             in List.iter (fun x -> match match_subscription_signature x with
-                                    | 0 -> let body = Frame.get_body x in
+                                    | 0 -> let body = Bytes.to_string (Frame.get_body x) in
                                            let sub = String.sub body 1 (String.length body - 1) in
                                            let rec check_and_remove subscriptions = match subscriptions with
                                                 | [] -> []
                                                 | hd::tl -> if hd = sub then tl else hd::(check_and_remove tl) in
                                             t.subscriptions <- check_and_remove t.subscriptions
-                                    | 1 -> let body = Frame.get_body x in
+                                    | 1 -> let body = Bytes.to_string (Frame.get_body x) in
                                         t.subscriptions <- (String.sub body 1 (String.length body - 1))::t.subscriptions
                                     | _ -> ()
                                 ) frames ) in 
@@ -1529,6 +1595,15 @@ end = struct
                         in
                         Lwt_list.iter_s f msg_list
             )
+
+    let if_send_queue_full t =
+        if not (if_queue_size_limited (Socket_base.get_socket_type t.socket)) then
+            false
+        else
+            match t.send_buffer_pf_bounded with
+                | None -> raise (Internal_Error "")
+                | Some(ref_f) -> !ref_f#size = !ref_f#count
+            
 
     let set_send_buffer t buffer =
         t.send_buffer <- buffer
