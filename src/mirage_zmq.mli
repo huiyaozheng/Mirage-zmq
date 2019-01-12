@@ -3,6 +3,10 @@ type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH 
 (** Secuirty mechanism types; CURVE not implemented *)
 type mechanism_type = NULL | PLAIN
 
+type message_component = Data of string | Identity of string
+
+type message = message_component list
+
 (** A context is essentially a set of options shared by a group of socket *)
 module Context : sig
     type t
@@ -30,12 +34,18 @@ module Socket_tcp : functor (S : Mirage_stack_lwt.V4) -> sig
 
     (** Set the maximum capacity of the outgoing queue in terms of messages *)
     val set_outgoing_queue_size: t -> int -> unit
+
+    (** Add a subscription filter to SUB/XSUB socket *)
+    val subscribe : t -> string -> unit
+
+    (** Remove a subscription filter from SUB/XSUB socket *)
+    val unsubscribe : t -> string -> unit
     
     (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
-    val recv : t -> string Lwt.t
+    val recv : t -> message Lwt.t
     
     (** Send a msg to the underlying connections, according to the semantics of the socket type *)
-    val send : t -> string -> unit
+    val send : t -> message -> unit
     
     (** Bind a local TCP port to the socket so the socket will accept incoming connections *)
     val bind : t -> int -> S.t -> unit
