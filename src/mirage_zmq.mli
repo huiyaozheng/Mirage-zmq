@@ -1,3 +1,5 @@
+exception No_Available_Peers
+
 type socket_type = REQ | REP | DEALER | ROUTER | PUB | XPUB | SUB | XSUB | PUSH | PULL | PAIR
 
 (** Secuirty mechanism types; CURVE not implemented *)

@@ -2,6 +2,7 @@ open Lwt.Infix
 
 let default_queue_size = 10
 
+exception No_Available_Peers
 exception Not_Implemented
 exception Should_Not_Reach
 exception Socket_Name_Not_Recognised
@@ -72,12 +73,11 @@ let tag_of_tcp_connection ipaddr port =
     String.concat "." ["TCP"; ipaddr; string_of_int port]
 
 (** Whether the socket type has connections with limited-size queues *)
-(* TODO complete checking all socket types*)
 let if_queue_size_limited socket =
     match socket with 
         | REP | REQ -> false
-        | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL -> true
-        | _ -> false
+        | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL | PAIR-> true
+
 (* End of helper functions *)
 module Frame : sig
     type t
@@ -782,7 +782,7 @@ end = struct
             | _ -> raise Should_Not_Reach
         )
         | XSUB -> (match t.socket_states with
-            | Xsub({subscriptions : string list;}) -> (
+            | Xsub({subscriptions = _}) -> (
                     (* Need to receive in a fair-queuing manner *)
                     (* Go through the list of connections and check buffer *)
                     if t.connections = [] then (
@@ -854,7 +854,25 @@ end = struct
                 )
             | _ -> raise Should_Not_Reach
         )
-        | _ -> raise Not_Implemented
+        | PAIR -> (match t.socket_states with
+            | Pair -> (
+                match t.connections with
+                            | [hd] -> (
+                                if Connection.get_stage (!hd) = TRAFFIC then
+                                    get_frame_list hd >>= function 
+                                | None -> 
+                                  Connection.close (!hd); 
+(* TODO check validity *)
+                                  raise No_Available_Peers
+                                | Some(frames) -> 
+                                Lwt.return ([Data(Frame.splice_message_frames frames)]) 
+                                    else raise No_Available_Peers
+                                )
+                                | [] -> raise No_Available_Peers
+                                | _ -> raise Should_Not_Reach
+            )
+            | _ -> raise Should_Not_Reach
+        )
 
     let send t msg = match t.socket_type with
         | REP -> (match msg with | [Data(msg)] -> (
@@ -1016,8 +1034,22 @@ end = struct
         | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!")
         )
         | PULL -> raise (Incorrect_use_of_API "Cannot send via PULL")
-        | _ -> raise Not_Implemented
-
+        | PAIR -> (match msg with | [Data(msg)] -> (
+            match t.socket_states with
+                | Pair -> (match t.connections with
+                            | [hd] -> (
+                                    if Connection.get_stage (!hd) = TRAFFIC && Connection.if_send_queue_full (!hd) then
+                                         Connection.send (!hd) (Frame.delimiter_frame::(List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)))
+(* TODO: not accepting further messages*)
+                                    else raise No_Available_Peers
+                                )
+                                | [] -> raise No_Available_Peers
+                                | _ -> raise Should_Not_Reach
+            )
+                | _ -> raise Should_Not_Reach
+        )
+        | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!")
+        )
     let add_connection t connection = t.connections <- (t.connections@[connection])
 
     let initial_traffic_messages t = match t.socket_type with
