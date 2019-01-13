@@ -391,6 +391,9 @@ module rec Socket_base : sig
   val get_outgoing_queue_size : t -> int
   (** Get the maximum capacity of the outgoing queue *)
 
+  val get_pair_connected : t -> bool
+  (** Whether a PAIR is already connected to another PAIR *)
+
   val create_socket :
     Context.t -> ?mechanism:mechanism_type -> socket_type -> t
   (** Create a socket from the given context, mechanism and type *)
@@ -409,6 +412,9 @@ module rec Socket_base : sig
 
   val set_outgoing_queue_size : t -> int -> unit
   (** Set the maximum capacity of the outgoing queue *)
+
+  val set_pair_connected : t -> bool -> unit
+  (** Set PAIR's connection status *)
 
   val subscribe : t -> string -> unit
 
@@ -442,7 +448,7 @@ end = struct
     | Xsub of {subscriptions: string list}
     | Push
     | Pull
-    | Pair
+    | Pair of {connected: bool}
 
   type t =
     { socket_type: socket_type
@@ -554,6 +560,14 @@ end = struct
     | Some x -> x
     | None -> raise (Internal_Error "Incoming queue size is not defined")
 
+  let get_pair_connected t =
+    match t.socket_states with
+    | Pair {connected} -> connected
+    | _ ->
+        raise
+          (Incorrect_use_of_API
+             "Cannot call this function on a socket other than PAIR!")
+
   let create_socket context ?(mechanism = NULL) socket_type =
     match socket_type with
     | REP ->
@@ -596,6 +610,24 @@ end = struct
         ; socket_states= Router
         ; incoming_queue_size= None
         ; outgoing_queue_size= None }
+    | PUB ->
+        { socket_type
+        ; metadata= [("Socket-Type", "PUB")]
+        ; security_mechanism= mechanism
+        ; security_info= Null
+        ; connections= []
+        ; socket_states= Pub
+        ; incoming_queue_size= None
+        ; outgoing_queue_size= None }
+    | XPUB ->
+        { socket_type
+        ; metadata= [("Socket-Type", "XPUB")]
+        ; security_mechanism= mechanism
+        ; security_info= Null
+        ; connections= []
+        ; socket_states= Xpub
+        ; incoming_queue_size= None
+        ; outgoing_queue_size= None }
     | SUB ->
         { socket_type
         ; metadata= [("Socket-Type", "SUB")]
@@ -614,7 +646,33 @@ end = struct
         ; socket_states= Xsub {subscriptions= []}
         ; incoming_queue_size= None
         ; outgoing_queue_size= None }
-    | _ -> raise Not_Implemented
+    | PUSH ->
+        { socket_type
+        ; metadata= [("Socket-Type", "PUSH")]
+        ; security_mechanism= mechanism
+        ; security_info= Null
+        ; connections= []
+        ; socket_states= Push
+        ; incoming_queue_size= None
+        ; outgoing_queue_size= None }
+    | PULL ->
+        { socket_type
+        ; metadata= [("Socket-Type", "PULL")]
+        ; security_mechanism= mechanism
+        ; security_info= Null
+        ; connections= []
+        ; socket_states= Pull
+        ; incoming_queue_size= None
+        ; outgoing_queue_size= None }
+    | PAIR ->
+        { socket_type
+        ; metadata= [("Socket-Type", "PAIR")]
+        ; security_mechanism= mechanism
+        ; security_info= Null
+        ; connections= []
+        ; socket_states= Pair {connected= false}
+        ; incoming_queue_size= None
+        ; outgoing_queue_size= None }
 
   let set_plain_credentials t name password =
     if t.security_mechanism = PLAIN then
@@ -639,6 +697,13 @@ end = struct
   let set_incoming_queue_size t size = t.incoming_queue_size <- Some size
 
   let set_outgoing_queue_size t size = t.outgoing_queue_size <- Some size
+
+  let set_pair_connected t status =
+    match t.socket_type with
+    | PAIR -> t.socket_states <- Pair {connected= status}
+    | _ ->
+        raise
+          (Incorrect_use_of_API "This state can only be set for PAIR socket!")
 
   let subscribe t (subscription : string) =
     match t.socket_type with
@@ -863,7 +928,6 @@ end = struct
                       [ Identity (Connection.get_identity !connection)
                       ; Data (Frame.splice_message_frames frames) ] ) )
       | _ -> raise Should_Not_Reach )
-    (* TODO implement other sockets' behaviour *)
     | PUB -> raise (Incorrect_use_of_API "Cannot receive from PUB")
     | SUB -> (
       match t.socket_states with
@@ -1044,10 +1108,10 @@ end = struct
       | _ -> raise Should_Not_Reach )
     | PAIR -> (
       match t.socket_states with
-      | Pair -> (
+      | Pair {connected} -> (
         match t.connections with
         | [hd] ->
-            if Connection.get_stage !hd = TRAFFIC then
+            if connected && Connection.get_stage !hd = TRAFFIC then
               get_frame_list hd
               >>= function
               | None ->
@@ -1308,11 +1372,12 @@ end = struct
       match msg with
       | [Data msg] -> (
         match t.socket_states with
-        | Pair -> (
+        | Pair {connected} -> (
           match t.connections with
           | [hd] ->
               if
-                Connection.get_stage !hd = TRAFFIC
+                connected
+                && Connection.get_stage !hd = TRAFFIC
                 && Connection.if_send_queue_full !hd
               then
                 Connection.send !hd
@@ -1756,7 +1821,7 @@ and Connection : sig
 
   type action = Write of bytes | Continue | Close of string
 
-  val init : Socket_base.t -> Security_mechanism.t -> string -> t
+  val init : Socket_base.t ref -> Security_mechanism.t -> string -> t
   (** Create a new connection for socket with specified security mechanism *)
 
   val get_tag : t -> string
@@ -1768,7 +1833,7 @@ and Connection : sig
   val get_stage : t -> connection_stage
   (** Get the stage of the connection. It is considered usable if in TRAFFIC *)
 
-  val get_socket : t -> Socket_base.t
+  val get_socket : t -> Socket_base.t ref
 
   val get_identity : t -> string
 
@@ -1800,7 +1865,7 @@ end = struct
 
   type t =
     { tag: string
-    ; socket: Socket_base.t
+    ; socket: Socket_base.t ref
     ; mutable greeting_state: Greeting.t
     ; mutable handshake_state: Security_mechanism.t
     ; mutable stage: connection_stage
@@ -1851,115 +1916,132 @@ end = struct
 
   let rec fsm t bytes =
     match t.stage with
-    | GREETING -> (
-        Logs.info (fun f -> f "Module Connection: Greeting -> FSM\n") ;
-        let len = Bytes.length bytes in
-        let rec convert greeting_action_list =
-          match greeting_action_list with
-          | [] -> []
-          | hd :: tl -> (
-            match hd with
-            | Greeting.Send_bytes b -> Write b :: convert tl
-            | Greeting.Set_server b ->
-                t.incoming_as_server <- b ;
-                if
-                  t.incoming_as_server
-                  && Security_mechanism.get_as_server t.handshake_state
-                then [Close "Both ends cannot be servers"]
-                else if
-                  Security_mechanism.get_as_client t.handshake_state
-                  && not t.incoming_as_server
-                then [Close "Other end is not a server"]
-                else convert tl
-            (* Assume security mechanism is pre-set*)
-            | Greeting.Check_mechanism s ->
-                if s <> Security_mechanism.get_name_string t.handshake_state
-                then [Close "Security Policy mismatch"]
-                else convert tl
-            | Greeting.Continue -> convert tl
-            | Greeting.Ok ->
-                Logs.info (fun f -> f "Module Connection: Greeting OK\n") ;
-                t.stage <- HANDSHAKE ;
-                if Security_mechanism.get_as_client t.handshake_state then
-                  Write
-                    (Security_mechanism.client_first_message t.handshake_state)
-                  :: convert tl
-                else convert tl
-            | Greeting.Error s -> [Close ("Greeting FSM error: " ^ s)] )
+    | GREETING ->
+        let if_pair =
+          match Socket_base.get_socket_type !(t.socket) with
+          | PAIR -> true
+          | _ -> false
         in
-        match len with
-        (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54 *)
-        (* Full greeting *)
-        | 64 ->
-            let state, action_list =
-              Greeting.fsm t.greeting_state
-                [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
-                ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1)
-                ; Greeting.Recv_Vminor (Bytes.sub bytes 11 1)
-                ; Greeting.Recv_Mechanism (Bytes.sub bytes 12 20)
-                ; Greeting.Recv_as_server (Bytes.sub bytes 32 1)
-                ; Greeting.Recv_filler ]
-            in
-            let connection_action = convert action_list in
-            t.greeting_state <- state ;
-            t.expected_bytes_length <- 0 ;
-            connection_action
-        (* Signature + version major *)
-        | 11 ->
-            let state, action_list =
-              Greeting.fsm t.greeting_state
-                [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
-                ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1) ]
-            in
-            t.greeting_state <- state ;
-            t.expected_bytes_length <- 53 ;
-            convert action_list
-        (* Signature *)
-        | 10 ->
-            let state, action =
-              Greeting.fsm_single t.greeting_state (Greeting.Recv_sig bytes)
-            in
-            t.greeting_state <- state ;
-            t.expected_bytes_length <- 54 ;
-            convert [action]
-        (* version minor + rest *)
-        | 53 ->
-            let state, action_list =
-              Greeting.fsm t.greeting_state
-                [ Greeting.Recv_Vminor (Bytes.sub bytes 0 1)
-                ; Greeting.Recv_Mechanism (Bytes.sub bytes 1 20)
-                ; Greeting.Recv_as_server (Bytes.sub bytes 21 1)
-                ; Greeting.Recv_filler ]
-            in
-            let connection_action = convert action_list in
-            t.greeting_state <- state ;
-            t.expected_bytes_length <- 0 ;
-            connection_action
-        (* version major + rest *)
-        | 54 ->
-            let state, action_list =
-              Greeting.fsm t.greeting_state
-                [ Greeting.Recv_Vmajor (Bytes.sub bytes 0 1)
-                ; Greeting.Recv_Vminor (Bytes.sub bytes 1 1)
-                ; Greeting.Recv_Mechanism (Bytes.sub bytes 2 20)
-                ; Greeting.Recv_as_server (Bytes.sub bytes 22 1)
-                ; Greeting.Recv_filler ]
-            in
-            let connection_action = convert action_list in
-            t.greeting_state <- state ;
-            t.expected_bytes_length <- 0 ;
-            connection_action
-        | n ->
-            if n < t.expected_bytes_length then [Close "Message too short"]
-            else
-              let expected_length = t.expected_bytes_length in
-              (* Handle greeting part *)
-              let action_list_1 = fsm t (Bytes.sub bytes 0 expected_length) in
-              (* Handle handshake part *)
-              let action_list_2 =
-                fsm t (Bytes.sub bytes expected_length (n - expected_length))
+        let if_pair_already_connected =
+          match Socket_base.get_socket_type !(t.socket) with
+          | PAIR -> Socket_base.get_pair_connected !(t.socket)
+          | _ -> false
+        in
+        Logs.info (fun f -> f "Module Connection: Greeting -> FSM\n") ;
+        if if_pair_already_connected then
+          [Close "This PAIR is already connected"]
+        else (
+          if if_pair then Socket_base.set_pair_connected !(t.socket) true ;
+          let len = Bytes.length bytes in
+          let rec convert greeting_action_list =
+            match greeting_action_list with
+            | [] -> []
+            | hd :: tl -> (
+              match hd with
+              | Greeting.Send_bytes b -> Write b :: convert tl
+              | Greeting.Set_server b ->
+                  t.incoming_as_server <- b ;
+                  if
+                    t.incoming_as_server
+                    && Security_mechanism.get_as_server t.handshake_state
+                  then [Close "Both ends cannot be servers"]
+                  else if
+                    Security_mechanism.get_as_client t.handshake_state
+                    && not t.incoming_as_server
+                  then [Close "Other end is not a server"]
+                  else convert tl
+              (* Assume security mechanism is pre-set*)
+              | Greeting.Check_mechanism s ->
+                  if s <> Security_mechanism.get_name_string t.handshake_state
+                  then [Close "Security Policy mismatch"]
+                  else convert tl
+              | Greeting.Continue -> convert tl
+              | Greeting.Ok ->
+                  Logs.info (fun f -> f "Module Connection: Greeting OK\n") ;
+                  t.stage <- HANDSHAKE ;
+                  if Security_mechanism.get_as_client t.handshake_state then
+                    Write
+                      (Security_mechanism.client_first_message
+                         t.handshake_state)
+                    :: convert tl
+                  else convert tl
+              | Greeting.Error s -> [Close ("Greeting FSM error: " ^ s)] )
+          in
+          match len with
+          (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54 *)
+          (* Full greeting *)
+          | 64 ->
+              let state, action_list =
+                Greeting.fsm t.greeting_state
+                  [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
+                  ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1)
+                  ; Greeting.Recv_Vminor (Bytes.sub bytes 11 1)
+                  ; Greeting.Recv_Mechanism (Bytes.sub bytes 12 20)
+                  ; Greeting.Recv_as_server (Bytes.sub bytes 32 1)
+                  ; Greeting.Recv_filler ]
               in
-              action_list_1 @ action_list_2 )
+              let connection_action = convert action_list in
+              t.greeting_state <- state ;
+              t.expected_bytes_length <- 0 ;
+              connection_action
+          (* Signature + version major *)
+          | 11 ->
+              let state, action_list =
+                Greeting.fsm t.greeting_state
+                  [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
+                  ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1) ]
+              in
+              t.greeting_state <- state ;
+              t.expected_bytes_length <- 53 ;
+              convert action_list
+          (* Signature *)
+          | 10 ->
+              let state, action =
+                Greeting.fsm_single t.greeting_state (Greeting.Recv_sig bytes)
+              in
+              t.greeting_state <- state ;
+              t.expected_bytes_length <- 54 ;
+              convert [action]
+          (* version minor + rest *)
+          | 53 ->
+              let state, action_list =
+                Greeting.fsm t.greeting_state
+                  [ Greeting.Recv_Vminor (Bytes.sub bytes 0 1)
+                  ; Greeting.Recv_Mechanism (Bytes.sub bytes 1 20)
+                  ; Greeting.Recv_as_server (Bytes.sub bytes 21 1)
+                  ; Greeting.Recv_filler ]
+              in
+              let connection_action = convert action_list in
+              t.greeting_state <- state ;
+              t.expected_bytes_length <- 0 ;
+              connection_action
+          (* version major + rest *)
+          | 54 ->
+              let state, action_list =
+                Greeting.fsm t.greeting_state
+                  [ Greeting.Recv_Vmajor (Bytes.sub bytes 0 1)
+                  ; Greeting.Recv_Vminor (Bytes.sub bytes 1 1)
+                  ; Greeting.Recv_Mechanism (Bytes.sub bytes 2 20)
+                  ; Greeting.Recv_as_server (Bytes.sub bytes 22 1)
+                  ; Greeting.Recv_filler ]
+              in
+              let connection_action = convert action_list in
+              t.greeting_state <- state ;
+              t.expected_bytes_length <- 0 ;
+              connection_action
+          | n ->
+              if n < t.expected_bytes_length then [Close "Message too short"]
+              else
+                let expected_length = t.expected_bytes_length in
+                (* Handle greeting part *)
+                let action_list_1 =
+                  fsm t (Bytes.sub bytes 0 expected_length)
+                in
+                (* Handle handshake part *)
+                let action_list_2 =
+                  fsm t (Bytes.sub bytes expected_length (n - expected_length))
+                in
+                action_list_1 @ action_list_2 )
     | HANDSHAKE ->
         Logs.info (fun f -> f "Module Connection: Handshake -> FSM\n") ;
         let command = Command.of_frame (Frame.of_bytes bytes) in
@@ -1976,8 +2058,9 @@ end = struct
             | Security_mechanism.Ok ->
                 Logs.info (fun f -> f "Module Connection: Handshake OK\n") ;
                 t.stage <- TRAFFIC ;
-                (* TODO check socket reference *)
-                let frames = Socket_base.initial_traffic_messages t.socket in
+                let frames =
+                  Socket_base.initial_traffic_messages !(t.socket)
+                in
                 List.map (fun x -> Write (Frame.to_bytes x)) frames
                 @ convert tl
             | Security_mechanism.Close -> [Close "Handshake FSM error"]
@@ -1986,7 +2069,7 @@ end = struct
               | "Socket-Type" ->
                   if
                     if_valid_socket_pair
-                      (Socket_base.get_socket_type t.socket)
+                      (Socket_base.get_socket_type !(t.socket))
                       (socket_type_from_string value)
                   then (
                     t.incoming_socket_type <- socket_type_from_string value ;
@@ -2048,18 +2131,25 @@ end = struct
           ) ;
           List.iter (fun x -> !(t.read_buffer_pf) (Some x)) frames
         in
-        match Socket_base.get_socket_type t.socket with
+        match Socket_base.get_socket_type !(t.socket) with
         | PUB -> manage_subscription () ; [Continue]
         | XPUB -> manage_subscription () ; enqueue () ; [Continue]
         | _ -> enqueue () ; [Continue] )
     | CLOSED -> [Close "Connection FSM error"]
 
   let close t =
+    let if_pair =
+      match Socket_base.get_socket_type !(t.socket) with
+      | PAIR -> true
+      | _ -> false
+    in
+    if if_pair then Socket_base.set_pair_connected !(t.socket) false ;
     t.stage <- CLOSED ;
     t.send_buffer_pf (Some Command_close)
 
   let send t msg_list =
-    if not (if_queue_size_limited (Socket_base.get_socket_type t.socket)) then
+    if not (if_queue_size_limited (Socket_base.get_socket_type !(t.socket)))
+    then
       (* Unbounded sending queue *)
       List.iter
         (fun x -> t.send_buffer_pf (Some (Command_data (Frame.to_bytes x))))
@@ -2077,8 +2167,8 @@ end = struct
               Lwt_list.iter_s f msg_list )
 
   let if_send_queue_full t =
-    if not (if_queue_size_limited (Socket_base.get_socket_type t.socket)) then
-      false
+    if not (if_queue_size_limited (Socket_base.get_socket_type !(t.socket)))
+    then false
     else
       match t.send_buffer_pf_bounded with
       | None -> raise (Internal_Error "")
@@ -2184,23 +2274,23 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
         let connection =
           Connection.init socket
             (Security_mechanism.init
-               (Socket_base.get_security_data socket)
-               (Socket_base.get_metadata socket))
+               (Socket_base.get_security_data !socket)
+               (Socket_base.get_metadata !socket))
             (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port)
         in
-        if if_queue_size_limited (Socket_base.get_socket_type socket) then (
+        if if_queue_size_limited (Socket_base.get_socket_type !socket) then (
           let stream, pf =
             Lwt_stream.create_bounded
-              (Socket_base.get_outgoing_queue_size socket)
+              (Socket_base.get_outgoing_queue_size !socket)
           in
           Connection.set_send_pf_bounded connection pf ;
-          Socket_base.add_connection socket (ref connection) ;
+          Socket_base.add_connection !socket (ref connection) ;
           Lwt.join
             [read_and_print flow connection; check_and_send_buffer stream flow] )
         else
           let stream, pf = Lwt_stream.create () in
           Connection.set_send_pf connection pf ;
-          Socket_base.add_connection socket (ref connection) ;
+          Socket_base.add_connection !socket (ref connection) ;
           Lwt.join
             [read_and_print flow connection; check_and_send_buffer stream flow]
     ) ;
@@ -2213,12 +2303,12 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     | Ok flow ->
         ( if
           if_queue_size_limited
-            (Socket_base.get_socket_type (Connection.get_socket connection))
+            (Socket_base.get_socket_type !(Connection.get_socket connection))
         then (
           let stream, pf =
             Lwt_stream.create_bounded
               (Socket_base.get_outgoing_queue_size
-                 (Connection.get_socket connection))
+                 !(Connection.get_socket connection))
           in
           Connection.set_send_pf_bounded connection pf ;
           Lwt.async (fun () ->
@@ -2317,12 +2407,12 @@ end = struct
 
   let bind t port s =
     let module C_tcp = Connection_tcp (S) in
-    Lwt.async (fun () -> C_tcp.listen s port t.socket)
+    Lwt.async (fun () -> C_tcp.listen s port (ref t.socket))
 
   let connect t ipaddr port s =
     let module C_tcp = Connection_tcp (S) in
     let connection =
-      Connection.init t.socket
+      Connection.init (ref t.socket)
         (Security_mechanism.init
            (Socket_base.get_security_data t.socket)
            (Socket_base.get_metadata t.socket))
