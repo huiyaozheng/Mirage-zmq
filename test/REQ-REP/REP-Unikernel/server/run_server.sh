@@ -1,1 +1,1 @@
-./network -l "*:debug"
+./rep_server -l "*:debug"

@@ -1,17 +1,17 @@
 open Lwt.Infix
-
+open Mirage_zmq
 module Main (S: Mirage_stack_lwt.V4) = struct
     let start s =
-        let context = Mirage_zmq.Context.create_context () in
-        let module Socket = Mirage_zmq.Socket_tcp (S) in
-        let socket = Socket.create_socket context Mirage_zmq.REP in
+        let context = Context.create_context () in
+        let module Socket = Socket_tcp (S) in
+        let socket = Socket.create_socket context REP in
             Socket.bind socket 5556 s;
-            let read_and_print : unit Lwt.t =
+            let read_and_print () =
+                Logs.info (fun f -> f "Started socket\n"); 
                 Socket.recv socket >>= fun msg -> match msg with
-                | "" -> Lwt.return_unit
-                | _ -> Logs.info (fun f -> f "Received msg: %s\n" msg); 
-                        Socket.send socket "World";
+                | [Data(msg)] -> Logs.info (fun f -> f "Received msg: %s\n" msg); 
+                        Socket.send socket [Data("World")];
                         Lwt.return_unit
-            in  Logs.info (fun f -> f "Started socket listening\n"); 
-                read_and_print
+                | _ -> Logs.info (fun f -> f "Unexpected msg received\n");  Lwt.return_unit
+            in  read_and_print ()
 end

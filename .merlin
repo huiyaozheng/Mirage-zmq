@@ -6,4 +6,4 @@ S src/
 B example_snippets/zmq_binding/hello_world_client/_build
 B example_snippets/zmq_binding/hello_world_server/_build
 B bootstrap/server/_build
-PKG zmq mirage mirage-stack-lwt bytes
+PKG zmq mirage mirage-stack-lwt bytes zmq-mirage

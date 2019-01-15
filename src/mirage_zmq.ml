@@ -768,8 +768,8 @@ end = struct
                     let buffer = !(Connection.get_buffer !hd) in
                     Lwt_stream.is_empty buffer
                     >>= function
-                    | false -> check_buffer tl
-                    | true -> Lwt.return (Some (Connection.get_tag !hd))
+                    | true -> check_buffer tl
+                    | false -> Lwt.return (Some (Connection.get_tag !hd))
                   else check_buffer tl
             in
             check_buffer t.connections
@@ -1927,7 +1927,7 @@ end = struct
           | PAIR -> Socket_base.get_pair_connected !(t.socket)
           | _ -> false
         in
-        Logs.info (fun f -> f "Module Connection: Greeting -> FSM\n") ;
+        Logs.debug (fun f -> f "Module Connection: Greeting -> FSM\n") ;
         if if_pair_already_connected then
           [Close "This PAIR is already connected"]
         else (
@@ -2043,7 +2043,7 @@ end = struct
                 in
                 action_list_1 @ action_list_2 )
     | HANDSHAKE ->
-        Logs.info (fun f -> f "Module Connection: Handshake -> FSM\n") ;
+        Logs.debug (fun f -> f "Module Connection: Handshake -> FSM\n") ;
         let command = Command.of_frame (Frame.of_bytes bytes) in
         let new_state, actions =
           Security_mechanism.fsm t.handshake_state command
@@ -2088,7 +2088,7 @@ end = struct
         t.handshake_state <- new_state ;
         actions
     | TRAFFIC -> (
-        Logs.info (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ;
+        Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ;
         let frames = Frame.list_of_bytes bytes in
         let manage_subscription () =
           let match_subscription_signature frame =
@@ -2224,7 +2224,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                     Lwt.return_unit
                 | Ok () -> act tl )
             | Connection.Continue ->
-                Logs.info (fun f ->
+                Logs.debug (fun f ->
                     f "Module Connection_tcp: Connection FSM Continue\n" ) ;
                 act tl
             | Connection.Close s ->
@@ -2257,7 +2257,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
               Lwt.return_unit
           | Ok () ->
               Lwt_stream.junk buffer
-              >>= fun () -> check_and_send_buffer buffer flow )
+              >>= fun () -> Lwt.pause () >>= fun () -> check_and_send_buffer buffer flow )
       | Command_close ->
           Logs.info (fun f ->
               f "Module Connection_tcp: Connection was instructed to close" ) ;
