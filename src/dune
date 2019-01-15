@@ -1,1 +1,1 @@
-(library (name mirage_zmq) (libraries lwt mirage-stack-lwt mirage))
+(library (name mirage_zmq) (public_name zmq-mirage) (libraries lwt mirage-stack-lwt mirage))

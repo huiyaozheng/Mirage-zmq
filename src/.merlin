@@ -31,7 +31,7 @@ B /Users/Huiyao/.opam/system/lib/sexplib
 B /Users/Huiyao/.opam/system/lib/sexplib0
 B /Users/Huiyao/.opam/system/lib/uchar
 B /usr/local/lib/ocaml
-B _build/default/.zmq_mirage.objs
+B _build/default/.mirage_zmq.objs
 S /Users/Huiyao/.opam/system/lib/astring
 S /Users/Huiyao/.opam/system/lib/bos
 S /Users/Huiyao/.opam/system/lib/bytes
@@ -65,4 +65,4 @@ S /Users/Huiyao/.opam/system/lib/sexplib0
 S /Users/Huiyao/.opam/system/lib/uchar
 S /usr/local/lib/ocaml
 S .
-FLG -open Zmq_mirage -w @a-4-29-40-41-42-44-45-48-58-59-60-40 -strict-sequence -strict-formats -short-paths -keep-locs
+FLG -w -40
