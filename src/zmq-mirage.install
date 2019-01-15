@@ -1,0 +1,4 @@
+lib: [
+  "_build/install/default/lib/zmq-mirage/META" {"META"}
+  "_build/install/default/lib/zmq-mirage/opam" {"opam"}
+]

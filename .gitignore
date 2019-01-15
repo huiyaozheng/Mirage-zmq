@@ -31,12 +31,10 @@ _build/
 lib
 Makefile
 .mirage.config
-*.opam
 key_gen.ml
 main.ml
 *.native
 myocamlbuild.ml
-src/dune
 src/dune-project
 *.ctf
 
@@ -45,3 +43,5 @@ test/**/mirage_zmq.mli
 test/REQ-REP/client/hw_client
 test/REQ-REP/server/network
 src/.merlin
+test/**/*.opam
+example_snippets/**/*.opam

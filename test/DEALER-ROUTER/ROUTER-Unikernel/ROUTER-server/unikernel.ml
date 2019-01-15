@@ -1,5 +1,5 @@
 open Lwt.Infix
-
+open Mirage_zmq
 module Main (S: Mirage_stack_lwt.V4) = struct
     let start s =
         let context = Mirage_zmq.Context.create_context () in

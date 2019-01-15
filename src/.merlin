@@ -13,6 +13,7 @@ B /Users/Huiyao/.opam/system/lib/functoria/app
 B /Users/Huiyao/.opam/system/lib/ipaddr
 B /Users/Huiyao/.opam/system/lib/logs
 B /Users/Huiyao/.opam/system/lib/lwt
+B /Users/Huiyao/.opam/system/lib/macaddr
 B /Users/Huiyao/.opam/system/lib/mirage
 B /Users/Huiyao/.opam/system/lib/mirage-device
 B /Users/Huiyao/.opam/system/lib/mirage-flow
@@ -22,7 +23,6 @@ B /Users/Huiyao/.opam/system/lib/mirage-stack
 B /Users/Huiyao/.opam/system/lib/mirage-stack-lwt
 B /Users/Huiyao/.opam/system/lib/ocamlgraph
 B /Users/Huiyao/.opam/system/lib/parsexp
-B /Users/Huiyao/.opam/system/lib/ppx_sexp_conv/runtime-lib
 B /Users/Huiyao/.opam/system/lib/ptime
 B /Users/Huiyao/.opam/system/lib/ptime/os
 B /Users/Huiyao/.opam/system/lib/result
@@ -31,7 +31,7 @@ B /Users/Huiyao/.opam/system/lib/sexplib
 B /Users/Huiyao/.opam/system/lib/sexplib0
 B /Users/Huiyao/.opam/system/lib/uchar
 B /usr/local/lib/ocaml
-B _build/default/.mirage_zmq.objs
+B _build/default/.zmq_mirage.objs
 S /Users/Huiyao/.opam/system/lib/astring
 S /Users/Huiyao/.opam/system/lib/bos
 S /Users/Huiyao/.opam/system/lib/bytes
@@ -46,6 +46,7 @@ S /Users/Huiyao/.opam/system/lib/functoria/app
 S /Users/Huiyao/.opam/system/lib/ipaddr
 S /Users/Huiyao/.opam/system/lib/logs
 S /Users/Huiyao/.opam/system/lib/lwt
+S /Users/Huiyao/.opam/system/lib/macaddr
 S /Users/Huiyao/.opam/system/lib/mirage
 S /Users/Huiyao/.opam/system/lib/mirage-device
 S /Users/Huiyao/.opam/system/lib/mirage-flow
@@ -55,7 +56,6 @@ S /Users/Huiyao/.opam/system/lib/mirage-stack
 S /Users/Huiyao/.opam/system/lib/mirage-stack-lwt
 S /Users/Huiyao/.opam/system/lib/ocamlgraph
 S /Users/Huiyao/.opam/system/lib/parsexp
-S /Users/Huiyao/.opam/system/lib/ppx_sexp_conv/runtime-lib
 S /Users/Huiyao/.opam/system/lib/ptime
 S /Users/Huiyao/.opam/system/lib/ptime/os
 S /Users/Huiyao/.opam/system/lib/result
@@ -65,4 +65,4 @@ S /Users/Huiyao/.opam/system/lib/sexplib0
 S /Users/Huiyao/.opam/system/lib/uchar
 S /usr/local/lib/ocaml
 S .
-FLG -w @a-4-29-40-41-42-44-45-48-58-59-60-40 -strict-sequence -strict-formats -short-paths -keep-locs
+FLG -open Zmq_mirage -w @a-4-29-40-41-42-44-45-48-58-59-60-40 -strict-sequence -strict-formats -short-paths -keep-locs

@@ -1,0 +1,8 @@
+opam-version: "2.0"
+name: "zmq-mirage"
+version: "0.1"
+synopsis: "A 0MQ implementation for MirageOS"
+maintainer: "Huiyao Zheng <huiyaozheng@gmail.com>"
+authors: "Huiyao Zheng <huiyaozheng@gmail.com>"
+depends: [ "ocaml" "mirage" ]
+build: ["dune" "build" "-p" "zmq-mirage"]
