@@ -1,6 +1,6 @@
 open Lwt.Infix
 
-let default_queue_size = 10
+let default_queue_size = 50
 
 exception No_Available_Peers
 
@@ -129,6 +129,18 @@ let if_queue_size_limited socket =
   match socket with
   | REP | REQ -> false
   | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL | PAIR -> true
+
+(** Whether the socket type has an outgoing queue *)
+let if_has_outgoing_queue socket =
+  match socket with
+  | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PAIR -> true
+  | PULL -> false
+
+(** Whether the socket type has an incoming queue *)
+let if_has_incoming_queue socket =
+  match socket with
+  | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PULL | PAIR -> true
+  | PUSH -> false
 
 (* End of helper functions *)
 module Frame : sig
@@ -599,8 +611,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Dealer
-        ; incoming_queue_size= None
-        ; outgoing_queue_size= None }
+        ; incoming_queue_size= Some default_queue_size
+        ; outgoing_queue_size= Some default_queue_size }
     | ROUTER ->
         { socket_type
         ; metadata= [("Socket-Type", "ROUTER")]
@@ -608,8 +620,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Router
-        ; incoming_queue_size= None
-        ; outgoing_queue_size= None }
+        ; incoming_queue_size= Some default_queue_size
+        ; outgoing_queue_size= Some default_queue_size }
     | PUB ->
         { socket_type
         ; metadata= [("Socket-Type", "PUB")]
@@ -618,7 +630,7 @@ end = struct
         ; connections= []
         ; socket_states= Pub
         ; incoming_queue_size= None
-        ; outgoing_queue_size= None }
+        ; outgoing_queue_size= Some default_queue_size }
     | XPUB ->
         { socket_type
         ; metadata= [("Socket-Type", "XPUB")]
@@ -626,8 +638,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Xpub
-        ; incoming_queue_size= None
-        ; outgoing_queue_size= None }
+        ; incoming_queue_size= Some default_queue_size
+        ; outgoing_queue_size= Some default_queue_size }
     | SUB ->
         { socket_type
         ; metadata= [("Socket-Type", "SUB")]
@@ -635,7 +647,7 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Sub {subscriptions= []}
-        ; incoming_queue_size= None
+        ; incoming_queue_size= Some default_queue_size
         ; outgoing_queue_size= None }
     | XSUB ->
         { socket_type
@@ -644,8 +656,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Xsub {subscriptions= []}
-        ; incoming_queue_size= None
-        ; outgoing_queue_size= None }
+        ; incoming_queue_size= Some default_queue_size
+        ; outgoing_queue_size= Some default_queue_size }
     | PUSH ->
         { socket_type
         ; metadata= [("Socket-Type", "PUSH")]
@@ -654,7 +666,7 @@ end = struct
         ; connections= []
         ; socket_states= Push
         ; incoming_queue_size= None
-        ; outgoing_queue_size= None }
+        ; outgoing_queue_size= Some default_queue_size }
     | PULL ->
         { socket_type
         ; metadata= [("Socket-Type", "PULL")]
@@ -662,7 +674,7 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Pull
-        ; incoming_queue_size= None
+        ; incoming_queue_size= Some default_queue_size
         ; outgoing_queue_size= None }
     | PAIR ->
         { socket_type
@@ -671,8 +683,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Pair {connected= false}
-        ; incoming_queue_size= None
-        ; outgoing_queue_size= None }
+        ; incoming_queue_size= Some default_queue_size
+        ; outgoing_queue_size= Some default_queue_size }
 
   let set_plain_credentials t name password =
     if t.security_mechanism = PLAIN then
@@ -2257,7 +2269,8 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
               Lwt.return_unit
           | Ok () ->
               Lwt_stream.junk buffer
-              >>= fun () -> Lwt.pause () >>= fun () -> check_and_send_buffer buffer flow )
+              >>= fun () ->
+              Lwt.pause () >>= fun () -> check_and_send_buffer buffer flow )
       | Command_close ->
           Logs.info (fun f ->
               f "Module Connection_tcp: Connection was instructed to close" ) ;
@@ -2278,22 +2291,35 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                (Socket_base.get_metadata !socket))
             (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port)
         in
-        if if_queue_size_limited (Socket_base.get_socket_type !socket) then (
-          let stream, pf =
-            Lwt_stream.create_bounded
-              (Socket_base.get_outgoing_queue_size !socket)
-          in
-          Connection.set_send_pf_bounded connection pf ;
-          Socket_base.add_connection !socket (ref connection) ;
-          Lwt.join
-            [read_and_print flow connection; check_and_send_buffer stream flow] )
-        else
+        if if_queue_size_limited (Socket_base.get_socket_type !socket) then
+          if
+            if_has_outgoing_queue
+              (Socket_base.get_socket_type !(Connection.get_socket connection))
+          then (
+            let stream, pf =
+              Lwt_stream.create_bounded
+                (Socket_base.get_outgoing_queue_size !socket)
+            in
+            Connection.set_send_pf_bounded connection pf ;
+            Socket_base.add_connection !socket (ref connection) ;
+            Lwt.join
+              [ read_and_print flow connection
+              ; check_and_send_buffer stream flow ] )
+          else (
+            Socket_base.add_connection !socket (ref connection) ;
+            read_and_print flow connection )
+        else if
+          if_has_outgoing_queue
+            (Socket_base.get_socket_type !(Connection.get_socket connection))
+        then (
           let stream, pf = Lwt_stream.create () in
           Connection.set_send_pf connection pf ;
           Socket_base.add_connection !socket (ref connection) ;
           Lwt.join
-            [read_and_print flow connection; check_and_send_buffer stream flow]
-    ) ;
+            [read_and_print flow connection; check_and_send_buffer stream flow] )
+        else (
+          Socket_base.add_connection !socket (ref connection) ;
+          read_and_print flow connection ) ) ;
     S.listen s
 
   let rec connect s addr port connection =
@@ -2301,27 +2327,36 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     S.TCPV4.create_connection (S.tcpv4 s) (ipaddr, port)
     >>= function
     | Ok flow ->
-        ( if
+        if
           if_queue_size_limited
             (Socket_base.get_socket_type !(Connection.get_socket connection))
+        then
+          if
+            if_has_outgoing_queue
+              (Socket_base.get_socket_type !(Connection.get_socket connection))
+          then (
+            let stream, pf =
+              Lwt_stream.create_bounded
+                (Socket_base.get_outgoing_queue_size
+                   !(Connection.get_socket connection))
+            in
+            Connection.set_send_pf_bounded connection pf ;
+            Lwt.async (fun () ->
+                Lwt.join
+                  [ read_and_print flow connection
+                  ; check_and_send_buffer stream flow ] ) )
+          else Lwt.async (fun () -> read_and_print flow connection)
+        else if
+          if_has_outgoing_queue
+            (Socket_base.get_socket_type !(Connection.get_socket connection))
         then (
-          let stream, pf =
-            Lwt_stream.create_bounded
-              (Socket_base.get_outgoing_queue_size
-                 !(Connection.get_socket connection))
-          in
-          Connection.set_send_pf_bounded connection pf ;
-          Lwt.async (fun () ->
-              Lwt.join
-                [ read_and_print flow connection
-                ; check_and_send_buffer stream flow ] ) )
-        else
           let stream, pf = Lwt_stream.create () in
           Connection.set_send_pf connection pf ;
           Lwt.async (fun () ->
               Lwt.join
                 [ read_and_print flow connection
-                ; check_and_send_buffer stream flow ] ) ) ;
+                ; check_and_send_buffer stream flow ] ) )
+        else Lwt.async (fun () -> read_and_print flow connection) ;
         let rec wait_until_traffic () =
           if Connection.get_stage connection <> TRAFFIC then
             Lwt.pause () >>= fun () -> wait_until_traffic ()
