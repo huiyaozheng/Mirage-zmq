@@ -537,12 +537,12 @@ end = struct
 
   let subscription_frame content =
     Frame.make_frame
-      (Bytes.cat (Bytes.make 1 '1') (Bytes.of_string content))
+      (Bytes.cat (Bytes.make 1 (Char.chr 1)) (Bytes.of_string content))
       ~if_more:false ~if_command:false
 
   let unsubscription_frame content =
     Frame.make_frame
-      (Bytes.cat (Bytes.make 1 '0') (Bytes.of_string content))
+      (Bytes.cat (Bytes.make 1 (Char.chr 0)) (Bytes.of_string content))
       ~if_more:false ~if_command:false
 
   let rec send_message_to_all_active_connections connections frame =
@@ -570,7 +570,7 @@ end = struct
   let get_outgoing_queue_size t =
     match t.outgoing_queue_size with
     | Some x -> x
-    | None -> raise (Internal_Error "Incoming queue size is not defined")
+    | None -> raise (Internal_Error "Outgoing queue size is not defined")
 
   let get_pair_connected t =
     match t.socket_states with
@@ -629,7 +629,7 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Pub
-        ; incoming_queue_size= None
+        ; incoming_queue_size= Some default_queue_size
         ; outgoing_queue_size= Some default_queue_size }
     | XPUB ->
         { socket_type
@@ -648,7 +648,8 @@ end = struct
         ; connections= []
         ; socket_states= Sub {subscriptions= []}
         ; incoming_queue_size= Some default_queue_size
-        ; outgoing_queue_size= None }
+        (* Need an outgoing queue to send subscriptions *)
+        ; outgoing_queue_size= Some default_queue_size }
     | XSUB ->
         { socket_type
         ; metadata= [("Socket-Type", "XSUB")]
@@ -2091,6 +2092,7 @@ end = struct
         t.handshake_state <- new_state ;
         actions
     | TRAFFIC -> (
+      (* TODO investigate what happens when overflow of frames *)
         Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ;
         let frames = Frame.list_of_bytes bytes in
         let manage_subscription () =
@@ -2101,8 +2103,8 @@ end = struct
               && not (Frame.get_if_long frame)
             then
               let first_char = (Bytes.to_string (Frame.get_body frame)).[0] in
-              if first_char = '1' then 1
-              else if first_char = '0' then 0
+              if first_char = (Char.chr 1) then 1
+              else if first_char = (Char.chr 0) then 0
               else -1
             else -1
           in

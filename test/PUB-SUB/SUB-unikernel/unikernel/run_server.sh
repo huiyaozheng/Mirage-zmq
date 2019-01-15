@@ -1,0 +1,1 @@
+./sub_unikernel -l "*:debug"
