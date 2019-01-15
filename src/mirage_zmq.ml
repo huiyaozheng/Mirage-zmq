@@ -947,8 +947,8 @@ end = struct
                     let buffer = !(Connection.get_buffer !hd) in
                     Lwt_stream.is_empty buffer
                     >>= function
-                    | false -> check_buffer tl
-                    | true -> Lwt.return (Some (Connection.get_tag !hd))
+                    | true -> check_buffer tl
+                    | false -> Lwt.return (Some (Connection.get_tag !hd))
                   else check_buffer tl
             in
             check_buffer t.connections
@@ -991,8 +991,8 @@ end = struct
                     let buffer = !(Connection.get_buffer !hd) in
                     Lwt_stream.is_empty buffer
                     >>= function
-                    | false -> check_buffer tl
-                    | true -> Lwt.return (Some (Connection.get_tag !hd))
+                    | true -> check_buffer tl
+                    | false -> Lwt.return (Some (Connection.get_tag !hd))
                   else check_buffer tl
             in
             check_buffer t.connections
@@ -1035,8 +1035,8 @@ end = struct
                     let buffer = !(Connection.get_buffer !hd) in
                     Lwt_stream.is_empty buffer
                     >>= function
-                    | false -> check_buffer tl
-                    | true -> Lwt.return (Some (Connection.get_tag !hd))
+                    | true -> check_buffer tl
+                    | false -> Lwt.return (Some (Connection.get_tag !hd))
                   else check_buffer tl
             in
             check_buffer t.connections
@@ -1080,8 +1080,8 @@ end = struct
                     let buffer = !(Connection.get_buffer !hd) in
                     Lwt_stream.is_empty buffer
                     >>= function
-                    | false -> check_buffer tl
-                    | true -> Lwt.return (Some (Connection.get_tag !hd))
+                    | true -> check_buffer tl
+                    | false -> Lwt.return (Some (Connection.get_tag !hd))
                   else check_buffer tl
             in
             check_buffer t.connections
