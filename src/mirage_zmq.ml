@@ -2240,15 +2240,15 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
         act action_list
 
   (** Check the 'mailbox' and send outgoing data / close connection *)
-  let rec check_and_send_buffer buffer flow =
+  let rec check_and_send_buffer buffer flow connection =
     Lwt_stream.peek buffer
     >>= function
-    | None -> Lwt.pause () >>= fun x -> check_and_send_buffer buffer flow
+    | None -> Lwt.pause () >>= fun x -> check_and_send_buffer buffer flow connection
     | Some data -> (
       match data with
       | Command_data b -> (
           Logs.info (fun f ->
-              f "Module Connection_tcp: Connection FSM Write %d bytes\n%s\n"
+              f "Module Connection_tcp: Connection mailbox Write %d bytes\n%s\n"
                 (Bytes.length b) (buffer_to_string b) ) ;
           S.TCPV4.write flow (Cstruct.of_bytes b)
           >>= function
@@ -2256,12 +2256,13 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
               Logs.warn (fun f ->
                   f
                     "Module Connection_tcp: Error writing data to established \
-                     connection." ) ;
+                     connection." );
+              Connection.close connection;
               Lwt.return_unit
           | Ok () ->
               Lwt_stream.junk buffer
               >>= fun () ->
-              Lwt.pause () >>= fun () -> check_and_send_buffer buffer flow )
+              Lwt.pause () >>= fun () -> check_and_send_buffer buffer flow connection)
       | Command_close ->
           Logs.info (fun f ->
               f "Module Connection_tcp: Connection was instructed to close" ) ;
@@ -2295,7 +2296,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             Socket_base.add_connection !socket (ref connection) ;
             Lwt.join
               [ read_and_print flow connection
-              ; check_and_send_buffer stream flow ] )
+              ; check_and_send_buffer stream flow connection] )
           else (
             Socket_base.add_connection !socket (ref connection) ;
             read_and_print flow connection )
@@ -2307,7 +2308,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           Connection.set_send_pf connection pf ;
           Socket_base.add_connection !socket (ref connection) ;
           Lwt.join
-            [read_and_print flow connection; check_and_send_buffer stream flow] )
+            [read_and_print flow connection; check_and_send_buffer stream flow connection] )
         else (
           Socket_base.add_connection !socket (ref connection) ;
           read_and_print flow connection ) ) ;
@@ -2335,7 +2336,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             Lwt.async (fun () ->
                 Lwt.join
                   [ read_and_print flow connection
-                  ; check_and_send_buffer stream flow ] ) )
+                  ; check_and_send_buffer stream flow connection] ) )
           else Lwt.async (fun () -> read_and_print flow connection)
         else if
           if_has_outgoing_queue
@@ -2346,7 +2347,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           Lwt.async (fun () ->
               Lwt.join
                 [ read_and_print flow connection
-                ; check_and_send_buffer stream flow ] ) )
+                ; check_and_send_buffer stream flow connection] ) )
         else Lwt.async (fun () -> read_and_print flow connection) ;
         let rec wait_until_traffic () =
           if Connection.get_stage connection <> TRAFFIC then

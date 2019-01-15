@@ -1,0 +1,1 @@
+./pub_unikernel -l "*:debug"
