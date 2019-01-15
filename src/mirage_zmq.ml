@@ -1188,8 +1188,7 @@ end = struct
                   (Incorrect_use_of_API
                      "Need to receive a reply before sending another message")
               else if t.connections = [] then
-                (* TODO make sure the error message is returned back *)
-                raise Not_Implemented
+                raise No_Available_Peers
               else
                 let rec check_available_connections connections =
                   match connections with
@@ -1200,8 +1199,7 @@ end = struct
                 in
                 check_available_connections t.connections
                 |> function
-                (* TODO make sure the error message is returned back *)
-                | None -> raise Not_Implemented
+                | None -> raise No_Available_Peers
                 | Some connection ->
                     (* TODO check re-send is working *)
                     Connection.send !connection
@@ -1223,14 +1221,9 @@ end = struct
           (* TODO check async *)
           let state = t.socket_states in
           match state with
-          | Req {if_sent; last_sent_connection_tag= tag} -> (
-              if if_sent then
-                raise
-                  (Incorrect_use_of_API
-                     "Need to receive a reply before sending another message")
-              else if t.connections = [] then
-                (* TODO make sure the error message is returned back *)
-                raise Not_Implemented
+          | Dealer -> (
+              if t.connections = [] then
+                raise No_Available_Peers
               else
                 let rec check_available_connections connections =
                   match connections with
@@ -1241,8 +1234,7 @@ end = struct
                 in
                 check_available_connections t.connections
                 |> function
-                (* TODO make sure the error message is returned back *)
-                | None -> raise Not_Implemented
+                | None -> raise No_Available_Peers
                 | Some connection ->
                     (* TODO check re-send is working *)
                     Connection.send !connection
@@ -1352,8 +1344,8 @@ end = struct
         match t.socket_states with
         | Push -> (
             if t.connections = [] then
-              (* TODO make sure the error message is returned back *)
-              raise Not_Implemented
+              (* TODO: not accepting further messages when no available_peers *)
+              raise No_Available_Peers
             else
               let rec check_available_connections connections =
                 match connections with
@@ -1361,14 +1353,13 @@ end = struct
                 | hd :: tl ->
                     if
                       Connection.get_stage !hd = TRAFFIC
-                      && Connection.if_send_queue_full !hd
+                      && not (Connection.if_send_queue_full !hd)
                     then Some hd
                     else check_available_connections tl
               in
               check_available_connections t.connections
               |> function
-              (* TODO make sure the error message is returned back *)
-              | None -> raise Not_Implemented
+              | None -> raise No_Available_Peers
               | Some connection ->
                   (* TODO check re-send is working *)
                   Connection.send !connection
@@ -1390,7 +1381,7 @@ end = struct
               if
                 connected
                 && Connection.get_stage !hd = TRAFFIC
-                && Connection.if_send_queue_full !hd
+                && not (Connection.if_send_queue_full !hd)
               then
                 Connection.send !hd
                   ( Frame.delimiter_frame

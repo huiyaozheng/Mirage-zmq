@@ -1,0 +1,1 @@
+./push_unikernel -l "*:debug"
