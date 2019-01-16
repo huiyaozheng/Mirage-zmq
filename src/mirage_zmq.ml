@@ -1364,8 +1364,7 @@ end = struct
               | Some connection ->
                   (* TODO check re-send is working *)
                   Connection.send !connection
-                    ( Frame.delimiter_frame
-                    :: List.map
+                    ( List.map
                          (fun x -> Message.to_frame x)
                          (Message.list_of_string msg) ) ;
                   t.connections <- reorder t.connections connection false )
@@ -1385,8 +1384,7 @@ end = struct
                 && not (Connection.if_send_queue_full !hd)
               then
                 Connection.send !hd
-                  ( Frame.delimiter_frame
-                  :: List.map
+                  ( List.map
                        (fun x -> Message.to_frame x)
                        (Message.list_of_string msg) )
                 (* TODO: not accepting further messages*)
@@ -1932,9 +1930,7 @@ end = struct
           | _ -> false
         in
         Logs.debug (fun f -> f "Module Connection: Greeting -> FSM\n") ;
-        if if_pair_already_connected then
-          [Close "This PAIR is already connected"]
-        else (
+        (
           if if_pair then Socket_base.set_pair_connected !(t.socket) true ;
           let len = Bytes.length bytes in
           let rec convert greeting_action_list =
@@ -1985,9 +1981,12 @@ end = struct
                   ; Greeting.Recv_filler ]
               in
               let connection_action = convert action_list in
-              t.greeting_state <- state ;
-              t.expected_bytes_length <- 0 ;
-              connection_action
+              if if_pair_already_connected then
+                [Close "This PAIR is already connected"]
+              else (
+                t.greeting_state <- state ;
+                t.expected_bytes_length <- 0 ;
+                connection_action)
           (* Signature + version major *)
           | 11 ->
               let state, action_list =
@@ -1995,17 +1994,23 @@ end = struct
                   [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
                   ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1) ]
               in
-              t.greeting_state <- state ;
-              t.expected_bytes_length <- 53 ;
-              convert action_list
+              if if_pair_already_connected then
+                [Close "This PAIR is already connected"]
+              else (
+                t.greeting_state <- state ;
+                t.expected_bytes_length <- 53 ;
+                convert action_list)
           (* Signature *)
           | 10 ->
               let state, action =
                 Greeting.fsm_single t.greeting_state (Greeting.Recv_sig bytes)
               in
-              t.greeting_state <- state ;
-              t.expected_bytes_length <- 54 ;
-              convert [action]
+              if if_pair_already_connected then
+                [Close "This PAIR is already connected"]
+              else (
+                t.greeting_state <- state ;
+                t.expected_bytes_length <- 54 ;
+                convert [action])
           (* version minor + rest *)
           | 53 ->
               let state, action_list =
