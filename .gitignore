@@ -45,3 +45,5 @@ test/REQ-REP/server/network
 src/.merlin
 test/**/*.opam
 example_snippets/**/*.opam
+perf/REQ-REP/client/client
+perf/REQ-REP/client/server
