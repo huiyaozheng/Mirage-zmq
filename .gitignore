@@ -47,3 +47,5 @@ test/**/*.opam
 example_snippets/**/*.opam
 perf/REQ-REP/client/client
 perf/REQ-REP/client/server
+**/.idea
+**/*.class
