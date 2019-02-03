@@ -1242,12 +1242,7 @@ end = struct
                       :: List.map
                            (fun x -> Message.to_frame x)
                            (Message.list_of_string msg) ) ;
-                    t.connections <- reorder t.connections connection false ;
-                    t.socket_states
-                    <- Req
-                         { if_sent= true
-                         ; last_sent_connection_tag=
-                             Connection.get_tag !connection } )
+                    t.connections <- reorder t.connections connection false ; )
           | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "DEALER sends [Data(string)]") )
     | ROUTER -> (
