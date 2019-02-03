@@ -1,0 +1,1 @@
+./router_server -l "*:debug"

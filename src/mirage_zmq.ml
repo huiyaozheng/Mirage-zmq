@@ -1254,10 +1254,17 @@ end = struct
               match connections with
               | hd :: tl ->
                   if Connection.get_identity !hd = id then
-                    Connection.send !hd
-                      (List.map
+                  (let frame_list = 
+                    if Connection.get_incoming_socket_type !hd == REQ then
+                      Frame.delimiter_frame :: (List.map
                          (fun x -> Message.to_frame x)
                          (Message.list_of_string msg))
+                    else 
+                      (List.map
+                         (fun x -> Message.to_frame x)
+                         (Message.list_of_string msg)) in
+                    Connection.send !hd
+                      frame_list)
                   else find_connection tl
               | [] -> ()
             in
@@ -1835,6 +1842,8 @@ and Connection : sig
 
   val get_subscriptions : t -> string list
 
+  val get_incoming_socket_type : t -> socket_type
+
   val fsm : t -> Bytes.t -> action list
   (** FSM for handing raw bytes transmission *)
 
@@ -1909,6 +1918,8 @@ end = struct
   let get_identity t = t.incoming_identity
 
   let get_subscriptions t = t.subscriptions
+
+  let get_incoming_socket_type t = t.incoming_socket_type
 
   let rec fsm t bytes =
     match t.stage with
