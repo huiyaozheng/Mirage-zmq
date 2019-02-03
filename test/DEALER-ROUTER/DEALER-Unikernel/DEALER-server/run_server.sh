@@ -1,0 +1,1 @@
+./dealer_server -l "*:debug"
