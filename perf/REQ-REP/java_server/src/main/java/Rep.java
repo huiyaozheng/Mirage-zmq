@@ -15,12 +15,10 @@ public class Rep
                 byte[] reply = socket.recv(0);
 
                 // Print the message
-                System.out.println(
-                        "Received: [" + new String(reply, ZMQ.CHARSET) + "]"
-                );
+                //System.out.println("Received: [" + new String(reply, ZMQ.CHARSET) + "]");
 
                 // Send a response
-                String response = "Hello, world!";
+                String response = "Reply";
                 socket.send(response.getBytes(ZMQ.CHARSET), 0);
             }
         }
