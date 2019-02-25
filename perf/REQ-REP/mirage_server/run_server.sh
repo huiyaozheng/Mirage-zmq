@@ -1,1 +1,1 @@
-./rep_server -l "*:debug"
+./rep_server 

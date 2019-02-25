@@ -1,6 +1,7 @@
 import sys
 import matplotlib.pyplot as plt
 import csv
+title = "Java server latency"
 
 if len(sys.argv) != 3:
     print ('Need to specify input csv and output graph filenames')
@@ -23,9 +24,12 @@ with open(input,'r') as csvfile:
             x.append(int(row[0]))
             y.append(float(row[1]))
 
+x.pop(0)
+y.pop(0)
+
 plt.plot(x,y)
 plt.xlabel(x_label)
 plt.ylabel(y_label)
-plt.title('C++ server latency')
+plt.title(title)
 plt.legend()
 plt.savefig(output)
