@@ -65,48 +65,6 @@ type io_buffer_pf_bounded =
   | NA
 
 module Utils = struct
-  (** Returns the socket type from string *)
-  let socket_type_from_string = function
-    | "REQ" -> REQ
-    | "REP" -> REP
-    | "DEALER" -> DEALER
-    | "ROUTER" -> ROUTER
-    | "PUB" -> PUB
-    | "XPUB" -> XPUB
-    | "SUB" -> SUB
-    | "XSUB" -> XSUB
-    | "PUSH" -> PUSH
-    | "PULL" -> PULL
-    | "PAIR" -> PAIR
-    | _ -> raise Socket_Name_Not_Recognised
-
-  (** Checks if the pair is valid as specified by 23/ZMTP *)
-  let if_valid_socket_pair a b =
-    match (a, b) with
-    | REQ, REP
-     |REQ, ROUTER
-     |REP, REQ
-     |REP, DEALER
-     |DEALER, REP
-     |DEALER, DEALER
-     |DEALER, ROUTER
-     |ROUTER, REQ
-     |ROUTER, DEALER
-     |ROUTER, ROUTER
-     |PUB, SUB
-     |PUB, XSUB
-     |XPUB, SUB
-     |XPUB, XSUB
-     |SUB, PUB
-     |SUB, XPUB
-     |XSUB, PUB
-     |XSUB, XPUB
-     |PUSH, PULL
-     |PULL, PUSH
-     |PAIR, PAIR ->
-        true
-    | _ -> false
-
   (** Convert a series of big-endian bytes to int *)
   let rec network_order_to_int bytes =
     let length = Bytes.length bytes in
@@ -131,30 +89,6 @@ module Utils = struct
              String.make 1 (Char.chr x)
            else string_of_int x )
          (List.rev !content))
-
-  (** Creates a tag for a TCP connection *)
-  let tag_of_tcp_connection ipaddr port =
-    String.concat "." ["TCP"; ipaddr; string_of_int port]
-
-  (** Whether the socket type has connections with limited-size queues *)
-  let if_queue_size_limited socket =
-    match socket with
-    | REP | REQ -> false
-    | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL | PAIR -> true
-
-  (** Whether the socket type has an outgoing queue *)
-  let if_has_outgoing_queue socket =
-    match socket with
-    | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PAIR ->
-        true
-    | PULL -> false
-
-  (** Whether the socket type has an incoming queue *)
-  let if_has_incoming_queue socket =
-    match socket with
-    | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PULL | PAIR ->
-        true
-    | PUSH -> false
 end
 
 module Frame : sig
@@ -410,6 +344,16 @@ end
 module rec Socket : sig
   type t
 
+  val socket_type_from_string : string -> socket_type
+
+  val if_valid_socket_pair : socket_type -> socket_type -> bool
+
+  val if_queue_size_limited : socket_type -> bool
+
+  val if_has_incoming_queue : socket_type -> bool
+
+  val if_has_outgoing_queue : socket_type -> bool
+
   val get_socket_type : t -> socket_type
   (** Get the type of the socket *)
 
@@ -498,6 +442,68 @@ end = struct
     ; mutable outgoing_queue_size: int option }
 
   (* Start of helper functions *)
+
+  (** Returns the socket type from string *)
+  let socket_type_from_string = function
+    | "REQ" -> REQ
+    | "REP" -> REP
+    | "DEALER" -> DEALER
+    | "ROUTER" -> ROUTER
+    | "PUB" -> PUB
+    | "XPUB" -> XPUB
+    | "SUB" -> SUB
+    | "XSUB" -> XSUB
+    | "PUSH" -> PUSH
+    | "PULL" -> PULL
+    | "PAIR" -> PAIR
+    | _ -> raise Socket_Name_Not_Recognised
+
+  (** Checks if the pair is valid as specified by 23/ZMTP *)
+  let if_valid_socket_pair a b =
+    match (a, b) with
+    | REQ, REP
+     |REQ, ROUTER
+     |REP, REQ
+     |REP, DEALER
+     |DEALER, REP
+     |DEALER, DEALER
+     |DEALER, ROUTER
+     |ROUTER, REQ
+     |ROUTER, DEALER
+     |ROUTER, ROUTER
+     |PUB, SUB
+     |PUB, XSUB
+     |XPUB, SUB
+     |XPUB, XSUB
+     |SUB, PUB
+     |SUB, XPUB
+     |XSUB, PUB
+     |XSUB, XPUB
+     |PUSH, PULL
+     |PULL, PUSH
+     |PAIR, PAIR ->
+        true
+    | _ -> false
+
+  (** Whether the socket type has connections with limited-size queues *)
+  let if_queue_size_limited socket =
+    match socket with
+    | REP | REQ -> false
+    | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL | PAIR -> true
+
+  (** Whether the socket type has an outgoing queue *)
+  let if_has_outgoing_queue socket =
+    match socket with
+    | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PAIR ->
+        true
+    | PULL -> false
+
+  (** Whether the socket type has an incoming queue *)
+  let if_has_incoming_queue socket =
+    match socket with
+    | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PULL | PAIR ->
+        true
+    | PUSH -> false
 
   (** Put connection at the end of the list or remove the connection from the list *)
   let reorder list connection if_remove =
@@ -2103,12 +2109,12 @@ end = struct
               match name with
               | "Socket-Type" ->
                   if
-                    Utils.if_valid_socket_pair
+                    Socket.if_valid_socket_pair
                       (Socket.get_socket_type !(t.socket))
-                      (Utils.socket_type_from_string value)
+                      (Socket.socket_type_from_string value)
                   then (
                     t.incoming_socket_type
-                    <- Utils.socket_type_from_string value ;
+                    <- Socket.socket_type_from_string value ;
                     convert tl )
                   else [Close "Socket type mismatch"]
               | "Identity" ->
@@ -2183,7 +2189,7 @@ end = struct
     t.send_buffer_pf (Some Command_close)
 
   let send t msg_list =
-    if not (Utils.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
+    if not (Socket.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
     then
       (* Unbounded sending queue *)
       List.iter
@@ -2202,7 +2208,7 @@ end = struct
               Lwt_list.iter_s f msg_list )
 
   let if_send_queue_full t =
-    if not (Utils.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
+    if not (Socket.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
     then false
     else
       match t.send_buffer_pf_bounded with
@@ -2218,6 +2224,10 @@ end
 
 module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
   (* Start of helper functions *)
+
+  (** Creates a tag for a TCP connection *)
+  let tag_of_tcp_connection ipaddr port =
+    String.concat "." ["TCP"; ipaddr; string_of_int port]
 
   (** Read input from flow, send the input to FSM and execute FSM actions *)
   let rec read_and_print flow connection =
@@ -2317,11 +2327,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             (Security_mechanism.init
                (Socket.get_security_data !socket)
                (Socket.get_metadata !socket))
-            (Utils.tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port)
+            (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port)
         in
-        if Utils.if_queue_size_limited (Socket.get_socket_type !socket) then
+        if Socket.if_queue_size_limited (Socket.get_socket_type !socket) then
           if
-            Utils.if_has_outgoing_queue
+            Socket.if_has_outgoing_queue
               (Socket.get_socket_type !(Connection.get_socket connection))
           then (
             let stream, pf =
@@ -2337,7 +2347,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             Socket.add_connection !socket (ref connection) ;
             read_and_print flow connection )
         else if
-          Utils.if_has_outgoing_queue
+          Socket.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
         then (
           let stream, pf = Lwt_stream.create () in
@@ -2357,11 +2367,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     >>= function
     | Ok flow ->
         if
-          Utils.if_queue_size_limited
+          Socket.if_queue_size_limited
             (Socket.get_socket_type !(Connection.get_socket connection))
         then
           if
-            Utils.if_has_outgoing_queue
+            Socket.if_has_outgoing_queue
               (Socket.get_socket_type !(Connection.get_socket connection))
           then (
             let stream, pf =
@@ -2376,7 +2386,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                   ; check_and_send_buffer stream flow connection ] ) )
           else Lwt.async (fun () -> read_and_print flow connection)
         else if
-          Utils.if_has_outgoing_queue
+          Socket.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
         then (
           let stream, pf = Lwt_stream.create () in
@@ -2485,7 +2495,7 @@ end = struct
         (Security_mechanism.init
            (Socket.get_security_data t.socket)
            (Socket.get_metadata t.socket))
-        (Utils.tag_of_tcp_connection ipaddr port)
+        (C_tcp.tag_of_tcp_connection ipaddr port)
     in
     Socket.add_connection t.socket (ref connection) ;
     C_tcp.connect s ipaddr port connection
