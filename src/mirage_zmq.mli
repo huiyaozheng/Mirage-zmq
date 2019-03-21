@@ -31,15 +31,19 @@ type socket_type =
 (** Secuirty mechanism types; CURVE not implemented *)
 type mechanism_type = NULL | PLAIN
 
-type message_component = Data of string | Identity of string
-
-type message = message_component list
+type message = Data of string | Identity_and_data of string * string
 
 (** A context is essentially a set of options shared by a group of socket *)
 module Context : sig
   type t
 
   val create_context : unit -> t
+
+  val set_default_queue_size : t -> int -> unit
+  (** Set the default queue size for this context *)
+
+  val get_default_queue_size : t -> int
+  (** Get the default queue size for this context *)
 end
 
 (** Due to the characteristics of a unikernel, we need the network stack module to create TCP sockets *)

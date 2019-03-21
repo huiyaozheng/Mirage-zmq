@@ -47,9 +47,7 @@ type socket_type =
 (* CURVE not implemented *)
 type mechanism_type = NULL | PLAIN
 
-type message_component = Data of string | Identity of string
-
-type message = message_component list
+type message = Data of string | Identity_and_data of string * string
 
 type socket_metadata = (string * string) list
 
@@ -380,18 +378,29 @@ end = struct
   let to_frame t = Frame.make_frame t.body ~if_more:t.if_more ~if_command:false
 end
 
+(* TODO add preset queue size to context? *)
 module Context : sig
   type t
 
   val create_context : unit -> t
   (** Create a new context *)
 
+  val set_default_queue_size : t -> int -> unit
+  (** Set the default queue size for this context *)
+
+  val get_default_queue_size : t -> int
+  (** Get the default queue size for this context *)
+
   val destroy_context : t -> unit
   (** Destroy all sockets initialised by the context. All connections will be closed *)
 end = struct
-  type t = {options: int}
+  type t = {mutable default_queue_size: int}
 
-  let create_context () = {options= 0}
+  let create_context () = {default_queue_size}
+
+  let set_default_queue_size context size = context.default_queue_size <- size
+
+  let get_default_queue_size context = context.default_queue_size
 
   (* TODO close all connections of sockets in the context *)
   let destroy_context (t : t) = ()
@@ -626,8 +635,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Dealer
-        ; incoming_queue_size= Some default_queue_size
-        ; outgoing_queue_size= Some default_queue_size }
+        ; incoming_queue_size= Some (Context.get_default_queue_size context)
+        ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | ROUTER ->
         { socket_type
         ; metadata= [("Socket-Type", "ROUTER")]
@@ -635,8 +644,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Router
-        ; incoming_queue_size= Some default_queue_size
-        ; outgoing_queue_size= Some default_queue_size }
+        ; incoming_queue_size= Some (Context.get_default_queue_size context)
+        ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | PUB ->
         { socket_type
         ; metadata= [("Socket-Type", "PUB")]
@@ -644,8 +653,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Pub
-        ; incoming_queue_size= Some default_queue_size
-        ; outgoing_queue_size= Some default_queue_size }
+        ; incoming_queue_size= Some (Context.get_default_queue_size context)
+        ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | XPUB ->
         { socket_type
         ; metadata= [("Socket-Type", "XPUB")]
@@ -653,8 +662,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Xpub
-        ; incoming_queue_size= Some default_queue_size
-        ; outgoing_queue_size= Some default_queue_size }
+        ; incoming_queue_size= Some (Context.get_default_queue_size context)
+        ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | SUB ->
         { socket_type
         ; metadata= [("Socket-Type", "SUB")]
@@ -663,9 +672,9 @@ end = struct
         ; connections= []
         ; socket_states= Sub {subscriptions= []}
         ; incoming_queue_size=
-            Some default_queue_size
+            Some (Context.get_default_queue_size context)
             (* Need an outgoing queue to send subscriptions *)
-        ; outgoing_queue_size= Some default_queue_size }
+        ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | XSUB ->
         { socket_type
         ; metadata= [("Socket-Type", "XSUB")]
@@ -673,8 +682,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Xsub {subscriptions= []}
-        ; incoming_queue_size= Some default_queue_size
-        ; outgoing_queue_size= Some default_queue_size }
+        ; incoming_queue_size= Some (Context.get_default_queue_size context)
+        ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | PUSH ->
         { socket_type
         ; metadata= [("Socket-Type", "PUSH")]
@@ -683,7 +692,7 @@ end = struct
         ; connections= []
         ; socket_states= Push
         ; incoming_queue_size= None
-        ; outgoing_queue_size= Some default_queue_size }
+        ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | PULL ->
         { socket_type
         ; metadata= [("Socket-Type", "PULL")]
@@ -691,7 +700,7 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Pull
-        ; incoming_queue_size= Some default_queue_size
+        ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= None }
     | PAIR ->
         { socket_type
@@ -700,8 +709,8 @@ end = struct
         ; security_info= Null
         ; connections= []
         ; socket_states= Pair {connected= false}
-        ; incoming_queue_size= Some default_queue_size
-        ; outgoing_queue_size= Some default_queue_size }
+        ; incoming_queue_size= Some (Context.get_default_queue_size context)
+        ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
 
   let set_plain_credentials t name password =
     if t.security_mechanism = PLAIN then
@@ -834,7 +843,7 @@ end = struct
                              ; last_received_connection_tag=
                                  Connection.get_tag !connection
                              ; address_envelope } ;
-                        Lwt.return [Data (Frame.splice_message_frames frames)]
+                        Lwt.return (Data (Frame.splice_message_frames frames))
                     ) ) )
       | _ -> raise Should_Not_Reach )
     | REQ -> (
@@ -871,7 +880,7 @@ end = struct
             >>= function
             | Some result -> (
               match result with
-              | Some result -> Lwt.return [Data result]
+              | Some result -> Lwt.return (Data result)
               | None -> recv t )
             | None -> recv t )
       | _ -> raise Should_Not_Reach )
@@ -913,7 +922,7 @@ end = struct
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
                     t.connections <- reorder t.connections connection false ;
-                    Lwt.return [Data (Frame.splice_message_frames frames)] ) )
+                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | ROUTER -> (
       match t.socket_states with
@@ -954,8 +963,9 @@ end = struct
                     (* Put the received connection at the end of the queue *)
                     t.connections <- reorder t.connections connection false ;
                     Lwt.return
-                      [ Identity (Connection.get_identity !connection)
-                      ; Data (Frame.splice_message_frames frames) ] ) )
+                      (Identity_and_data
+                         ( Connection.get_identity !connection
+                         , Frame.splice_message_frames frames )) ) )
       | _ -> raise Should_Not_Reach )
     | PUB -> raise (Incorrect_use_of_API "Cannot receive from PUB")
     | SUB -> (
@@ -1000,7 +1010,7 @@ end = struct
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
                     t.connections <- reorder t.connections connection false ;
-                    Lwt.return [Data (Frame.splice_message_frames frames)] ) )
+                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | XPUB -> (
       match t.socket_states with
@@ -1044,7 +1054,7 @@ end = struct
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
                     t.connections <- reorder t.connections connection false ;
-                    Lwt.return [Data (Frame.splice_message_frames frames)] ) )
+                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | XSUB -> (
       match t.socket_states with
@@ -1088,7 +1098,7 @@ end = struct
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
                     t.connections <- reorder t.connections connection false ;
-                    Lwt.return [Data (Frame.splice_message_frames frames)] ) )
+                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | PUSH -> raise (Incorrect_use_of_API "Cannot receive from PUSH")
     | PULL -> (
@@ -1133,7 +1143,7 @@ end = struct
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
                     t.connections <- reorder t.connections connection false ;
-                    Lwt.return [Data (Frame.splice_message_frames frames)] ) )
+                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | PAIR -> (
       match t.socket_states with
@@ -1148,7 +1158,7 @@ end = struct
                   (* TODO check validity *)
                   raise No_Available_Peers
               | Some frames ->
-                  Lwt.return [Data (Frame.splice_message_frames frames)]
+                  Lwt.return (Data (Frame.splice_message_frames frames))
             else raise No_Available_Peers
         | [] -> raise No_Available_Peers
         | _ -> raise Should_Not_Reach )
@@ -1158,7 +1168,7 @@ end = struct
     match t.socket_type with
     | REP -> (
       match msg with
-      | [Data msg] -> (
+      | Data msg -> (
           let state = t.socket_states in
           match state with
           | Rep
@@ -1196,7 +1206,7 @@ end = struct
     (* TODO check sync *)
     | REQ -> (
       match msg with
-      | [Data msg] -> (
+      | Data msg -> (
           let state = t.socket_states in
           match state with
           | Req {if_sent; last_sent_connection_tag= tag} -> (
@@ -1233,7 +1243,7 @@ end = struct
       | _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]") )
     | DEALER -> (
       match msg with
-      | [Data msg] -> (
+      | Data msg -> (
           (* TODO check async *)
           let state = t.socket_states in
           match state with
@@ -1257,29 +1267,30 @@ end = struct
                       :: List.map
                            (fun x -> Message.to_frame x)
                            (Message.list_of_string msg) ) ;
-                    t.connections <- reorder t.connections connection false ; )
+                    t.connections <- reorder t.connections connection false )
           | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "DEALER sends [Data(string)]") )
     | ROUTER -> (
       match msg with
-      | [Identity id; Data msg] -> (
+      | Identity_and_data (id, msg) -> (
         match t.socket_states with
         | Router ->
             let rec find_connection connections =
               match connections with
               | hd :: tl ->
                   if Connection.get_identity !hd = id then
-                  (let frame_list = 
-                    if Connection.get_incoming_socket_type !hd == REQ then
-                      Frame.delimiter_frame :: (List.map
-                         (fun x -> Message.to_frame x)
-                         (Message.list_of_string msg))
-                    else 
-                      (List.map
-                         (fun x -> Message.to_frame x)
-                         (Message.list_of_string msg)) in
-                    Connection.send !hd
-                      frame_list)
+                    let frame_list =
+                      if Connection.get_incoming_socket_type !hd == REQ then
+                        Frame.delimiter_frame
+                        :: List.map
+                             (fun x -> Message.to_frame x)
+                             (Message.list_of_string msg)
+                      else
+                        List.map
+                          (fun x -> Message.to_frame x)
+                          (Message.list_of_string msg)
+                    in
+                    Connection.send !hd frame_list
                   else find_connection tl
               | [] -> ()
             in
@@ -1292,7 +1303,7 @@ end = struct
                 identity!") )
     | PUB -> (
       match msg with
-      | [Data msg] -> (
+      | Data msg -> (
         match t.socket_states with
         | Pub ->
             let frames_to_send =
@@ -1316,7 +1327,7 @@ end = struct
     | SUB -> raise (Incorrect_use_of_API "Cannot send via SUB")
     | XPUB -> (
       match msg with
-      | [Data msg] -> (
+      | Data msg -> (
         match t.socket_states with
         | Xpub ->
             let frames_to_send =
@@ -1339,7 +1350,7 @@ end = struct
       | _ -> raise (Incorrect_use_of_API "XPUB accepts a message only!") )
     | XSUB -> (
       match msg with
-      | [Data msg] -> (
+      | Data msg -> (
         match t.socket_states with
         | Xsub {subscriptions= _} ->
             let frames_to_send =
@@ -1357,7 +1368,7 @@ end = struct
       | _ -> raise (Incorrect_use_of_API "XSUB accepts a message only!") )
     | PUSH -> (
       match msg with
-      | [Data msg] -> (
+      | Data msg -> (
         match t.socket_states with
         | Push -> (
             if t.connections = [] then
@@ -1389,7 +1400,7 @@ end = struct
     | PULL -> raise (Incorrect_use_of_API "Cannot send via PULL")
     | PAIR -> (
       match msg with
-      | [Data msg] -> (
+      | Data msg -> (
         match t.socket_states with
         | Pair {connected} -> (
           match t.connections with
@@ -2083,9 +2094,7 @@ end = struct
             | Security_mechanism.Ok ->
                 Logs.debug (fun f -> f "Module Connection: Handshake OK\n") ;
                 t.stage <- TRAFFIC ;
-                let frames =
-                  Socket.initial_traffic_messages !(t.socket)
-                in
+                let frames = Socket.initial_traffic_messages !(t.socket) in
                 List.map (fun x -> Write (Frame.to_bytes x)) frames
                 @ convert tl
             | Security_mechanism.Close -> [Close "Handshake FSM error"]
@@ -2165,17 +2174,14 @@ end = struct
 
   let close t =
     let if_pair =
-      match Socket.get_socket_type !(t.socket) with
-      | PAIR -> true
-      | _ -> false
+      match Socket.get_socket_type !(t.socket) with PAIR -> true | _ -> false
     in
     if if_pair then Socket.set_pair_connected !(t.socket) false ;
     t.stage <- CLOSED ;
     t.send_buffer_pf (Some Command_close)
 
   let send t msg_list =
-    if not (if_queue_size_limited (Socket.get_socket_type !(t.socket)))
-    then
+    if not (if_queue_size_limited (Socket.get_socket_type !(t.socket))) then
       (* Unbounded sending queue *)
       List.iter
         (fun x -> t.send_buffer_pf (Some (Command_data (Frame.to_bytes x))))
@@ -2193,8 +2199,8 @@ end = struct
               Lwt_list.iter_s f msg_list )
 
   let if_send_queue_full t =
-    if not (if_queue_size_limited (Socket.get_socket_type !(t.socket)))
-    then false
+    if not (if_queue_size_limited (Socket.get_socket_type !(t.socket))) then
+      false
     else
       match t.send_buffer_pf_bounded with
       | None -> raise (Internal_Error "")
@@ -2443,8 +2449,7 @@ end = struct
   let set_plain_credentials t username password =
     Socket.set_plain_credentials t.socket username password
 
-  let set_plain_user_list t list =
-    Socket.set_plain_user_list t.socket list
+  let set_plain_user_list t list = Socket.set_plain_user_list t.socket list
 
   let set_identity t identity = Socket.set_identity t.socket identity
 
@@ -2456,8 +2461,7 @@ end = struct
 
   let subscribe t subscription = Socket.subscribe t.socket subscription
 
-  let unsubscribe t subscription =
-    Socket.unsubscribe t.socket subscription
+  let unsubscribe t subscription = Socket.unsubscribe t.socket subscription
 
   let recv t = Socket.recv t.socket
 
