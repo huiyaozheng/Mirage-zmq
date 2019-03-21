@@ -64,98 +64,99 @@ type io_buffer_pf_bounded =
   | Applicable of connection_buffer_object option Lwt_stream.bounded_push ref
   | NA
 
-(* Start of helper functions *)
+module Utils = struct
+  (** Returns the socket type from string *)
+  let socket_type_from_string = function
+    | "REQ" -> REQ
+    | "REP" -> REP
+    | "DEALER" -> DEALER
+    | "ROUTER" -> ROUTER
+    | "PUB" -> PUB
+    | "XPUB" -> XPUB
+    | "SUB" -> SUB
+    | "XSUB" -> XSUB
+    | "PUSH" -> PUSH
+    | "PULL" -> PULL
+    | "PAIR" -> PAIR
+    | _ -> raise Socket_Name_Not_Recognised
 
-(** Returns the socket type from string *)
-let socket_type_from_string = function
-  | "REQ" -> REQ
-  | "REP" -> REP
-  | "DEALER" -> DEALER
-  | "ROUTER" -> ROUTER
-  | "PUB" -> PUB
-  | "XPUB" -> XPUB
-  | "SUB" -> SUB
-  | "XSUB" -> XSUB
-  | "PUSH" -> PUSH
-  | "PULL" -> PULL
-  | "PAIR" -> PAIR
-  | _ -> raise Socket_Name_Not_Recognised
+  (** Checks if the pair is valid as specified by 23/ZMTP *)
+  let if_valid_socket_pair a b =
+    match (a, b) with
+    | REQ, REP
+     |REQ, ROUTER
+     |REP, REQ
+     |REP, DEALER
+     |DEALER, REP
+     |DEALER, DEALER
+     |DEALER, ROUTER
+     |ROUTER, REQ
+     |ROUTER, DEALER
+     |ROUTER, ROUTER
+     |PUB, SUB
+     |PUB, XSUB
+     |XPUB, SUB
+     |XPUB, XSUB
+     |SUB, PUB
+     |SUB, XPUB
+     |XSUB, PUB
+     |XSUB, XPUB
+     |PUSH, PULL
+     |PULL, PUSH
+     |PAIR, PAIR ->
+        true
+    | _ -> false
 
-(** Checks if the pair is valid as specified by 23/ZMTP *)
-let if_valid_socket_pair a b =
-  match (a, b) with
-  | REQ, REP
-   |REQ, ROUTER
-   |REP, REQ
-   |REP, DEALER
-   |DEALER, REP
-   |DEALER, DEALER
-   |DEALER, ROUTER
-   |ROUTER, REQ
-   |ROUTER, DEALER
-   |ROUTER, ROUTER
-   |PUB, SUB
-   |PUB, XSUB
-   |XPUB, SUB
-   |XPUB, XSUB
-   |SUB, PUB
-   |SUB, XPUB
-   |XSUB, PUB
-   |XSUB, XPUB
-   |PUSH, PULL
-   |PULL, PUSH
-   |PAIR, PAIR ->
-      true
-  | _ -> false
+  (** Convert a series of big-endian bytes to int *)
+  let rec network_order_to_int bytes =
+    let length = Bytes.length bytes in
+    if length = 1 then Char.code (Bytes.get bytes 0)
+    else
+      Char.code (Bytes.get bytes (length - 1))
+      + (network_order_to_int (Bytes.sub bytes 0 (length - 1)) * 256)
 
-(** Convert a series of big-endian bytes to int *)
-let rec network_order_to_int bytes =
-  let length = Bytes.length bytes in
-  if length = 1 then Char.code (Bytes.get bytes 0)
-  else
-    Char.code (Bytes.get bytes (length - 1))
-    + (network_order_to_int (Bytes.sub bytes 0 (length - 1)) * 256)
+  (** Convert a int to big-endian bytes of length n *)
+  let int_to_network_order n length =
+    Bytes.init length (fun i ->
+        Char.chr ((n lsr (8 * (length - i - 1))) land 255) )
 
-(** Convert a int to big-endian bytes of length n *)
-let int_to_network_order n length =
-  Bytes.init length (fun i -> Char.chr ((n lsr (8 * (length - i - 1))) land 255)
-  )
+  (** Converts a byte buffer to printable string *)
+  let buffer_to_string data =
+    let content = ref [] in
+    Bytes.iter (fun b -> content := Char.code b :: !content) data ;
+    String.concat " "
+      (List.map
+         (fun x ->
+           if (x >= 65 && x <= 90) || (x >= 97 && x <= 122) then
+             String.make 1 (Char.chr x)
+           else string_of_int x )
+         (List.rev !content))
 
-(** Converts a byte buffer to printable string *)
-let buffer_to_string data =
-  let content = ref [] in
-  Bytes.iter (fun b -> content := Char.code b :: !content) data ;
-  String.concat " "
-    (List.map
-       (fun x ->
-         if (x >= 65 && x <= 90) || (x >= 97 && x <= 122) then
-           String.make 1 (Char.chr x)
-         else string_of_int x )
-       (List.rev !content))
+  (** Creates a tag for a TCP connection *)
+  let tag_of_tcp_connection ipaddr port =
+    String.concat "." ["TCP"; ipaddr; string_of_int port]
 
-(** Creates a tag for a TCP connection *)
-let tag_of_tcp_connection ipaddr port =
-  String.concat "." ["TCP"; ipaddr; string_of_int port]
+  (** Whether the socket type has connections with limited-size queues *)
+  let if_queue_size_limited socket =
+    match socket with
+    | REP | REQ -> false
+    | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL | PAIR -> true
 
-(** Whether the socket type has connections with limited-size queues *)
-let if_queue_size_limited socket =
-  match socket with
-  | REP | REQ -> false
-  | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL | PAIR -> true
+  (** Whether the socket type has an outgoing queue *)
+  let if_has_outgoing_queue socket =
+    match socket with
+    | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PAIR ->
+        true
+    | PULL -> false
 
-(** Whether the socket type has an outgoing queue *)
-let if_has_outgoing_queue socket =
-  match socket with
-  | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PAIR -> true
-  | PULL -> false
+  (** Whether the socket type has an incoming queue *)
+  let if_has_incoming_queue socket =
+    match socket with
+    | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PULL | PAIR ->
+        true
+    | PUSH -> false
+end
 
-(** Whether the socket type has an incoming queue *)
-let if_has_incoming_queue socket =
-  match socket with
-  | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PULL | PAIR -> true
-  | PUSH -> false
-
-(* End of helper functions *)
 module Frame : sig
   type t
 
@@ -200,7 +201,7 @@ end = struct
 
   let size_to_bytes size if_long =
     if not if_long then Bytes.make 1 (Char.chr size)
-    else int_to_network_order size 8
+    else Utils.int_to_network_order size 8
 
   let make_frame body ~if_more ~if_command =
     let f = ref 0 in
@@ -223,7 +224,7 @@ end = struct
     if if_long then
       (* long-size *)
       (* TODO test long *)
-      let content_length = network_order_to_int (Bytes.sub bytes 1 8) in
+      let content_length = Utils.network_order_to_int (Bytes.sub bytes 1 8) in
       if total_length < content_length + 9 then
         raise (Internal_Error "Not a complete frame buffer")
       else if total_length > content_length + 9 then
@@ -1507,7 +1508,7 @@ end = struct
       let name_length = Char.code (Bytes.get bytes 0) in
       let name = Bytes.sub_string bytes 1 name_length in
       let property_length =
-        network_order_to_int (Bytes.sub bytes (name_length + 1) 4)
+        Utils.network_order_to_int (Bytes.sub bytes (name_length + 1) 4)
       in
       let property =
         Bytes.sub_string bytes (name_length + 1 + 4) property_length
@@ -1550,7 +1551,7 @@ end = struct
       Bytes.cat
         (Bytes.cat (Bytes.make 1 (Char.chr name_length)) (Bytes.of_string name))
         (Bytes.cat
-           (int_to_network_order property_length 4)
+           (Utils.int_to_network_order property_length 4)
            (Bytes.of_string property))
     in
     let rec convert_metadata = function
@@ -1569,7 +1570,7 @@ end = struct
       Bytes.cat
         (Bytes.cat (Bytes.make 1 (Char.chr name_length)) (Bytes.of_string name))
         (Bytes.cat
-           (int_to_network_order property_length 4)
+           (Utils.int_to_network_order property_length 4)
            (Bytes.of_string property))
     in
     let rec convert_metadata = function
@@ -2102,11 +2103,12 @@ end = struct
               match name with
               | "Socket-Type" ->
                   if
-                    if_valid_socket_pair
+                    Utils.if_valid_socket_pair
                       (Socket.get_socket_type !(t.socket))
-                      (socket_type_from_string value)
+                      (Utils.socket_type_from_string value)
                   then (
-                    t.incoming_socket_type <- socket_type_from_string value ;
+                    t.incoming_socket_type
+                    <- Utils.socket_type_from_string value ;
                     convert tl )
                   else [Close "Socket type mismatch"]
               | "Identity" ->
@@ -2181,7 +2183,8 @@ end = struct
     t.send_buffer_pf (Some Command_close)
 
   let send t msg_list =
-    if not (if_queue_size_limited (Socket.get_socket_type !(t.socket))) then
+    if not (Utils.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
+    then
       (* Unbounded sending queue *)
       List.iter
         (fun x -> t.send_buffer_pf (Some (Command_data (Frame.to_bytes x))))
@@ -2199,8 +2202,8 @@ end = struct
               Lwt_list.iter_s f msg_list )
 
   let if_send_queue_full t =
-    if not (if_queue_size_limited (Socket.get_socket_type !(t.socket))) then
-      false
+    if not (Utils.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
+    then false
     else
       match t.send_buffer_pf_bounded with
       | None -> raise (Internal_Error "")
@@ -2233,7 +2236,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     | Ok (`Data b) ->
         Logs.debug (fun f ->
             f "Module Connection_tcp: Read: %d bytes:\n%s" (Cstruct.len b)
-              (buffer_to_string (Cstruct.to_bytes b)) ) ;
+              (Utils.buffer_to_string (Cstruct.to_bytes b)) ) ;
         let action_list = Connection.fsm connection (Cstruct.to_bytes b) in
         let rec act actions =
           match actions with
@@ -2245,7 +2248,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                     f
                       "Module Connection_tcp: Connection FSM Write %d bytes\n\
                        %s\n"
-                      (Bytes.length b) (buffer_to_string b) ) ;
+                      (Bytes.length b) (Utils.buffer_to_string b) ) ;
                 S.TCPV4.write flow (Cstruct.of_bytes b)
                 >>= function
                 | Error _ ->
@@ -2281,7 +2284,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
               f
                 "Module Connection_tcp: Connection mailbox Write %d bytes\n\
                  %s\n"
-                (Bytes.length b) (buffer_to_string b) ) ;
+                (Bytes.length b) (Utils.buffer_to_string b) ) ;
           S.TCPV4.write flow (Cstruct.of_bytes b)
           >>= function
           | Error _ ->
@@ -2314,11 +2317,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             (Security_mechanism.init
                (Socket.get_security_data !socket)
                (Socket.get_metadata !socket))
-            (tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port)
+            (Utils.tag_of_tcp_connection (Ipaddr.V4.to_string dst) dst_port)
         in
-        if if_queue_size_limited (Socket.get_socket_type !socket) then
+        if Utils.if_queue_size_limited (Socket.get_socket_type !socket) then
           if
-            if_has_outgoing_queue
+            Utils.if_has_outgoing_queue
               (Socket.get_socket_type !(Connection.get_socket connection))
           then (
             let stream, pf =
@@ -2334,7 +2337,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             Socket.add_connection !socket (ref connection) ;
             read_and_print flow connection )
         else if
-          if_has_outgoing_queue
+          Utils.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
         then (
           let stream, pf = Lwt_stream.create () in
@@ -2354,11 +2357,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     >>= function
     | Ok flow ->
         if
-          if_queue_size_limited
+          Utils.if_queue_size_limited
             (Socket.get_socket_type !(Connection.get_socket connection))
         then
           if
-            if_has_outgoing_queue
+            Utils.if_has_outgoing_queue
               (Socket.get_socket_type !(Connection.get_socket connection))
           then (
             let stream, pf =
@@ -2373,7 +2376,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                   ; check_and_send_buffer stream flow connection ] ) )
           else Lwt.async (fun () -> read_and_print flow connection)
         else if
-          if_has_outgoing_queue
+          Utils.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
         then (
           let stream, pf = Lwt_stream.create () in
@@ -2482,7 +2485,7 @@ end = struct
         (Security_mechanism.init
            (Socket.get_security_data t.socket)
            (Socket.get_metadata t.socket))
-        (tag_of_tcp_connection ipaddr port)
+        (Utils.tag_of_tcp_connection ipaddr port)
     in
     Socket.add_connection t.socket (ref connection) ;
     C_tcp.connect s ipaddr port connection
