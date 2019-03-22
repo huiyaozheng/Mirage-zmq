@@ -54,7 +54,7 @@ type socket_metadata = (string * string) list
 type security_data =
   | Null
   | Plain_client of string * string
-  | Plain_server of (string * string) list
+  | Plain_server of (string, string) Hashtbl.t
 
 type connection_stage = GREETING | HANDSHAKE | TRAFFIC | CLOSED
 
@@ -128,10 +128,10 @@ module Frame : sig
   (** A helper function that takes a list of message frames and returns the reconstructed message *)
 end = struct
   type t =
-    { flag: char
+    { flags: char
     ; (* Known issue: size is limited by max_int; may not be able to reach 2^63-1 *)
       size: int
-    ; body: Bytes.t }
+    ; body: bytes }
 
   let size_to_bytes size if_long =
     if not if_long then Bytes.make 1 (Char.chr size)
@@ -143,12 +143,12 @@ end = struct
     if if_more then f := !f + 1 ;
     if if_command then f := !f + 4 ;
     if len > 255 then f := !f + 2 ;
-    {flag= Char.chr !f; size= len; body}
+    {flags= Char.chr !f; size= len; body}
 
   let to_bytes t =
     Bytes.concat Bytes.empty
-      [ Bytes.make 1 t.flag
-      ; size_to_bytes t.size (Char.code t.flag land 2 = 2)
+      [ Bytes.make 1 t.flags
+      ; size_to_bytes t.size (Char.code t.flags land 2 = 2)
       ; t.body ]
 
   let of_bytes bytes =
@@ -164,7 +164,7 @@ end = struct
       else if total_length > content_length + 9 then
         raise (Internal_Error "More than one frame in the buffer")
       else
-        { flag= Char.chr flag
+        { flags= Char.chr flag
         ; size= content_length
         ; body= Bytes.sub bytes 9 content_length }
     else
@@ -176,7 +176,7 @@ end = struct
       else if total_length > content_length + 2 then
         raise (Internal_Error "More than one frame in the buffer")
       else
-        { flag= Char.chr flag
+        { flags= Char.chr flag
         ; size= content_length
         ; body= Bytes.sub bytes 2 content_length }
 
@@ -195,17 +195,17 @@ end = struct
     in
     List.rev (list_of_bytes_accumu bytes [])
 
-  let get_if_more t = Char.code t.flag land 1 = 1
+  let get_if_more t = Char.code t.flags land 1 = 1
 
-  let get_if_long t = Char.code t.flag land 2 = 2
+  let get_if_long t = Char.code t.flags land 2 = 2
 
-  let get_if_command t = Char.code t.flag land 4 = 4
+  let get_if_command t = Char.code t.flags land 4 = 4
 
   let get_body t = t.body
 
   let is_delimiter_frame t = get_if_more t && t.size = 0
 
-  let delimiter_frame = {flag= Char.chr 1; size= 0; body= Bytes.empty}
+  let delimiter_frame = {flags= Char.chr 1; size= 0; body= Bytes.empty}
 
   let splice_message_frames list =
     let rec splice_message_frames_accumu list s =
@@ -725,7 +725,12 @@ end = struct
     else raise Not_Able_To_Set_Credentials
 
   let set_plain_user_list t list =
-    if t.security_mechanism = PLAIN then t.security_info <- Plain_server list
+    if t.security_mechanism = PLAIN then (
+      let hashtable = Hashtbl.create (List.length list) in
+      List.iter
+        (fun (username, password) -> Hashtbl.add hashtable username password)
+        list ;
+      t.security_info <- Plain_server hashtable )
     else raise Not_Able_To_Set_Credentials
 
   let set_identity t identity =
@@ -1587,12 +1592,6 @@ end = struct
       (Command.to_frame
          (Command.make_command command (convert_metadata metadata)))
 
-  (** Search the server's password list for the presented credentials *)
-  let rec search (name : string) (password : string) list =
-    match list with
-    | [] -> false
-    | (n, p) :: tl -> (n = name && p = password) || search name password tl
-
   (* End of helper functions *)
 
   let get_name_string t =
@@ -1660,13 +1659,17 @@ end = struct
             let username, password = extract_username_password data in
             match t.data with
             | Plain_client _ -> raise (Internal_Error "Server data expected")
-            | Plain_server list ->
-                if
-                  search (Bytes.to_string username) (Bytes.to_string password)
-                    list
-                then ({t with state= WELCOME}, [Write welcome])
-                else
+            | Plain_server hashtable -> (
+              match Hashtbl.find_opt hashtable (Bytes.to_string username) with
+              | Some valid_password ->
+                  if valid_password = (Bytes.to_string password) then
+                    ({t with state= WELCOME}, [Write welcome])
+                  else
+                    ( {t with state= OK}
+                    , [Write (error "Handshake error"); Close] )
+              | None ->
                   ({t with state= OK}, [Write (error "Handshake error"); Close])
+              )
             | _ -> raise (Internal_Error "Security type mismatch")
           else ({t with state= OK}, [Write (error "Handshake error"); Close])
       | START_CLIENT ->
