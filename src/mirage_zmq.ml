@@ -422,10 +422,8 @@ end = struct
     | Dealer
     | Router
     | Pub
-    (* It may not be necessary to keep a local copy of the subscriptions *)
     | Sub of {subscriptions: string list}
     | Xpub
-    (* It may not be necessary to keep a local copy of the subscriptions *)
     | Xsub of {subscriptions: string list}
     | Push
     | Pull
