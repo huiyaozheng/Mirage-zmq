@@ -2231,7 +2231,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     String.concat "." ["TCP"; ipaddr; string_of_int port]
 
   (** Read input from flow, send the input to FSM and execute FSM actions *)
-  let rec read_and_print flow connection =
+  let rec process_input flow connection =
     S.TCPV4.read flow
     >>= function
     | Ok `Eof ->
@@ -2251,7 +2251,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
         let action_list = Connection.fsm connection (Cstruct.to_bytes b) in
         let rec act actions =
           match actions with
-          | [] -> Lwt.pause () >>= fun () -> read_and_print flow connection
+          | [] -> Lwt.pause () >>= fun () -> process_input flow connection
           | hd :: tl -> (
             match hd with
             | Connection.Write b -> (
@@ -2283,11 +2283,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
         act action_list
 
   (** Check the 'mailbox' and send outgoing data / close connection *)
-  let rec check_and_send_buffer buffer flow connection =
+  let rec process_output buffer flow connection =
     Lwt_stream.peek buffer
     >>= function
     | None ->
-        Lwt.pause () >>= fun x -> check_and_send_buffer buffer flow connection
+        Lwt.pause () >>= fun x -> process_output buffer flow connection
     | Some data -> (
       match data with
       | Command_data b -> (
@@ -2309,7 +2309,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
               Lwt_stream.junk buffer
               >>= fun () ->
               Lwt.pause ()
-              >>= fun () -> check_and_send_buffer buffer flow connection )
+              >>= fun () -> process_output buffer flow connection )
       | Command_close ->
           Logs.debug (fun f ->
               f "Module Connection_tcp: Connection was instructed to close" ) ;
@@ -2342,11 +2342,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             Connection.set_send_pf_bounded connection pf ;
             Socket.add_connection !socket (ref connection) ;
             Lwt.join
-              [ read_and_print flow connection
-              ; check_and_send_buffer stream flow connection ] )
+              [ process_input flow connection
+              ; process_output stream flow connection ] )
           else (
             Socket.add_connection !socket (ref connection) ;
-            read_and_print flow connection )
+            process_input flow connection )
         else if
           Socket.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
@@ -2355,11 +2355,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           Connection.set_send_pf connection pf ;
           Socket.add_connection !socket (ref connection) ;
           Lwt.join
-            [ read_and_print flow connection
-            ; check_and_send_buffer stream flow connection ] )
+            [ process_input flow connection
+            ; process_output stream flow connection ] )
         else (
           Socket.add_connection !socket (ref connection) ;
-          read_and_print flow connection ) ) ;
+          process_input flow connection ) ) ;
     S.listen s
 
   let rec connect s addr port connection =
@@ -2383,9 +2383,9 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             Connection.set_send_pf_bounded connection pf ;
             Lwt.async (fun () ->
                 Lwt.join
-                  [ read_and_print flow connection
-                  ; check_and_send_buffer stream flow connection ] ) )
-          else Lwt.async (fun () -> read_and_print flow connection)
+                  [ process_input flow connection
+                  ; process_output stream flow connection ] ) )
+          else Lwt.async (fun () -> process_input flow connection)
         else if
           Socket.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
@@ -2394,9 +2394,9 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           Connection.set_send_pf connection pf ;
           Lwt.async (fun () ->
               Lwt.join
-                [ read_and_print flow connection
-                ; check_and_send_buffer stream flow connection ] ) )
-        else Lwt.async (fun () -> read_and_print flow connection) ;
+                [ process_input flow connection
+                ; process_output stream flow connection ] ) )
+        else Lwt.async (fun () -> process_input flow connection) ;
         let rec wait_until_traffic () =
           if Connection.get_stage connection <> TRAFFIC then
             Lwt.pause () >>= fun () -> wait_until_traffic ()
