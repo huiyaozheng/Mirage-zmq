@@ -407,6 +407,8 @@ module rec Socket : sig
   val send : t -> message -> unit
   (** Send a msg to the underlying connections, according to the semantics of the socket type *)
 
+  val send_blocking : t -> message -> unit Lwt.t
+
   val add_connection : t -> Connection.t ref -> unit
 
   val initial_traffic_messages : t -> Frame.t list
@@ -1431,6 +1433,10 @@ end = struct
         | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!") )
 
+  let rec send_blocking t msg =
+    try send t msg ; Lwt.return_unit with No_Available_Peers ->
+      Lwt.pause () >>= fun () -> send_blocking t msg
+  
   let add_connection t connection =
     t.connections <- t.connections @ [connection]
 
@@ -2481,9 +2487,7 @@ end = struct
 
   let send t msg = Socket.send t.socket msg
 
-  let rec send_blocking t msg =
-    try send t msg ; Lwt.return_unit with No_Available_Peers ->
-      Lwt.pause () >>= fun () -> send_blocking t msg
+  let send_blocking t msg = Socket.send_blocking t.socket msg
 
   let bind t port s =
     let module C_tcp = Connection_tcp (S) in
