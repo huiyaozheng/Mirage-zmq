@@ -15,6 +15,8 @@
  *)
 exception No_Available_Peers
 
+exception Incorrect_use_of_API of string
+
 type socket_type =
   | REQ
   | REP
