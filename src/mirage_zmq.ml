@@ -75,6 +75,8 @@ module Linked_list : sig
 
     val front : 'a t -> 'a
 
+    val pop : 'a t -> 'a
+
     val search : 'a t -> ('a -> bool) -> 'a
 end = struct
     type 'a node = Some of {mutable data: 'a; mutable next: 'a node} | NULL
@@ -103,6 +105,16 @@ end = struct
     | Some{data=_data; next=_} -> _data
     | NULL -> raise (Internal_Error "empty list") 
 
+    let pop list = if list.length = 0 then raise (Internal_Error "empty list") 
+    else if list.length = 1 then (
+      match list.head with 
+      | Some{data=_data; next= next} -> (list.head <- NULL; list.tail <- NULL; list.length <- 0; _data)
+      | NULL -> raise (Internal_Error "empty list")
+    )
+    else match list.head with 
+      | Some{data=_data; next= next} -> (list.head <- next;  list.length <- list.length - 1; _data)
+      | NULL -> raise (Internal_Error "empty list")
+
     let search list f =
     let rec g head =
    (match head with
@@ -111,8 +123,52 @@ end = struct
     )
     | NULL -> raise Not_found)
     in g (list.head)
+end
 
-  end
+module Container : sig
+  type 'a t
+  type container_type = QUEUE | LINKED_LIST | SINGLETON
+  val create : container_type -> 'a t
+  val append : 'a t -> 'a -> unit
+  val rotate : 'a t -> unit
+  val get_head : 'a t -> 'a
+  val discard_head : 'a t -> unit
+  (*val search : search : 'a t -> ('a -> bool) -> 'a
+  val iter : 'a t -> ('a -> unit) -> unit*)
+end = struct
+  type 'a t = Queue of 'a Queue.t | Linked_list of 'a Linked_list.t | Singleton of 'a option ref
+  type container_type = QUEUE | LINKED_LIST | SINGLETON
+
+  let create container_type =
+  match container_type with
+  | QUEUE -> Queue(Queue.create ())
+  | LINKED_LIST -> Linked_list(Linked_list.create ())
+  | SINGLETON -> Singleton(ref None)
+
+  let append container data =
+  match container with
+  | Queue(q) -> Queue.push data q
+  | Linked_list(ll) -> Linked_list.append ll data
+  | Singleton(x) -> x := Some(data)
+
+  let rotate container = 
+  match container with
+  | Queue(q) -> (let head = Queue.pop q in Queue.push head q)
+  | Linked_list(ll) -> (let head = Linked_list.pop ll in Linked_list.append ll head)
+  | Singleton(_) -> ()
+
+  let get_head container = 
+  match container with
+  | Queue(q) -> (try Queue.peek q with Queue.Empty -> raise No_Available_Peers)
+  | Linked_list(ll) -> (try Linked_list.front ll with Internal_Error _ -> raise No_Available_Peers)
+  | Singleton(x) -> match !x with Some(x) -> x | None -> raise No_Available_Peers
+
+  let discard_head container = 
+  match container with
+  | Queue(q) -> (try (Queue. q; with Queue.Empty -> ())
+  (*| Linked_list(ll) -> (try Linked_list.pop ll; with Internal_Error _ -> ())
+  | Singleton(x) -> x := None*)
+end
 module Utils = struct
   (** Convert a series of big-endian bytes to int *)
   let rec network_order_to_int bytes =
