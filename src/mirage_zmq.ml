@@ -31,6 +31,8 @@ exception Internal_Error of string
 
 exception Incorrect_use_of_API of string
 
+exception Not_found
+
 type socket_type =
   | REQ
   | REP
@@ -64,6 +66,53 @@ type io_buffer_pf_bounded =
   | Applicable of connection_buffer_object option Lwt_stream.bounded_push ref
   | NA
 
+module Linked_list : sig
+    type 'a t
+
+    val create : unit -> 'a t
+
+    val append : 'a t -> 'a -> unit
+
+    val front : 'a t -> 'a
+
+    val search : 'a t -> ('a -> bool) -> 'a
+end = struct
+    type 'a node = Some of {mutable data: 'a; mutable next: 'a node} | NULL
+
+    type 'a t =
+      {mutable head: 'a node; mutable tail: 'a node; mutable length: int}
+
+
+    let create () = {head= NULL; tail= NULL; length= 0}
+
+    let append list data =
+      let new_node = Some {data; next= NULL} in
+      if list.length = 0 then
+        (list.head <- new_node;
+        list.tail <- new_node;
+        list.length <- 1)
+      else
+      match list.tail with
+      | Some (k) ->
+          (k.next <- new_node;
+          list.tail <- new_node ;
+          list.length <- list.length + 1;)
+      | NULL -> raise (Internal_Error "empty list")
+
+    let front list = match list.head with
+    | Some{data=_data; next=_} -> _data
+    | NULL -> raise (Internal_Error "empty list") 
+
+    let search list f =
+    let rec g head =
+   (match head with
+    | Some{data=_data; next = _next} -> (
+      if f _data then _data else g _next
+    )
+    | NULL -> raise Not_found)
+    in g (list.head)
+
+  end
 module Utils = struct
   (** Convert a series of big-endian bytes to int *)
   let rec network_order_to_int bytes =
@@ -89,6 +138,8 @@ module Utils = struct
              String.make 1 (Char.chr x)
            else string_of_int x )
          (List.rev !content))
+
+  
 end
 
 module Frame : sig
@@ -417,19 +468,27 @@ end = struct
   type socket_states =
     | NONE
     | Rep of
-        { if_received: bool
+        { mutable connections: Connection.t ref Queue.t
+        ; if_received: bool
         ; last_received_connection_tag: string
         ; address_envelope: Frame.t list }
-    | Req of {if_sent: bool; last_sent_connection_tag: string}
-    | Dealer
-    | Router
-    | Pub
-    | Sub of {subscriptions: string list}
-    | Xpub
-    | Xsub of {subscriptions: string list}
-    | Push
-    | Pull
-    | Pair of {connected: bool}
+    | Req of
+        { mutable connections: Connection.t ref Queue.t
+        ; if_sent: bool
+        ; last_sent_connection_tag: string }
+    | Dealer of
+        { mutable connections: Connection.t ref Queue.t
+        ; mutable request_tags: string Queue.t }
+    | Router of {mutable connections: Connection.t ref Linked_list.t}
+    | Pub of {mutable connections: Connection.t ref Queue.t}
+    | Sub of {mutable connections: Connection.t ref Queue.t;
+    subscriptions: string list}
+    | Xpub of {mutable connections: Connection.t ref Queue.t}
+    | Xsub of {mutable connections: Connection.t ref Queue.t;subscriptions: string list}
+    | Push of {mutable connections: Connection.t ref Queue.t}
+    | Pull of {mutable connections: Connection.t ref Queue.t}
+    | Pair of {mutable connection: Connection.t option;
+              connected: bool}
 
   type t =
     { socket_type: socket_type
@@ -621,7 +680,8 @@ end = struct
         ; connections= []
         ; socket_states=
             Rep
-              { if_received= false
+              { connections= Queue.create ();
+                if_received= false
               ; last_received_connection_tag= ""
               ; address_envelope= [] }
         ; incoming_queue_size= None
@@ -632,7 +692,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Req {if_sent= false; last_sent_connection_tag= ""}
+        ; socket_states= Req {connections= Queue.create ();if_sent= false; last_sent_connection_tag= ""}
         ; incoming_queue_size= None
         ; outgoing_queue_size= None }
     | DEALER ->
@@ -641,7 +701,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Dealer
+        ; socket_states= Dealer{connections= Queue.create (); request_tags=Queue.create ();}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | ROUTER ->
@@ -650,7 +710,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Router
+        ; socket_states= Router{connections= Linked_list.create ();}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | PUB ->
@@ -659,7 +719,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Pub
+        ; socket_states= Pub{connections= Queue.create ();}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | XPUB ->
@@ -668,7 +728,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Xpub
+        ; socket_states= Xpub{connections= Queue.create ();}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | SUB ->
@@ -677,7 +737,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Sub {subscriptions= []}
+        ; socket_states= Sub {connections= Queue.create ();subscriptions= []}
         ; incoming_queue_size=
             Some (Context.get_default_queue_size context)
             (* Need an outgoing queue to send subscriptions *)
@@ -688,7 +748,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Xsub {subscriptions= []}
+        ; socket_states= Xsub {connections= Queue.create ();subscriptions= []}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | PUSH ->
@@ -697,7 +757,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Push
+        ; socket_states= Push{connections= Queue.create ();}
         ; incoming_queue_size= None
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | PULL ->
@@ -706,7 +766,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Pull
+        ; socket_states= Pull{connections= Queue.create ();}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= None }
     | PAIR ->
@@ -715,7 +775,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= []
-        ; socket_states= Pair {connected= false}
+        ; socket_states= Pair {connection= None;connected= false}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
 
@@ -1436,7 +1496,7 @@ end = struct
   let rec send_blocking t msg =
     try send t msg ; Lwt.return_unit with No_Available_Peers ->
       Lwt.pause () >>= fun () -> send_blocking t msg
-  
+
   let add_connection t connection =
     t.connections <- t.connections @ [connection]
 
@@ -1666,7 +1726,7 @@ end = struct
             | Plain_server hashtable -> (
               match Hashtbl.find_opt hashtable (Bytes.to_string username) with
               | Some valid_password ->
-                  if valid_password = (Bytes.to_string password) then
+                  if valid_password = Bytes.to_string password then
                     ({t with state= WELCOME}, [Write welcome])
                   else
                     ( {t with state= OK}
@@ -2292,8 +2352,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
   let rec process_output buffer flow connection =
     Lwt_stream.peek buffer
     >>= function
-    | None ->
-        Lwt.pause () >>= fun x -> process_output buffer flow connection
+    | None -> Lwt.pause () >>= fun x -> process_output buffer flow connection
     | Some data -> (
       match data with
       | Command_data b -> (
@@ -2314,8 +2373,8 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           | Ok () ->
               Lwt_stream.junk buffer
               >>= fun () ->
-              Lwt.pause ()
-              >>= fun () -> process_output buffer flow connection )
+              Lwt.pause () >>= fun () -> process_output buffer flow connection
+          )
       | Command_close ->
           Logs.debug (fun f ->
               f "Module Connection_tcp: Connection was instructed to close" ) ;
