@@ -1002,39 +1002,20 @@ end = struct
             Queue.is_empty t.connections
           then Lwt.pause () >>= fun () -> recv t
           else
-            let rec check_buffer connections =
-              match connections with
-              (* If no connection in the list, wait for an incoming connection *)
-              | [] -> Lwt.return None
-              | hd :: tl ->
-                  if Connection.get_stage !hd = TRAFFIC then
-                    let buffer = !(Connection.get_buffer !hd) in
-                    Lwt_stream.is_empty buffer
-                    >>= function
-                    | true -> check_buffer tl
-                    | false -> Lwt.return (Some (Connection.get_tag !hd))
-                  else check_buffer tl
-            in
-            check_buffer t.connections
+            find_connection_with_incoming_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some tag -> (
-                (* Find the tagged connection *)
-                let connection =
-                  List.find
-                    (fun x -> Connection.get_tag !x = tag)
-                    t.connections
-                in
+            | Some connection-> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
                 >>= function
                 | None ->
-                    Connection.close !connection ;
-                    t.connections <- rotate t.connections connection true ;
+                    Connection.close connection ;
+                    rotate t.connections true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- rotate t.connections connection false ;
+                    rotate t.connections false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | XSUB -> (
@@ -1309,7 +1290,7 @@ end = struct
               then Connection.send connection frames_to_send
               else ()
             in
-            List.iter
+            Queue.iter
               (fun x ->
                 if Connection.get_stage !x = TRAFFIC then publish !x else () )
               t.connections
