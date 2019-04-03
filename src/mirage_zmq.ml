@@ -589,6 +589,25 @@ end = struct
     | None -> Lwt.return_none
     | Some frames -> Lwt.return_some (List.rev frames)
 
+  (* receive from the first available connection in the queue and rotate the queue once after receving *)
+  let receive_and_rotate connections =
+    if Queue.is_empty connections then Lwt.return None
+    else
+      find_connection_with_incoming_buffer connections
+      >>= function
+      | None -> Lwt.return None
+      | Some connection -> (
+          (* Reconstruct message from the connection *)
+          get_frame_list connection
+          >>= function
+          | None ->
+              Connection.close connection ;
+              rotate connections true ;
+              Lwt.return None
+          | Some frames ->
+              rotate connections false ;
+              Lwt.return (Some (Data (Frame.splice_message_frames frames))) )
+
   (** Get the address envelope from the read buffer, stop when the empty delimiter is encountered and discard the delimiter *)
   let get_address_envelope connection =
     let rec get_reverse_frame_list_accumu list =
@@ -971,97 +990,35 @@ end = struct
     | SUB -> (
       match t.socket_states with
       | Sub {subscriptions= _} -> (
-          if
-            (* Need to receive in a fair-queuing manner *)
-            (* Go through the list of connections and check buffer *)
-            Queue.is_empty t.connections
-          then Lwt.pause () >>= fun () -> recv t
-          else
-            find_connection_with_incoming_buffer t.connections
-            >>= function
-            | None -> Lwt.pause () >>= fun () -> recv t
-            | Some connection -> (
-                (* Reconstruct message from the connection *)
-                get_frame_list connection
-                >>= function
-                | None ->
-                    Connection.close connection ;
-                    rotate t.connections true ;
-                    Lwt.pause () >>= fun () -> recv t
-                | Some frames ->
-                    (* Put the received connection at the end of the queue *)
-                    rotate t.connections false ;
-                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
+          receive_and_rotate t.connections
+          >>= function
+          | None -> Lwt.pause () >>= fun () -> recv t
+          | Some data -> Lwt.return data )
       | _ -> raise Should_Not_Reach )
     | XPUB -> (
       match t.socket_states with
       | Xpub -> (
-          if Queue.is_empty t.connections then
-            Lwt.pause () >>= fun () -> recv t
-          else
-            find_connection_with_incoming_buffer t.connections
-            >>= function
-            | None -> Lwt.pause () >>= fun () -> recv t
-            | Some connection -> (
-                (* Reconstruct message from the connection *)
-                get_frame_list connection
-                >>= function
-                | None ->
-                    Connection.close connection ;
-                    rotate t.connections true ;
-                    Lwt.pause () >>= fun () -> recv t
-                | Some frames ->
-                    (* Put the received connection at the end of the queue *)
-                    rotate t.connections false ;
-                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
+          receive_and_rotate t.connections
+          >>= function
+          | None -> Lwt.pause () >>= fun () -> recv t
+          | Some data -> Lwt.return data )
       | _ -> raise Should_Not_Reach )
     | XSUB -> (
       match t.socket_states with
       | Xsub {subscriptions= _} -> (
-          if Queue.is_empty t.connections then
-            Lwt.pause () >>= fun () -> recv t
-          else
-            find_connection_with_incoming_buffer t.connections
-            >>= function
-            | None -> Lwt.pause () >>= fun () -> recv t
-            | Some connection -> (
-                (* Reconstruct message from the connection *)
-                get_frame_list connection
-                >>= function
-                | None ->
-                    Connection.close connection ;
-                    rotate t.connections true ;
-                    Lwt.pause () >>= fun () -> recv t
-                | Some frames ->
-                    (* Put the received connection at the end of the queue *)
-                    rotate t.connections false ;
-                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
+          receive_and_rotate t.connections
+          >>= function
+          | None -> Lwt.pause () >>= fun () -> recv t
+          | Some data -> Lwt.return data )
       | _ -> raise Should_Not_Reach )
     | PUSH -> raise (Incorrect_use_of_API "Cannot receive from PUSH")
     | PULL -> (
       match t.socket_states with
       | Pull -> (
-          if
-            (* Need to receive in a fair-queuing manner *)
-            (* Go through the list of connections and check buffer *)
-            Queue.is_empty t.connections
-          then Lwt.pause () >>= fun () -> recv t
-          else
-            find_connection_with_incoming_buffer t.connections
-            >>= function
-            | None -> Lwt.pause () >>= fun () -> recv t
-            | Some connection -> (
-                (* Reconstruct message from the connection *)
-                get_frame_list connection
-                >>= function
-                | None ->
-                    Connection.close connection ;
-                    rotate t.connections true ;
-                    Lwt.pause () >>= fun () -> recv t
-                | Some frames ->
-                    (* Put the received connection at the end of the queue *)
-                    rotate t.connections false ;
-                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
+          receive_and_rotate t.connections
+          >>= function
+          | None -> Lwt.pause () >>= fun () -> recv t
+          | Some data -> Lwt.return data )
       | _ -> raise Should_Not_Reach )
     | PAIR -> (
       match t.socket_states with
