@@ -436,7 +436,7 @@ end = struct
     ; mutable metadata: socket_metadata
     ; security_mechanism: mechanism_type
     ; mutable security_info: security_data
-    ; mutable connections: Connection.t ref list
+    ; mutable connections: Connection.t ref Queue.t
     ; mutable socket_states: socket_states
     ; mutable incoming_queue_size: int option
     ; mutable outgoing_queue_size: int option }
@@ -506,16 +506,20 @@ end = struct
     | PUSH -> false
 
   (** Put connection at the end of the list or remove the connection from the list *)
-  let reorder list connection if_remove =
-    let rec reorder_accumu list accumu =
+  let rotate list connection if_remove_head =
+    let rec rotate_accumu list accumu =
       match list with
-      | [] -> if not if_remove then connection :: accumu else accumu
+      | [] -> if not if_remove_head then connection :: accumu else accumu
       | hd :: tl ->
           if Connection.get_tag !hd = Connection.get_tag !connection then
-            reorder_accumu tl accumu
-          else reorder_accumu tl (hd :: accumu)
+            rotate_accumu tl accumu
+          else rotate_accumu tl (hd :: accumu)
     in
-    List.rev (reorder_accumu list [])
+    List.rev (rotate_accumu list [])
+
+  let rotate connections if_drop_head =
+    if if_drop_head then ignore (Queue.pop connections)
+    else Queue.push (Queue.pop connections) connections
 
   (** Get the next list of frames containing a complete message/command from the read buffer *)
   let get_frame_list connection =
@@ -577,11 +581,10 @@ end = struct
       ~if_more:false ~if_command:false
 
   let rec send_message_to_all_active_connections connections frame =
-    match connections with
-    | [] -> ()
-    | hd :: tl ->
-        if Connection.get_stage !hd = TRAFFIC then Connection.send !hd [frame] ;
-        send_message_to_all_active_connections tl frame
+    Queue.iter
+      (fun x ->
+        if Connection.get_stage !x = TRAFFIC then Connection.send !x [frame] )
+      connections
 
   (* End of helper functions *)
 
@@ -618,7 +621,7 @@ end = struct
         ; metadata= [("Socket-Type", "REP")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states=
             Rep
               { if_received= false
@@ -631,7 +634,7 @@ end = struct
         ; metadata= [("Socket-Type", "REQ")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Req {if_sent= false; last_sent_connection_tag= ""}
         ; incoming_queue_size= None
         ; outgoing_queue_size= None }
@@ -640,7 +643,7 @@ end = struct
         ; metadata= [("Socket-Type", "DEALER"); ("Identity", "")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Dealer
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
@@ -649,7 +652,7 @@ end = struct
         ; metadata= [("Socket-Type", "ROUTER")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Router
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
@@ -658,7 +661,7 @@ end = struct
         ; metadata= [("Socket-Type", "PUB")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Pub
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
@@ -667,7 +670,7 @@ end = struct
         ; metadata= [("Socket-Type", "XPUB")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Xpub
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
@@ -676,7 +679,7 @@ end = struct
         ; metadata= [("Socket-Type", "SUB")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Sub {subscriptions= []}
         ; incoming_queue_size=
             Some (Context.get_default_queue_size context)
@@ -687,7 +690,7 @@ end = struct
         ; metadata= [("Socket-Type", "XSUB")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Xsub {subscriptions= []}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
@@ -696,7 +699,7 @@ end = struct
         ; metadata= [("Socket-Type", "PUSH")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Push
         ; incoming_queue_size= None
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
@@ -705,7 +708,7 @@ end = struct
         ; metadata= [("Socket-Type", "PULL")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Pull
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= None }
@@ -714,7 +717,7 @@ end = struct
         ; metadata= [("Socket-Type", "PAIR")]
         ; security_mechanism= mechanism
         ; security_info= Null
-        ; connections= []
+        ; connections= Queue.create ()
         ; socket_states= Pair {connected= false}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
@@ -799,56 +802,48 @@ end = struct
     match t.socket_type with
     | REP -> (
       match t.socket_states with
-      | Rep
-          { if_received
-          ; last_received_connection_tag= tag
-          ; address_envelope= envelope } -> (
-          if
-            (* Need to receive in a fair-queuing manner *)
-            (* Go through the list of connections and check buffer *)
-            t.connections = []
+      | Rep(_) -> (
+          if Queue.is_empty t.connections
           then Lwt.pause () >>= fun () -> recv t
           else
+            (* Go through the queue of connections and check buffer *)
             let rec check_buffer connections =
-              match connections with
-              (* If no connection in the list, wait for an incoming connection *)
-              | [] -> Lwt.return None
-              | hd :: tl ->
-                  if Connection.get_stage !hd = TRAFFIC then
-                    let buffer = !(Connection.get_buffer !hd) in
-                    Lwt_stream.is_empty buffer
-                    >>= function
-                    | true -> check_buffer tl
-                    | false -> Lwt.return (Some (Connection.get_tag !hd))
-                  else check_buffer tl
+              if Queue.is_empty connections then Lwt.return None
+              else
+                let head = !(Queue.peek connections) in
+                if Connection.get_stage head = TRAFFIC then
+                  let buffer = !(Connection.get_buffer head) in
+                  Lwt_stream.is_empty buffer
+                  >>= function
+                  | true ->
+                      Queue.push (Queue.pop connections) connections ;
+                      check_buffer connections
+                  | false -> Lwt.return (Some (Connection.get_tag head))
+                else (
+                  Queue.push (Queue.pop connections) connections ;
+                  Lwt.pause () >>= fun () -> check_buffer connections )
             in
             check_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
             | Some tag -> (
                 (* Find the tagged connection *)
-                let connection =
-                  List.find
-                    (fun x -> Connection.get_tag !x = tag)
-                    t.connections
-                in
+                let connection = Queue.peek t.connections in
                 (* Reconstruct message from the connection *)
                 get_address_envelope connection
                 >>= function
                 | None ->
                     Connection.close !connection ;
-                    t.connections <- reorder t.connections connection true ;
+                    rotate t.connections true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some address_envelope -> (
                     get_frame_list connection
                     >>= function
                     | None ->
                         Connection.close !connection ;
-                        t.connections <- reorder t.connections connection true ;
+                        rotate t.connections true ;
                         Lwt.pause () >>= fun () -> recv t
                     | Some frames ->
-                        (* Put the received connection at the end of the queue *)
-                        t.connections <- reorder t.connections connection false ;
                         t.socket_states
                         <- Rep
                              { if_received= true
@@ -899,7 +894,8 @@ end = struct
     | DEALER -> (
       match t.socket_states with
       | Dealer -> (
-          if t.connections = [] then Lwt.pause () >>= fun () -> recv t
+          if Queue.is_empty t.connections then
+            Lwt.pause () >>= fun () -> recv t
           else
             let rec check_buffer connections =
               match connections with
@@ -929,11 +925,11 @@ end = struct
                 >>= function
                 | None ->
                     Connection.close !connection ;
-                    t.connections <- reorder t.connections connection true ;
+                    t.connections <- rotate t.connections connection true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- reorder t.connections connection false ;
+                    t.connections <- rotate t.connections connection false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | ROUTER -> (
@@ -969,11 +965,11 @@ end = struct
                 >>= function
                 | None ->
                     Connection.close !connection ;
-                    t.connections <- reorder t.connections connection true ;
+                    t.connections <- rotate t.connections connection true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- reorder t.connections connection false ;
+                    t.connections <- rotate t.connections connection false ;
                     Lwt.return
                       (Identity_and_data
                          ( Connection.get_identity !connection
@@ -986,7 +982,7 @@ end = struct
           if
             (* Need to receive in a fair-queuing manner *)
             (* Go through the list of connections and check buffer *)
-            t.connections = []
+            Queue.is_empty t.connections
           then Lwt.pause () >>= fun () -> recv t
           else
             let rec check_buffer connections =
@@ -1017,11 +1013,11 @@ end = struct
                 >>= function
                 | None ->
                     Connection.close !connection ;
-                    t.connections <- reorder t.connections connection true ;
+                    t.connections <- rotate t.connections connection true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- reorder t.connections connection false ;
+                    t.connections <- rotate t.connections connection false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | XPUB -> (
@@ -1030,7 +1026,7 @@ end = struct
           if
             (* Need to receive in a fair-queuing manner *)
             (* Go through the list of connections and check buffer *)
-            t.connections = []
+            Queue.is_empty t.connections
           then Lwt.pause () >>= fun () -> recv t
           else
             let rec check_buffer connections =
@@ -1061,11 +1057,11 @@ end = struct
                 >>= function
                 | None ->
                     Connection.close !connection ;
-                    t.connections <- reorder t.connections connection true ;
+                    t.connections <- rotate t.connections connection true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- reorder t.connections connection false ;
+                    t.connections <- rotate t.connections connection false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | XSUB -> (
@@ -1074,7 +1070,7 @@ end = struct
           if
             (* Need to receive in a fair-queuing manner *)
             (* Go through the list of connections and check buffer *)
-            t.connections = []
+            Queue.is_empty t.connections
           then Lwt.pause () >>= fun () -> recv t
           else
             let rec check_buffer connections =
@@ -1105,11 +1101,11 @@ end = struct
                 >>= function
                 | None ->
                     Connection.close !connection ;
-                    t.connections <- reorder t.connections connection true ;
+                    t.connections <- rotate t.connections connection true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- reorder t.connections connection false ;
+                    t.connections <- rotate t.connections connection false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | PUSH -> raise (Incorrect_use_of_API "Cannot receive from PUSH")
@@ -1119,7 +1115,7 @@ end = struct
           if
             (* Need to receive in a fair-queuing manner *)
             (* Go through the list of connections and check buffer *)
-            t.connections = []
+            Queue.is_empty t.connections
           then Lwt.pause () >>= fun () -> recv t
           else
             let rec check_buffer connections =
@@ -1150,11 +1146,11 @@ end = struct
                 >>= function
                 | None ->
                     Connection.close !connection ;
-                    t.connections <- reorder t.connections connection true ;
+                    t.connections <- rotate t.connections connection true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- reorder t.connections connection false ;
+                    t.connections <- rotate t.connections connection false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | PAIR -> (
@@ -1191,28 +1187,29 @@ end = struct
                   (Incorrect_use_of_API
                      "Need to receive a request before sending a message")
               else
-                let rec find connections =
-                  match connections with
-                  (* Discard the message if peer no longer connected *)
-                  | [] -> ()
-                  | hd :: tl ->
-                      if tag = Connection.get_tag !hd then
-                        if Connection.get_stage !hd = TRAFFIC then (
-                          Connection.send !hd
-                            ( address_envelope
-                            @ Frame.delimiter_frame
-                              :: List.map
-                                   (fun x -> Message.to_frame x)
-                                   (Message.list_of_string msg) ) ;
-                          t.socket_states
-                          <- Rep
-                               { if_received= false
-                               ; last_received_connection_tag= ""
-                               ; address_envelope= [] } )
-                        else ()
-                      else find tl
+                let rec find_and_send connections =
+                  let head = !(Queue.peek connections) in
+                  if tag = Connection.get_tag head then (
+                    if Connection.get_stage head = TRAFFIC then
+                      Connection.send head
+                        ( address_envelope
+                        @ Frame.delimiter_frame
+                          :: List.map
+                               (fun x -> Message.to_frame x)
+                               (Message.list_of_string msg) )
+                    else () ;
+                    t.socket_states
+                    <- Rep
+                         { if_received= false
+                         ; last_received_connection_tag= ""
+                         ; address_envelope= [] };
+                    rotate t.connections false     
+                    )
+                  else
+                    raise
+                      (Internal_Error "Send target no longer at head of queue")
                 in
-                find t.connections
+                find_and_send t.connections
           | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]") )
     (* TODO check sync *)
@@ -1226,7 +1223,8 @@ end = struct
                 raise
                   (Incorrect_use_of_API
                      "Need to receive a reply before sending another message")
-              else if t.connections = [] then raise No_Available_Peers
+              else if Queue.is_empty t.connections then
+                raise No_Available_Peers
               else
                 let rec check_available_connections connections =
                   match connections with
@@ -1245,7 +1243,7 @@ end = struct
                       :: List.map
                            (fun x -> Message.to_frame x)
                            (Message.list_of_string msg) ) ;
-                    t.connections <- reorder t.connections connection false ;
+                    t.connections <- rotate t.connections connection false ;
                     t.socket_states
                     <- Req
                          { if_sent= true
@@ -1260,7 +1258,7 @@ end = struct
           let state = t.socket_states in
           match state with
           | Dealer -> (
-              if t.connections = [] then raise No_Available_Peers
+              if Queue.is_empty t.connections then raise No_Available_Peers
               else
                 let rec check_available_connections connections =
                   match connections with
@@ -1279,7 +1277,7 @@ end = struct
                       :: List.map
                            (fun x -> Message.to_frame x)
                            (Message.list_of_string msg) ) ;
-                    t.connections <- reorder t.connections connection false )
+                    t.connections <- rotate t.connections connection false )
           | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "DEALER sends [Data(string)]") )
     | ROUTER -> (
@@ -1383,7 +1381,7 @@ end = struct
       | Data msg -> (
         match t.socket_states with
         | Push -> (
-            if t.connections = [] then
+            if Queue.is_empty t.connections then
               (* TODO: not accepting further messages when no available_peers *)
               raise No_Available_Peers
             else
@@ -1406,7 +1404,7 @@ end = struct
                     (List.map
                        (fun x -> Message.to_frame x)
                        (Message.list_of_string msg)) ;
-                  t.connections <- reorder t.connections connection false )
+                  t.connections <- rotate t.connections connection false )
         | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!") )
     | PULL -> raise (Incorrect_use_of_API "Cannot send via PULL")
@@ -1436,9 +1434,8 @@ end = struct
   let rec send_blocking t msg =
     try send t msg ; Lwt.return_unit with No_Available_Peers ->
       Lwt.pause () >>= fun () -> send_blocking t msg
-  
-  let add_connection t connection =
-    t.connections <- t.connections @ [connection]
+
+  let add_connection t connection = Queue.push connection t.connections
 
   let initial_traffic_messages t =
     match t.socket_type with
@@ -1666,7 +1663,7 @@ end = struct
             | Plain_server hashtable -> (
               match Hashtbl.find_opt hashtable (Bytes.to_string username) with
               | Some valid_password ->
-                  if valid_password = (Bytes.to_string password) then
+                  if valid_password = Bytes.to_string password then
                     ({t with state= WELCOME}, [Write welcome])
                   else
                     ( {t with state= OK}
@@ -2292,8 +2289,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
   let rec process_output buffer flow connection =
     Lwt_stream.peek buffer
     >>= function
-    | None ->
-        Lwt.pause () >>= fun x -> process_output buffer flow connection
+    | None -> Lwt.pause () >>= fun x -> process_output buffer flow connection
     | Some data -> (
       match data with
       | Command_data b -> (
@@ -2314,8 +2310,8 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           | Ok () ->
               Lwt_stream.junk buffer
               >>= fun () ->
-              Lwt.pause ()
-              >>= fun () -> process_output buffer flow connection )
+              Lwt.pause () >>= fun () -> process_output buffer flow connection
+          )
       | Command_close ->
           Logs.debug (fun f ->
               f "Module Connection_tcp: Connection was instructed to close" ) ;
