@@ -421,7 +421,7 @@ end = struct
         ; last_received_connection_tag: string
         ; address_envelope: Frame.t list }
     | Req of {if_sent: bool; last_sent_connection_tag: string}
-    | Dealer
+    | Dealer of {request_order_queue: string Queue.t}
     | Router
     | Pub
     | Sub of {subscriptions: string list}
@@ -504,6 +504,27 @@ end = struct
     | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PULL | PAIR ->
         true
     | PUSH -> false
+
+  (* If success, the connection at the front of the queue is available and returns it.
+    Otherwise, return None *)
+  let rec find_available_connection connections =
+    if Queue.is_empty connections then None
+    else
+      let buffer_queue = Queue.create () in
+      let rec rotate () =
+        if Queue.is_empty connections then (
+          Queue.transfer buffer_queue connections ;
+          None )
+        else
+          let head = Queue.peek connections in
+          if Connection.get_stage !head = TRAFFIC then (
+            Queue.transfer buffer_queue connections ;
+            Some !head )
+          else (
+            Queue.push (Queue.pop connections) buffer_queue ;
+            rotate () )
+      in
+      rotate ()
 
   (** Put connection at the end of the list or remove the connection from the list *)
   let rotate list connection if_remove_head =
@@ -644,7 +665,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= Queue.create ()
-        ; socket_states= Dealer
+        ; socket_states= Dealer {request_order_queue= Queue.create ()}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | ROUTER ->
@@ -798,6 +819,8 @@ end = struct
         raise
           (Incorrect_use_of_API "This socket does not support unsubscription!")
 
+  type queue_fold_type = UNINITIALISED | Result of Connection.t
+
   let rec recv t =
     match t.socket_type with
     | REP -> (
@@ -826,7 +849,7 @@ end = struct
             check_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some tag -> (
+            | Some _ -> (
                 (* Find the tagged connection *)
                 let connection = !(Queue.peek t.connections) in
                 (* Reconstruct message from the connection *)
@@ -884,43 +907,37 @@ end = struct
       | _ -> raise Should_Not_Reach )
     | DEALER -> (
       match t.socket_states with
-      | Dealer -> (
-          if Queue.is_empty t.connections then
-            Lwt.pause () >>= fun () -> recv t
+      | Dealer {request_order_queue} -> (
+          if Queue.is_empty request_order_queue then
+            raise (Incorrect_use_of_API "You need to send requests first!")
           else
-            let rec check_buffer connections =
-              match connections with
-              (* If no connection in the list, wait for an incoming connection *)
-              | [] -> Lwt.return None
-              | hd :: tl ->
-                  if Connection.get_stage !hd = TRAFFIC then
-                    let buffer = !(Connection.get_buffer !hd) in
-                    Lwt_stream.is_empty buffer
-                    >>= function
-                    | true -> check_buffer tl
-                    | false -> Lwt.return (Some (Connection.get_tag !hd))
-                  else check_buffer tl
+            let tag = Queue.peek request_order_queue in
+            let find_connection connections =
+              Queue.fold
+                (fun accum connection_ref ->
+                  match accum with
+                  | Some _ -> accum
+                  | None ->
+                      let connection = !connection_ref in
+                      if Connection.get_tag connection = tag then
+                        Some connection
+                      else accum )
+                None connections
             in
-            check_buffer t.connections
-            >>= function
+            find_connection t.connections
+            |> function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some tag -> (
-                (* Find the tagged connection *)
-                let connection =
-                  List.find
-                    (fun x -> Connection.get_tag !x = tag)
-                    t.connections
-                in
+            | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
                 >>= function
                 | None ->
-                    Connection.close !connection ;
-                    t.connections <- rotate t.connections connection true ;
-                    Lwt.pause () >>= fun () -> recv t
+                    Connection.close connection ;
+                    ignore (Queue.pop request_order_queue) ;
+                    raise (Internal_Error "Connection closed")
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- rotate t.connections connection false ;
+                    ignore (Queue.pop request_order_queue) ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | ROUTER -> (
@@ -1214,25 +1231,6 @@ end = struct
                   (Incorrect_use_of_API
                      "Need to receive a reply before sending another message")
               else
-                let rec find_available_connection connections =
-                  if Queue.is_empty connections then None
-                  else
-                    let buffer_queue = Queue.create () in
-                    let rec rotate () =
-                      if Queue.is_empty connections then (
-                        Queue.transfer buffer_queue connections ;
-                        None )
-                      else
-                        let head = Queue.peek connections in
-                        if Connection.get_stage !head = TRAFFIC then (
-                          Queue.transfer buffer_queue connections ;
-                          Some !head )
-                        else (
-                          Queue.push (Queue.pop connections) buffer_queue ;
-                          rotate () )
-                    in
-                    rotate ()
-                in
                 find_available_connection t.connections
                 |> function
                 | None -> raise No_Available_Peers
@@ -1256,30 +1254,25 @@ end = struct
     | DEALER -> (
       match msg with
       | Data msg -> (
-          (* TODO check async *)
           let state = t.socket_states in
           match state with
-          | Dealer -> (
+          | Dealer {request_order_queue} -> (
               if Queue.is_empty t.connections then raise No_Available_Peers
               else
-                let rec check_available_connections connections =
-                  match connections with
-                  | [] -> None
-                  | hd :: tl ->
-                      if Connection.get_stage !hd = TRAFFIC then Some hd
-                      else check_available_connections tl
-                in
-                check_available_connections t.connections
+                find_available_connection t.connections
                 |> function
                 | None -> raise No_Available_Peers
                 | Some connection ->
                     (* TODO check re-send is working *)
-                    Connection.send !connection
+                    Connection.send connection
                       ( Frame.delimiter_frame
                       :: List.map
                            (fun x -> Message.to_frame x)
                            (Message.list_of_string msg) ) ;
-                    t.connections <- rotate t.connections connection false )
+                    Queue.push
+                      (Connection.get_tag connection)
+                      request_order_queue ;
+                    rotate t.connections false )
           | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "DEALER sends [Data(string)]") )
     | ROUTER -> (
