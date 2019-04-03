@@ -556,7 +556,7 @@ end = struct
 
   (* Rotate a queue until the front connection has non-empty incoming buffer.
     Will rotate indefinitely until return, unless queue is empty at start*)
-  let rec check_buffer connections =
+  let rec find_connection_with_incoming_buffer connections =
     if Queue.is_empty connections then Lwt.return None
     else
       let head = !(Queue.peek connections) in
@@ -566,11 +566,12 @@ end = struct
         >>= function
         | true ->
             Queue.push (Queue.pop connections) connections ;
-            check_buffer connections
-        | false -> Lwt.return (Some (Connection.get_tag head))
+            find_connection_with_incoming_buffer connections
+        | false -> Lwt.return (Some head)
       else (
         rotate connections false ;
-        Lwt.pause () >>= fun () -> check_buffer connections )
+        Lwt.pause ()
+        >>= fun () -> find_connection_with_incoming_buffer connections )
 
   (** Get the next list of frames containing a complete message/command from the read buffer *)
   let get_frame_list connection =
@@ -860,12 +861,10 @@ end = struct
             Lwt.pause () >>= fun () -> recv t
           else
             (* Go through the queue of connections and check buffer *)
-            check_buffer t.connections
+            find_connection_with_incoming_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some _ -> (
-                (* Find the tagged connection *)
-                let connection = !(Queue.peek t.connections) in
+            | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_address_envelope connection
                 >>= function
@@ -949,11 +948,10 @@ end = struct
           if Queue.is_empty t.connections then
             Lwt.pause () >>= fun () -> recv t
           else
-            check_buffer t.connections
+            find_connection_with_incoming_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some tag -> (
-                let connection = !(Queue.peek t.connections) in
+            | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
                 >>= function
@@ -979,39 +977,20 @@ end = struct
             Queue.is_empty t.connections
           then Lwt.pause () >>= fun () -> recv t
           else
-            let rec check_buffer connections =
-              match connections with
-              (* If no connection in the list, wait for an incoming connection *)
-              | [] -> Lwt.return None
-              | hd :: tl ->
-                  if Connection.get_stage !hd = TRAFFIC then
-                    let buffer = !(Connection.get_buffer !hd) in
-                    Lwt_stream.is_empty buffer
-                    >>= function
-                    | true -> check_buffer tl
-                    | false -> Lwt.return (Some (Connection.get_tag !hd))
-                  else check_buffer tl
-            in
-            check_buffer t.connections
+            find_connection_with_incoming_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some tag -> (
-                (* Find the tagged connection *)
-                let connection =
-                  List.find
-                    (fun x -> Connection.get_tag !x = tag)
-                    t.connections
-                in
+            | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
                 >>= function
                 | None ->
-                    Connection.close !connection ;
-                    t.connections <- rotate t.connections connection true ;
+                    Connection.close connection ;
+                    rotate t.connections true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- rotate t.connections connection false ;
+                    rotate t.connections false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | XPUB -> (
