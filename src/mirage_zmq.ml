@@ -31,6 +31,7 @@ exception Internal_Error of string
 
 exception Incorrect_use_of_API of string
 
+exception Connection_closed
 type socket_type =
   | REQ
   | REP
@@ -969,11 +970,11 @@ end = struct
                 | None ->
                     Connection.close connection ;
                     ignore (Queue.pop request_order_queue) ;
-                    raise (Internal_Error "Connection closed")
+                    raise Connection_closed
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
                     ignore (Queue.pop request_order_queue) ;
-                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
+                    Lwt.return (Data (Frame.splice_message_frames frames))))
       | _ -> raise Should_Not_Reach )
     | ROUTER -> (
       match t.socket_states with
@@ -1075,7 +1076,7 @@ end = struct
                 find_and_send t.connections
           | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]") )
-    (* TODO check sync *)
+    
     | REQ -> (
       match msg with
       | Data msg -> (

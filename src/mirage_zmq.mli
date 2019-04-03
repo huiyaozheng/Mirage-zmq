@@ -17,6 +17,7 @@ exception No_Available_Peers
 
 exception Incorrect_use_of_API of string
 
+exception Connection_closed
 type socket_type =
   | REQ
   | REP
