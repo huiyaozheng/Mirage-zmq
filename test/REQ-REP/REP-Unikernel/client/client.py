@@ -5,7 +5,7 @@ context = zmq.Context()
 #  Socket to talk to server
 print("Connecting to server…")
 socket = context.socket(zmq.REQ)
-socket.connect("tcp://localhost:5556")
+socket.connect("tcp://localhost:5555")
 for i in range(10):
     print("Sending request …" + str(i))
     socket.send(b"Hello")
