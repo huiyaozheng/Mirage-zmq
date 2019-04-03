@@ -996,16 +996,13 @@ end = struct
     | XPUB -> (
       match t.socket_states with
       | Xpub -> (
-          if
-            (* Need to receive in a fair-queuing manner *)
-            (* Go through the list of connections and check buffer *)
-            Queue.is_empty t.connections
-          then Lwt.pause () >>= fun () -> recv t
+          if Queue.is_empty t.connections then
+            Lwt.pause () >>= fun () -> recv t
           else
             find_connection_with_incoming_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some connection-> (
+            | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
                 >>= function
@@ -1021,45 +1018,23 @@ end = struct
     | XSUB -> (
       match t.socket_states with
       | Xsub {subscriptions= _} -> (
-          if
-            (* Need to receive in a fair-queuing manner *)
-            (* Go through the list of connections and check buffer *)
-            Queue.is_empty t.connections
-          then Lwt.pause () >>= fun () -> recv t
+          if Queue.is_empty t.connections then
+            Lwt.pause () >>= fun () -> recv t
           else
-            let rec check_buffer connections =
-              match connections with
-              (* If no connection in the list, wait for an incoming connection *)
-              | [] -> Lwt.return None
-              | hd :: tl ->
-                  if Connection.get_stage !hd = TRAFFIC then
-                    let buffer = !(Connection.get_buffer !hd) in
-                    Lwt_stream.is_empty buffer
-                    >>= function
-                    | true -> check_buffer tl
-                    | false -> Lwt.return (Some (Connection.get_tag !hd))
-                  else check_buffer tl
-            in
-            check_buffer t.connections
+            find_connection_with_incoming_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some tag -> (
-                (* Find the tagged connection *)
-                let connection =
-                  List.find
-                    (fun x -> Connection.get_tag !x = tag)
-                    t.connections
-                in
+            | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
                 >>= function
                 | None ->
-                    Connection.close !connection ;
-                    t.connections <- rotate t.connections connection true ;
+                    Connection.close connection ;
+                    rotate t.connections true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- rotate t.connections connection false ;
+                    rotate t.connections false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | PUSH -> raise (Incorrect_use_of_API "Cannot receive from PUSH")
@@ -1072,58 +1047,38 @@ end = struct
             Queue.is_empty t.connections
           then Lwt.pause () >>= fun () -> recv t
           else
-            let rec check_buffer connections =
-              match connections with
-              (* If no connection in the list, wait for an incoming connection *)
-              | [] -> Lwt.return None
-              | hd :: tl ->
-                  if Connection.get_stage !hd = TRAFFIC then
-                    let buffer = !(Connection.get_buffer !hd) in
-                    Lwt_stream.is_empty buffer
-                    >>= function
-                    | true -> check_buffer tl
-                    | false -> Lwt.return (Some (Connection.get_tag !hd))
-                  else check_buffer tl
-            in
-            check_buffer t.connections
+            find_connection_with_incoming_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
-            | Some tag -> (
-                (* Find the tagged connection *)
-                let connection =
-                  List.find
-                    (fun x -> Connection.get_tag !x = tag)
-                    t.connections
-                in
+            | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
                 >>= function
                 | None ->
-                    Connection.close !connection ;
-                    t.connections <- rotate t.connections connection true ;
+                    Connection.close connection ;
+                    rotate t.connections true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- rotate t.connections connection false ;
+                    rotate t.connections false ;
                     Lwt.return (Data (Frame.splice_message_frames frames)) ) )
       | _ -> raise Should_Not_Reach )
     | PAIR -> (
       match t.socket_states with
-      | Pair {connected} -> (
-        match t.connections with
-        | [hd] ->
-            if connected && Connection.get_stage !hd = TRAFFIC then
-              get_frame_list hd
+      | Pair {connected} ->
+          if Queue.is_empty t.connections then raise No_Available_Peers
+          else
+            let connection = !(Queue.peek t.connections) in
+            if connected && Connection.get_stage connection = TRAFFIC then
+              get_frame_list connection
               >>= function
               | None ->
-                  Connection.close !hd ;
+                  Connection.close connection ;
                   (* TODO check validity *)
                   raise No_Available_Peers
               | Some frames ->
                   Lwt.return (Data (Frame.splice_message_frames frames))
             else raise No_Available_Peers
-        | [] -> raise No_Available_Peers
-        | _ -> raise Should_Not_Reach )
       | _ -> raise Should_Not_Reach )
 
   let send t msg =
@@ -1306,7 +1261,7 @@ end = struct
                 (fun x -> Message.to_frame x)
                 (Message.list_of_string msg)
             in
-            List.iter
+            Queue.iter
               (fun x ->
                 if Connection.get_stage !x = TRAFFIC then
                   Connection.send !x frames_to_send
@@ -1323,26 +1278,16 @@ end = struct
               (* TODO: not accepting further messages when no available_peers *)
               raise No_Available_Peers
             else
-              let rec check_available_connections connections =
-                match connections with
-                | [] -> None
-                | hd :: tl ->
-                    if
-                      Connection.get_stage !hd = TRAFFIC
-                      && not (Connection.if_send_queue_full !hd)
-                    then Some hd
-                    else check_available_connections tl
-              in
-              check_available_connections t.connections
+              find_available_connection t.connections
               |> function
               | None -> raise No_Available_Peers
               | Some connection ->
                   (* TODO check re-send is working *)
-                  Connection.send !connection
+                  Connection.send connection
                     (List.map
                        (fun x -> Message.to_frame x)
                        (Message.list_of_string msg)) ;
-                  t.connections <- rotate t.connections connection false )
+                  rotate t.connections false )
         | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!") )
     | PULL -> raise (Incorrect_use_of_API "Cannot send via PULL")
@@ -1350,22 +1295,21 @@ end = struct
       match msg with
       | Data msg -> (
         match t.socket_states with
-        | Pair {connected} -> (
-          match t.connections with
-          | [hd] ->
+        | Pair {connected} ->
+            if Queue.is_empty t.connections then raise No_Available_Peers
+            else
+              let connection = !(Queue.peek t.connections) in
               if
                 connected
-                && Connection.get_stage !hd = TRAFFIC
-                && not (Connection.if_send_queue_full !hd)
+                && Connection.get_stage connection = TRAFFIC
+                && not (Connection.if_send_queue_full connection)
               then
-                Connection.send !hd
+                Connection.send connection
                   (List.map
                      (fun x -> Message.to_frame x)
                      (Message.list_of_string msg))
                 (* TODO: not accepting further messages*)
               else raise No_Available_Peers
-          | [] -> raise No_Available_Peers
-          | _ -> raise Should_Not_Reach )
         | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!") )
 
