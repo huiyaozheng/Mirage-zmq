@@ -1306,7 +1306,7 @@ end = struct
               then Connection.send connection frames_to_send
               else ()
             in
-            List.iter
+            Queue.iter
               (fun x ->
                 if Connection.get_stage !x = TRAFFIC then publish !x else () )
               t.connections
