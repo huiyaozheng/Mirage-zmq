@@ -524,7 +524,7 @@ end = struct
   (** Get the next list of frames containing a complete message/command from the read buffer *)
   let get_frame_list connection =
     let rec get_reverse_frame_list_accumu list =
-      Lwt_stream.get !(Connection.get_buffer !connection)
+      Lwt_stream.get !(Connection.get_buffer connection)
       >>= function
       | None -> (* Received data not complete *) Lwt.return None
       | Some next_frame ->
@@ -540,7 +540,7 @@ end = struct
   (** Get the address envelope from the read buffer, stop when the empty delimiter is encountered and discard the delimiter *)
   let get_address_envelope connection =
     let rec get_reverse_frame_list_accumu list =
-      Lwt_stream.get !(Connection.get_buffer !connection)
+      Lwt_stream.get !(Connection.get_buffer connection)
       >>= function
       | None -> (* Received data not complete *) Lwt.return None
       | Some next_frame ->
@@ -802,9 +802,9 @@ end = struct
     match t.socket_type with
     | REP -> (
       match t.socket_states with
-      | Rep(_) -> (
-          if Queue.is_empty t.connections
-          then Lwt.pause () >>= fun () -> recv t
+      | Rep _ -> (
+          if Queue.is_empty t.connections then
+            Lwt.pause () >>= fun () -> recv t
           else
             (* Go through the queue of connections and check buffer *)
             let rec check_buffer connections =
@@ -820,7 +820,7 @@ end = struct
                       check_buffer connections
                   | false -> Lwt.return (Some (Connection.get_tag head))
                 else (
-                  Queue.push (Queue.pop connections) connections ;
+                  rotate connections false ;
                   Lwt.pause () >>= fun () -> check_buffer connections )
             in
             check_buffer t.connections
@@ -828,19 +828,19 @@ end = struct
             | None -> Lwt.pause () >>= fun () -> recv t
             | Some tag -> (
                 (* Find the tagged connection *)
-                let connection = Queue.peek t.connections in
+                let connection = !(Queue.peek t.connections) in
                 (* Reconstruct message from the connection *)
                 get_address_envelope connection
                 >>= function
                 | None ->
-                    Connection.close !connection ;
+                    Connection.close connection ;
                     rotate t.connections true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some address_envelope -> (
                     get_frame_list connection
                     >>= function
                     | None ->
-                        Connection.close !connection ;
+                        Connection.close connection ;
                         rotate t.connections true ;
                         Lwt.pause () >>= fun () -> recv t
                     | Some frames ->
@@ -848,7 +848,7 @@ end = struct
                         <- Rep
                              { if_received= true
                              ; last_received_connection_tag=
-                                 Connection.get_tag !connection
+                                 Connection.get_tag connection
                              ; address_envelope } ;
                         Lwt.return (Data (Frame.splice_message_frames frames))
                     ) ) )
@@ -860,35 +860,26 @@ end = struct
             raise
               (Incorrect_use_of_API "Need to send a request before receiving")
           else
-            let result = ref None in
-            let rec find connections =
-              match connections with
-              | [] -> Lwt.return_some !result
-              | hd :: tl ->
-                  if tag = Connection.get_tag !hd then
-                    if Connection.get_stage !hd = TRAFFIC then (
-                      get_frame_list hd
-                      >>= function
-                      | None -> Lwt.return_none
-                      | Some frames ->
-                          t.socket_states
-                          <- Req {if_sent= false; last_sent_connection_tag= ""} ;
-                          result := Some (Frame.splice_message_frames frames) ;
-                          find tl )
-                    else
-                      (* TODO recover from a closed connection? *)
-                      raise (Internal_Error "Connection closed")
-                  else
-                    (* Discard all frames from the connection *)
-                    Lwt_stream.junk_old !(Connection.get_buffer !hd)
-                    >>= fun () -> find tl
+            let rec find_and_send connections =
+              let head = !(Queue.peek connections) in
+              if tag = Connection.get_tag head then
+                if Connection.get_stage head = TRAFFIC then (
+                  get_frame_list head
+                  >>= function
+                  | None -> Lwt.return None
+                  | Some frames ->
+                      t.socket_states
+                      <- Req {if_sent= false; last_sent_connection_tag= ""} ;
+                      Lwt.return (Some (Frame.splice_message_frames frames)) )
+                else raise (Internal_Error "Connection closed")
+              else
+                raise
+                  (Internal_Error "Receive target no longer at head of queue")
             in
-            find t.connections
+            find_and_send t.connections
             >>= function
-            | Some result -> (
-              match result with
-              | Some result -> Lwt.return (Data result)
-              | None -> recv t )
+            | Some result ->
+                rotate t.connections false ; Lwt.return (Data result)
             | None -> recv t )
       | _ -> raise Should_Not_Reach )
     | DEALER -> (
@@ -1202,9 +1193,8 @@ end = struct
                     <- Rep
                          { if_received= false
                          ; last_received_connection_tag= ""
-                         ; address_envelope= [] };
-                    rotate t.connections false     
-                    )
+                         ; address_envelope= [] } ;
+                    rotate t.connections false )
                   else
                     raise
                       (Internal_Error "Send target no longer at head of queue")
@@ -1218,37 +1208,49 @@ end = struct
       | Data msg -> (
           let state = t.socket_states in
           match state with
-          | Req {if_sent; last_sent_connection_tag= tag} -> (
+          | Req {if_sent; last_sent_connection_tag= _} -> (
               if if_sent then
                 raise
                   (Incorrect_use_of_API
                      "Need to receive a reply before sending another message")
-              else if Queue.is_empty t.connections then
-                raise No_Available_Peers
               else
-                let rec check_available_connections connections =
-                  match connections with
-                  | [] -> None
-                  | hd :: tl ->
-                      if Connection.get_stage !hd = TRAFFIC then Some hd
-                      else check_available_connections tl
+                let rec find_available_connection connections =
+                  if Queue.is_empty connections then None
+                  else
+                    let buffer_queue = Queue.create () in
+                    let rec rotate () =
+                      if Queue.is_empty connections then (
+                        Queue.transfer buffer_queue connections ;
+                        None )
+                      else
+                        let head = Queue.peek connections in
+                        if Connection.get_stage !head = TRAFFIC then (
+                          Queue.transfer buffer_queue connections ;
+                          Some !head )
+                        else (
+                          Queue.push (Queue.pop connections) buffer_queue ;
+                          rotate () )
+                    in
+                    rotate ()
                 in
-                check_available_connections t.connections
+                find_available_connection t.connections
                 |> function
                 | None -> raise No_Available_Peers
                 | Some connection ->
                     (* TODO check re-send is working *)
-                    Connection.send !connection
+                    Lwt.async (fun () ->
+                        Lwt_stream.junk_old !(Connection.get_buffer connection)
+                    ) ;
+                    Connection.send connection
                       ( Frame.delimiter_frame
                       :: List.map
                            (fun x -> Message.to_frame x)
                            (Message.list_of_string msg) ) ;
-                    t.connections <- rotate t.connections connection false ;
                     t.socket_states
                     <- Req
                          { if_sent= true
                          ; last_sent_connection_tag=
-                             Connection.get_tag !connection } )
+                             Connection.get_tag connection } )
           | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]") )
     | DEALER -> (
