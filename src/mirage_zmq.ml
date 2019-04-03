@@ -590,12 +590,13 @@ end = struct
     | Some frames -> Lwt.return_some (List.rev frames)
 
   (* receive from the first available connection in the queue and rotate the queue once after receving *)
-  let receive_and_rotate connections =
-    if Queue.is_empty connections then Lwt.return None
+  let rec receive_and_rotate connections =
+    if Queue.is_empty connections then
+      Lwt.pause () >>= fun () -> receive_and_rotate connections
     else
       find_connection_with_incoming_buffer connections
       >>= function
-      | None -> Lwt.return None
+      | None -> Lwt.pause () >>= fun () -> receive_and_rotate connections
       | Some connection -> (
           (* Reconstruct message from the connection *)
           get_frame_list connection
@@ -603,10 +604,10 @@ end = struct
           | None ->
               Connection.close connection ;
               rotate connections true ;
-              Lwt.return None
+              Lwt.pause () >>= fun () -> receive_and_rotate connections
           | Some frames ->
               rotate connections false ;
-              Lwt.return (Some (Data (Frame.splice_message_frames frames))) )
+              Lwt.return (Data (Frame.splice_message_frames frames)) )
 
   (** Get the address envelope from the read buffer, stop when the empty delimiter is encountered and discard the delimiter *)
   let get_address_envelope connection =
@@ -640,6 +641,19 @@ end = struct
       List.fold_left
         (fun flag x -> flag || match_subscription x)
         false subscriptions
+
+  (* Broadcast a message to all connections that satisfy predicate if_send_to in the queue *)
+  let broadcast connections msg if_send_to =
+    let frames_to_send =
+      List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)
+    in
+    let publish connection =
+      if if_send_to connection then Connection.send connection frames_to_send
+      else ()
+    in
+    Queue.iter
+      (fun x -> if Connection.get_stage !x = TRAFFIC then publish !x else ())
+      connections
 
   let subscription_frame content =
     Frame.make_frame
@@ -989,36 +1003,20 @@ end = struct
     | PUB -> raise (Incorrect_use_of_API "Cannot receive from PUB")
     | SUB -> (
       match t.socket_states with
-      | Sub {subscriptions= _} -> (
-          receive_and_rotate t.connections
-          >>= function
-          | None -> Lwt.pause () >>= fun () -> recv t
-          | Some data -> Lwt.return data )
+      | Sub {subscriptions= _} -> receive_and_rotate t.connections
       | _ -> raise Should_Not_Reach )
     | XPUB -> (
       match t.socket_states with
-      | Xpub -> (
-          receive_and_rotate t.connections
-          >>= function
-          | None -> Lwt.pause () >>= fun () -> recv t
-          | Some data -> Lwt.return data )
+      | Xpub -> receive_and_rotate t.connections
       | _ -> raise Should_Not_Reach )
     | XSUB -> (
       match t.socket_states with
-      | Xsub {subscriptions= _} -> (
-          receive_and_rotate t.connections
-          >>= function
-          | None -> Lwt.pause () >>= fun () -> recv t
-          | Some data -> Lwt.return data )
+      | Xsub {subscriptions= _} -> receive_and_rotate t.connections
       | _ -> raise Should_Not_Reach )
     | PUSH -> raise (Incorrect_use_of_API "Cannot receive from PUSH")
     | PULL -> (
       match t.socket_states with
-      | Pull -> (
-          receive_and_rotate t.connections
-          >>= function
-          | None -> Lwt.pause () >>= fun () -> recv t
-          | Some data -> Lwt.return data )
+      | Pull -> receive_and_rotate t.connections
       | _ -> raise Should_Not_Reach )
     | PAIR -> (
       match t.socket_states with
@@ -1166,22 +1164,9 @@ end = struct
       | Data msg -> (
         match t.socket_states with
         | Pub ->
-            let frames_to_send =
-              List.map
-                (fun x -> Message.to_frame x)
-                (Message.list_of_string msg)
-            in
-            let publish connection =
-              if
+            broadcast t.connections msg (fun connection ->
                 match_subscriptions msg
-                  (Connection.get_subscriptions connection)
-              then Connection.send connection frames_to_send
-              else ()
-            in
-            Queue.iter
-              (fun x ->
-                if Connection.get_stage !x = TRAFFIC then publish !x else () )
-              t.connections
+                  (Connection.get_subscriptions connection) )
         | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "PUB accepts a message only!") )
     | SUB -> raise (Incorrect_use_of_API "Cannot send via SUB")
@@ -1190,40 +1175,16 @@ end = struct
       | Data msg -> (
         match t.socket_states with
         | Xpub ->
-            let frames_to_send =
-              List.map
-                (fun x -> Message.to_frame x)
-                (Message.list_of_string msg)
-            in
-            let publish connection =
-              if
+            broadcast t.connections msg (fun connection ->
                 match_subscriptions msg
-                  (Connection.get_subscriptions connection)
-              then Connection.send connection frames_to_send
-              else ()
-            in
-            Queue.iter
-              (fun x ->
-                if Connection.get_stage !x = TRAFFIC then publish !x else () )
-              t.connections
+                  (Connection.get_subscriptions connection) )
         | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "XPUB accepts a message only!") )
     | XSUB -> (
       match msg with
       | Data msg -> (
         match t.socket_states with
-        | Xsub {subscriptions= _} ->
-            let frames_to_send =
-              List.map
-                (fun x -> Message.to_frame x)
-                (Message.list_of_string msg)
-            in
-            Queue.iter
-              (fun x ->
-                if Connection.get_stage !x = TRAFFIC then
-                  Connection.send !x frames_to_send
-                else () )
-              t.connections
+        | Xsub {subscriptions= _} -> broadcast t.connections msg (fun _ -> true)
         | _ -> raise Should_Not_Reach )
       | _ -> raise (Incorrect_use_of_API "XSUB accepts a message only!") )
     | PUSH -> (
