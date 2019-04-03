@@ -542,6 +542,36 @@ end = struct
     if if_drop_head then ignore (Queue.pop connections)
     else Queue.push (Queue.pop connections) connections
 
+  (* connections is a queue of Connection.t ref. 
+    This functions returns the Connection.t with the compare function if found *)
+  let find_connection connections comp =
+    Queue.fold
+      (fun accum connection_ref ->
+        match accum with
+        | Some _ -> accum
+        | None ->
+            let connection = !connection_ref in
+            if comp connection then Some connection else accum )
+      None connections
+
+  (* Rotate a queue until the front connection has non-empty incoming buffer.
+    Will rotate indefinitely until return, unless queue is empty at start*)
+  let rec check_buffer connections =
+    if Queue.is_empty connections then Lwt.return None
+    else
+      let head = !(Queue.peek connections) in
+      if Connection.get_stage head = TRAFFIC then
+        let buffer = !(Connection.get_buffer head) in
+        Lwt_stream.is_empty buffer
+        >>= function
+        | true ->
+            Queue.push (Queue.pop connections) connections ;
+            check_buffer connections
+        | false -> Lwt.return (Some (Connection.get_tag head))
+      else (
+        rotate connections false ;
+        Lwt.pause () >>= fun () -> check_buffer connections )
+
   (** Get the next list of frames containing a complete message/command from the read buffer *)
   let get_frame_list connection =
     let rec get_reverse_frame_list_accumu list =
@@ -830,22 +860,6 @@ end = struct
             Lwt.pause () >>= fun () -> recv t
           else
             (* Go through the queue of connections and check buffer *)
-            let rec check_buffer connections =
-              if Queue.is_empty connections then Lwt.return None
-              else
-                let head = !(Queue.peek connections) in
-                if Connection.get_stage head = TRAFFIC then
-                  let buffer = !(Connection.get_buffer head) in
-                  Lwt_stream.is_empty buffer
-                  >>= function
-                  | true ->
-                      Queue.push (Queue.pop connections) connections ;
-                      check_buffer connections
-                  | false -> Lwt.return (Some (Connection.get_tag head))
-                else (
-                  rotate connections false ;
-                  Lwt.pause () >>= fun () -> check_buffer connections )
-            in
             check_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
@@ -912,19 +926,8 @@ end = struct
             raise (Incorrect_use_of_API "You need to send requests first!")
           else
             let tag = Queue.peek request_order_queue in
-            let find_connection connections =
-              Queue.fold
-                (fun accum connection_ref ->
-                  match accum with
-                  | Some _ -> accum
-                  | None ->
-                      let connection = !connection_ref in
-                      if Connection.get_tag connection = tag then
-                        Some connection
-                      else accum )
-                None connections
-            in
-            find_connection t.connections
+            find_connection t.connections (fun connection ->
+                Connection.get_tag connection = tag )
             |> function
             | None -> Lwt.pause () >>= fun () -> recv t
             | Some connection -> (
@@ -943,44 +946,27 @@ end = struct
     | ROUTER -> (
       match t.socket_states with
       | Router -> (
-          if t.connections = [] then Lwt.pause () >>= fun () -> recv t
+          if Queue.is_empty t.connections then
+            Lwt.pause () >>= fun () -> recv t
           else
-            let rec check_buffer connections =
-              match connections with
-              (* If no connection in the list, wait for an incoming connection *)
-              | [] -> Lwt.return None
-              | hd :: tl ->
-                  if Connection.get_stage !hd = TRAFFIC then
-                    let buffer = !(Connection.get_buffer !hd) in
-                    Lwt_stream.is_empty buffer
-                    >>= function
-                    | true -> check_buffer tl
-                    | false -> Lwt.return (Some (Connection.get_tag !hd))
-                  else check_buffer tl
-            in
             check_buffer t.connections
             >>= function
             | None -> Lwt.pause () >>= fun () -> recv t
             | Some tag -> (
-                (* Find the tagged connection *)
-                let connection =
-                  List.find
-                    (fun x -> Connection.get_tag !x = tag)
-                    t.connections
-                in
+                let connection = !(Queue.peek t.connections) in
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
                 >>= function
                 | None ->
-                    Connection.close !connection ;
-                    t.connections <- rotate t.connections connection true ;
+                    Connection.close connection ;
+                    rotate t.connections true ;
                     Lwt.pause () >>= fun () -> recv t
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
-                    t.connections <- rotate t.connections connection false ;
+                    rotate t.connections false ;
                     Lwt.return
                       (Identity_and_data
-                         ( Connection.get_identity !connection
+                         ( Connection.get_identity connection
                          , Frame.splice_message_frames frames )) ) )
       | _ -> raise Should_Not_Reach )
     | PUB -> raise (Incorrect_use_of_API "Cannot receive from PUB")
@@ -1279,27 +1265,24 @@ end = struct
       match msg with
       | Identity_and_data (id, msg) -> (
         match t.socket_states with
-        | Router ->
-            let rec find_connection connections =
-              match connections with
-              | hd :: tl ->
-                  if Connection.get_identity !hd = id then
-                    let frame_list =
-                      if Connection.get_incoming_socket_type !hd == REQ then
-                        Frame.delimiter_frame
-                        :: List.map
-                             (fun x -> Message.to_frame x)
-                             (Message.list_of_string msg)
-                      else
-                        List.map
-                          (fun x -> Message.to_frame x)
-                          (Message.list_of_string msg)
-                    in
-                    Connection.send !hd frame_list
-                  else find_connection tl
-              | [] -> ()
-            in
-            find_connection t.connections
+        | Router -> (
+            find_connection t.connections (fun connection ->
+                Connection.get_identity connection = id )
+            |> function
+            | None -> ()
+            | Some connection ->
+                let frame_list =
+                  if Connection.get_incoming_socket_type connection == REQ then
+                    Frame.delimiter_frame
+                    :: List.map
+                         (fun x -> Message.to_frame x)
+                         (Message.list_of_string msg)
+                  else
+                    List.map
+                      (fun x -> Message.to_frame x)
+                      (Message.list_of_string msg)
+                in
+                Connection.send connection frame_list )
         | _ -> raise Should_Not_Reach )
       | _ ->
           raise
