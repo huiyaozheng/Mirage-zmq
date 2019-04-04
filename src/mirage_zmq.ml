@@ -32,6 +32,7 @@ exception Internal_Error of string
 exception Incorrect_use_of_API of string
 
 exception Connection_closed
+
 type socket_type =
   | REQ
   | REP
@@ -211,7 +212,8 @@ end = struct
   let splice_message_frames list =
     let rec splice_message_frames_accumu list s =
       match list with
-      | [] -> s
+      | [] ->
+          s
       | hd :: tl -> (
         match tl with
         | [] ->
@@ -446,65 +448,82 @@ end = struct
 
   (** Returns the socket type from string *)
   let socket_type_from_string = function
-    | "REQ" -> REQ
-    | "REP" -> REP
-    | "DEALER" -> DEALER
-    | "ROUTER" -> ROUTER
-    | "PUB" -> PUB
-    | "XPUB" -> XPUB
-    | "SUB" -> SUB
-    | "XSUB" -> XSUB
-    | "PUSH" -> PUSH
-    | "PULL" -> PULL
-    | "PAIR" -> PAIR
-    | _ -> raise Socket_Name_Not_Recognised
+    | "REQ" ->
+        REQ
+    | "REP" ->
+        REP
+    | "DEALER" ->
+        DEALER
+    | "ROUTER" ->
+        ROUTER
+    | "PUB" ->
+        PUB
+    | "XPUB" ->
+        XPUB
+    | "SUB" ->
+        SUB
+    | "XSUB" ->
+        XSUB
+    | "PUSH" ->
+        PUSH
+    | "PULL" ->
+        PULL
+    | "PAIR" ->
+        PAIR
+    | _ ->
+        raise Socket_Name_Not_Recognised
 
   (** Checks if the pair is valid as specified by 23/ZMTP *)
   let if_valid_socket_pair a b =
     match (a, b) with
     | REQ, REP
-     |REQ, ROUTER
-     |REP, REQ
-     |REP, DEALER
-     |DEALER, REP
-     |DEALER, DEALER
-     |DEALER, ROUTER
-     |ROUTER, REQ
-     |ROUTER, DEALER
-     |ROUTER, ROUTER
-     |PUB, SUB
-     |PUB, XSUB
-     |XPUB, SUB
-     |XPUB, XSUB
-     |SUB, PUB
-     |SUB, XPUB
-     |XSUB, PUB
-     |XSUB, XPUB
-     |PUSH, PULL
-     |PULL, PUSH
-     |PAIR, PAIR ->
+    | REQ, ROUTER
+    | REP, REQ
+    | REP, DEALER
+    | DEALER, REP
+    | DEALER, DEALER
+    | DEALER, ROUTER
+    | ROUTER, REQ
+    | ROUTER, DEALER
+    | ROUTER, ROUTER
+    | PUB, SUB
+    | PUB, XSUB
+    | XPUB, SUB
+    | XPUB, XSUB
+    | SUB, PUB
+    | SUB, XPUB
+    | XSUB, PUB
+    | XSUB, XPUB
+    | PUSH, PULL
+    | PULL, PUSH
+    | PAIR, PAIR ->
         true
-    | _ -> false
+    | _ ->
+        false
 
   (** Whether the socket type has connections with limited-size queues *)
   let if_queue_size_limited socket =
     match socket with
-    | REP | REQ -> false
-    | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL | PAIR -> true
+    | REP | REQ ->
+        false
+    | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PULL | PAIR ->
+        true
 
   (** Whether the socket type has an outgoing queue *)
   let if_has_outgoing_queue socket =
     match socket with
     | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PUSH | PAIR ->
         true
-    | PULL -> false
+    | PULL ->
+        false
 
   (** Whether the socket type has an incoming queue *)
   let if_has_incoming_queue socket =
     match socket with
     | REP | REQ | DEALER | ROUTER | PUB | SUB | XPUB | XSUB | PULL | PAIR ->
         true
-    | PUSH -> false
+    | PUSH ->
+        false
 
   (* If success, the connection at the front of the queue is available and returns it.
     Otherwise, return None *)
@@ -518,12 +537,15 @@ end = struct
           None )
         else
           let head = Queue.peek connections in
-          if Connection.get_stage !head = TRAFFIC then (
-            Queue.transfer buffer_queue connections ;
-            Some !head )
-          else (
+          if
+            Connection.get_stage !head <> TRAFFIC
+            or Connection.if_send_queue_full !head
+          then (
             Queue.push (Queue.pop connections) buffer_queue ;
             rotate () )
+          else (
+            Queue.transfer buffer_queue connections ;
+            Some !head )
       in
       rotate ()
 
@@ -531,7 +553,8 @@ end = struct
   let rotate list connection if_remove_head =
     let rec rotate_accumu list accumu =
       match list with
-      | [] -> if not if_remove_head then connection :: accumu else accumu
+      | [] ->
+          if not if_remove_head then connection :: accumu else accumu
       | hd :: tl ->
           if Connection.get_tag !hd = Connection.get_tag !connection then
             rotate_accumu tl accumu
@@ -549,7 +572,8 @@ end = struct
     Queue.fold
       (fun accum connection_ref ->
         match accum with
-        | Some _ -> accum
+        | Some _ ->
+            accum
         | None ->
             let connection = !connection_ref in
             if comp connection then Some connection else accum )
@@ -568,7 +592,8 @@ end = struct
         | true ->
             Queue.push (Queue.pop connections) connections ;
             find_connection_with_incoming_buffer connections
-        | false -> Lwt.return (Some head)
+        | false ->
+            Lwt.return (Some head)
       else (
         rotate connections false ;
         Lwt.pause ()
@@ -579,7 +604,8 @@ end = struct
     let rec get_reverse_frame_list_accumu list =
       Lwt_stream.get !(Connection.get_buffer connection)
       >>= function
-      | None -> (* Received data not complete *) Lwt.return None
+      | None ->
+          (* Received data not complete *) Lwt.return None
       | Some next_frame ->
           if Frame.get_if_more next_frame then
             get_reverse_frame_list_accumu (next_frame :: list)
@@ -587,8 +613,10 @@ end = struct
     in
     get_reverse_frame_list_accumu []
     >>= function
-    | None -> Lwt.return_none
-    | Some frames -> Lwt.return_some (List.rev frames)
+    | None ->
+        Lwt.return_none
+    | Some frames ->
+        Lwt.return_some (List.rev frames)
 
   (* receive from the first available connection in the queue and rotate the queue once after receving *)
   let rec receive_and_rotate connections =
@@ -597,7 +625,8 @@ end = struct
     else
       find_connection_with_incoming_buffer connections
       >>= function
-      | None -> Lwt.pause () >>= fun () -> receive_and_rotate connections
+      | None ->
+          Lwt.pause () >>= fun () -> receive_and_rotate connections
       | Some connection -> (
           (* Reconstruct message from the connection *)
           get_frame_list connection
@@ -615,7 +644,8 @@ end = struct
     let rec get_reverse_frame_list_accumu list =
       Lwt_stream.get !(Connection.get_buffer connection)
       >>= function
-      | None -> (* Received data not complete *) Lwt.return None
+      | None ->
+          (* Received data not complete *) Lwt.return None
       | Some next_frame ->
           if Frame.is_delimiter_frame next_frame then Lwt.return (Some list)
           else if Frame.get_if_more next_frame then
@@ -624,8 +654,10 @@ end = struct
     in
     get_reverse_frame_list_accumu []
     >>= function
-    | None -> Lwt.return_none
-    | Some frames -> Lwt.return_some (List.rev frames)
+    | None ->
+        Lwt.return_none
+    | Some frames ->
+        Lwt.return_some (List.rev frames)
 
   (** Check whether the content matches with any entry in the subscriptions *)
   let match_subscriptions content subscriptions =
@@ -684,17 +716,22 @@ end = struct
 
   let get_incoming_queue_size t =
     match t.incoming_queue_size with
-    | Some x -> x
-    | None -> raise (Internal_Error "Incoming queue size is not defined")
+    | Some x ->
+        x
+    | None ->
+        raise (Internal_Error "Incoming queue size is not defined")
 
   let get_outgoing_queue_size t =
     match t.outgoing_queue_size with
-    | Some x -> x
-    | None -> raise (Internal_Error "Outgoing queue size is not defined")
+    | Some x ->
+        x
+    | None ->
+        raise (Internal_Error "Outgoing queue size is not defined")
 
   let get_pair_connected t =
     match t.socket_states with
-    | Pair {connected} -> connected
+    | Pair {connected} ->
+        connected
     | _ ->
         raise
           (Incorrect_use_of_API
@@ -839,7 +876,8 @@ end = struct
 
   let set_pair_connected t status =
     match t.socket_type with
-    | PAIR -> t.socket_states <- Pair {connected= status}
+    | PAIR ->
+        t.socket_states <- Pair {connected= status}
     | _ ->
         raise
           (Incorrect_use_of_API "This state can only be set for PAIR socket!")
@@ -856,7 +894,8 @@ end = struct
           t.socket_states <- Xsub {subscriptions= subscription :: subscriptions} ;
           send_message_to_all_active_connections t.connections
             (subscription_frame subscription)
-      | _ -> raise Should_Not_Reach )
+      | _ ->
+          raise Should_Not_Reach )
     | _ ->
         raise
           (Incorrect_use_of_API "This socket does not support subscription!")
@@ -864,8 +903,10 @@ end = struct
   let unsubscribe t subscription =
     let rec check_and_remove subscriptions =
       match subscriptions with
-      | [] -> []
-      | hd :: tl -> if hd = subscription then tl else hd :: check_and_remove tl
+      | [] ->
+          []
+      | hd :: tl ->
+          if hd = subscription then tl else hd :: check_and_remove tl
     in
     match t.socket_type with
     | SUB | XSUB -> (
@@ -879,7 +920,8 @@ end = struct
           <- Xsub {subscriptions= check_and_remove subscriptions} ;
           send_message_to_all_active_connections t.connections
             (unsubscription_frame subscription)
-      | _ -> raise Should_Not_Reach )
+      | _ ->
+          raise Should_Not_Reach )
     | _ ->
         raise
           (Incorrect_use_of_API "This socket does not support unsubscription!")
@@ -897,7 +939,8 @@ end = struct
             (* Go through the queue of connections and check buffer *)
             find_connection_with_incoming_buffer t.connections
             >>= function
-            | None -> Lwt.pause () >>= fun () -> recv t
+            | None ->
+                Lwt.pause () >>= fun () -> recv t
             | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_address_envelope connection
@@ -922,7 +965,8 @@ end = struct
                              ; address_envelope } ;
                         Lwt.return (Data (Frame.splice_message_frames frames))
                     ) ) )
-      | _ -> raise Should_Not_Reach )
+      | _ ->
+          raise Should_Not_Reach )
     | REQ -> (
       match t.socket_states with
       | Req {if_sent; last_sent_connection_tag= tag} -> (
@@ -936,7 +980,8 @@ end = struct
                 if Connection.get_stage head = TRAFFIC then (
                   get_frame_list head
                   >>= function
-                  | None -> Lwt.return None
+                  | None ->
+                      Lwt.return None
                   | Some frames ->
                       t.socket_states
                       <- Req {if_sent= false; last_sent_connection_tag= ""} ;
@@ -950,8 +995,10 @@ end = struct
             >>= function
             | Some result ->
                 rotate t.connections false ; Lwt.return (Data result)
-            | None -> recv t )
-      | _ -> raise Should_Not_Reach )
+            | None ->
+                recv t )
+      | _ ->
+          raise Should_Not_Reach )
     | DEALER -> (
       match t.socket_states with
       | Dealer {request_order_queue} -> (
@@ -962,7 +1009,8 @@ end = struct
             find_connection t.connections (fun connection ->
                 Connection.get_tag connection = tag )
             |> function
-            | None -> Lwt.pause () >>= fun () -> recv t
+            | None ->
+                Lwt.pause () >>= fun () -> recv t
             | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
@@ -974,8 +1022,9 @@ end = struct
                 | Some frames ->
                     (* Put the received connection at the end of the queue *)
                     ignore (Queue.pop request_order_queue) ;
-                    Lwt.return (Data (Frame.splice_message_frames frames))))
-      | _ -> raise Should_Not_Reach )
+                    Lwt.return (Data (Frame.splice_message_frames frames)) ) )
+      | _ ->
+          raise Should_Not_Reach )
     | ROUTER -> (
       match t.socket_states with
       | Router -> (
@@ -984,7 +1033,8 @@ end = struct
           else
             find_connection_with_incoming_buffer t.connections
             >>= function
-            | None -> Lwt.pause () >>= fun () -> recv t
+            | None ->
+                Lwt.pause () >>= fun () -> recv t
             | Some connection -> (
                 (* Reconstruct message from the connection *)
                 get_frame_list connection
@@ -1000,25 +1050,36 @@ end = struct
                       (Identity_and_data
                          ( Connection.get_identity connection
                          , Frame.splice_message_frames frames )) ) )
-      | _ -> raise Should_Not_Reach )
-    | PUB -> raise (Incorrect_use_of_API "Cannot receive from PUB")
+      | _ ->
+          raise Should_Not_Reach )
+    | PUB ->
+        raise (Incorrect_use_of_API "Cannot receive from PUB")
     | SUB -> (
       match t.socket_states with
-      | Sub {subscriptions= _} -> receive_and_rotate t.connections
-      | _ -> raise Should_Not_Reach )
+      | Sub {subscriptions= _} ->
+          receive_and_rotate t.connections
+      | _ ->
+          raise Should_Not_Reach )
     | XPUB -> (
       match t.socket_states with
-      | Xpub -> receive_and_rotate t.connections
-      | _ -> raise Should_Not_Reach )
+      | Xpub ->
+          receive_and_rotate t.connections
+      | _ ->
+          raise Should_Not_Reach )
     | XSUB -> (
       match t.socket_states with
-      | Xsub {subscriptions= _} -> receive_and_rotate t.connections
-      | _ -> raise Should_Not_Reach )
-    | PUSH -> raise (Incorrect_use_of_API "Cannot receive from PUSH")
+      | Xsub {subscriptions= _} ->
+          receive_and_rotate t.connections
+      | _ ->
+          raise Should_Not_Reach )
+    | PUSH ->
+        raise (Incorrect_use_of_API "Cannot receive from PUSH")
     | PULL -> (
       match t.socket_states with
-      | Pull -> receive_and_rotate t.connections
-      | _ -> raise Should_Not_Reach )
+      | Pull ->
+          receive_and_rotate t.connections
+      | _ ->
+          raise Should_Not_Reach )
     | PAIR -> (
       match t.socket_states with
       | Pair {connected} ->
@@ -1035,7 +1096,8 @@ end = struct
               | Some frames ->
                   Lwt.return (Data (Frame.splice_message_frames frames))
             else raise No_Available_Peers
-      | _ -> raise Should_Not_Reach )
+      | _ ->
+          raise Should_Not_Reach )
 
   let send t msg =
     match t.socket_type with
@@ -1074,9 +1136,10 @@ end = struct
                       (Internal_Error "Send target no longer at head of queue")
                 in
                 find_and_send t.connections
-          | _ -> raise Should_Not_Reach )
-      | _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]") )
-    
+          | _ ->
+              raise Should_Not_Reach )
+      | _ ->
+          raise (Incorrect_use_of_API "REP sends [Data(string)]") )
     | REQ -> (
       match msg with
       | Data msg -> (
@@ -1090,7 +1153,8 @@ end = struct
               else
                 find_available_connection t.connections
                 |> function
-                | None -> raise No_Available_Peers
+                | None ->
+                    raise No_Available_Peers
                 | Some connection ->
                     (* TODO check re-send is working *)
                     Lwt.async (fun () ->
@@ -1106,8 +1170,10 @@ end = struct
                          { if_sent= true
                          ; last_sent_connection_tag=
                              Connection.get_tag connection } )
-          | _ -> raise Should_Not_Reach )
-      | _ -> raise (Incorrect_use_of_API "REP sends [Data(string)]") )
+          | _ ->
+              raise Should_Not_Reach )
+      | _ ->
+          raise (Incorrect_use_of_API "REP sends [Data(string)]") )
     | DEALER -> (
       match msg with
       | Data msg -> (
@@ -1118,7 +1184,8 @@ end = struct
               else
                 find_available_connection t.connections
                 |> function
-                | None -> raise No_Available_Peers
+                | None ->
+                    raise No_Available_Peers
                 | Some connection ->
                     (* TODO check re-send is working *)
                     Connection.send connection
@@ -1130,8 +1197,10 @@ end = struct
                       (Connection.get_tag connection)
                       request_order_queue ;
                     rotate t.connections false )
-          | _ -> raise Should_Not_Reach )
-      | _ -> raise (Incorrect_use_of_API "DEALER sends [Data(string)]") )
+          | _ ->
+              raise Should_Not_Reach )
+      | _ ->
+          raise (Incorrect_use_of_API "DEALER sends [Data(string)]") )
     | ROUTER -> (
       match msg with
       | Identity_and_data (id, msg) -> (
@@ -1140,7 +1209,8 @@ end = struct
             find_connection t.connections (fun connection ->
                 Connection.get_identity connection = id )
             |> function
-            | None -> ()
+            | None ->
+                ()
             | Some connection ->
                 let frame_list =
                   if Connection.get_incoming_socket_type connection == REQ then
@@ -1154,7 +1224,8 @@ end = struct
                       (Message.list_of_string msg)
                 in
                 Connection.send connection frame_list )
-        | _ -> raise Should_Not_Reach )
+        | _ ->
+            raise Should_Not_Reach )
       | _ ->
           raise
             (Incorrect_use_of_API
@@ -1168,9 +1239,12 @@ end = struct
             broadcast t.connections msg (fun connection ->
                 match_subscriptions msg
                   (Connection.get_subscriptions connection) )
-        | _ -> raise Should_Not_Reach )
-      | _ -> raise (Incorrect_use_of_API "PUB accepts a message only!") )
-    | SUB -> raise (Incorrect_use_of_API "Cannot send via SUB")
+        | _ ->
+            raise Should_Not_Reach )
+      | _ ->
+          raise (Incorrect_use_of_API "PUB accepts a message only!") )
+    | SUB ->
+        raise (Incorrect_use_of_API "Cannot send via SUB")
     | XPUB -> (
       match msg with
       | Data msg -> (
@@ -1179,15 +1253,20 @@ end = struct
             broadcast t.connections msg (fun connection ->
                 match_subscriptions msg
                   (Connection.get_subscriptions connection) )
-        | _ -> raise Should_Not_Reach )
-      | _ -> raise (Incorrect_use_of_API "XPUB accepts a message only!") )
+        | _ ->
+            raise Should_Not_Reach )
+      | _ ->
+          raise (Incorrect_use_of_API "XPUB accepts a message only!") )
     | XSUB -> (
       match msg with
       | Data msg -> (
         match t.socket_states with
-        | Xsub {subscriptions= _} -> broadcast t.connections msg (fun _ -> true)
-        | _ -> raise Should_Not_Reach )
-      | _ -> raise (Incorrect_use_of_API "XSUB accepts a message only!") )
+        | Xsub {subscriptions= _} ->
+            broadcast t.connections msg (fun _ -> true)
+        | _ ->
+            raise Should_Not_Reach )
+      | _ ->
+          raise (Incorrect_use_of_API "XSUB accepts a message only!") )
     | PUSH -> (
       match msg with
       | Data msg -> (
@@ -1199,7 +1278,8 @@ end = struct
             else
               find_available_connection t.connections
               |> function
-              | None -> raise No_Available_Peers
+              | None ->
+                  raise No_Available_Peers
               | Some connection ->
                   (* TODO check re-send is working *)
                   Connection.send connection
@@ -1207,9 +1287,12 @@ end = struct
                        (fun x -> Message.to_frame x)
                        (Message.list_of_string msg)) ;
                   rotate t.connections false )
-        | _ -> raise Should_Not_Reach )
-      | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!") )
-    | PULL -> raise (Incorrect_use_of_API "Cannot send via PULL")
+        | _ ->
+            raise Should_Not_Reach )
+      | _ ->
+          raise (Incorrect_use_of_API "PUSH accepts a message only!") )
+    | PULL ->
+        raise (Incorrect_use_of_API "Cannot send via PULL")
     | PAIR -> (
       match msg with
       | Data msg -> (
@@ -1229,12 +1312,14 @@ end = struct
                      (Message.list_of_string msg))
                 (* TODO: not accepting further messages*)
               else raise No_Available_Peers
-        | _ -> raise Should_Not_Reach )
-      | _ -> raise (Incorrect_use_of_API "PUSH accepts a message only!") )
+        | _ ->
+            raise Should_Not_Reach )
+      | _ ->
+          raise (Incorrect_use_of_API "PUSH accepts a message only!") )
 
   let rec send_blocking t msg =
-    try send t msg ; Lwt.return_unit with No_Available_Peers ->
-      Lwt.pause () >>= fun () -> send_blocking t msg
+    try send t msg ; Lwt.return_unit
+    with No_Available_Peers -> Lwt.pause () >>= fun () -> send_blocking t msg
 
   let add_connection t connection = Queue.push connection t.connections
 
@@ -1246,15 +1331,18 @@ end = struct
           if subscriptions <> [] then
             List.map (fun x -> subscription_frame x) subscriptions
           else []
-      | _ -> raise Should_Not_Reach )
+      | _ ->
+          raise Should_Not_Reach )
     | XSUB -> (
       match t.socket_states with
       | Xsub {subscriptions} ->
           if subscriptions <> [] then
             List.map (fun x -> subscription_frame x) subscriptions
           else []
-      | _ -> raise Should_Not_Reach )
-    | _ -> []
+      | _ ->
+          raise Should_Not_Reach )
+    | _ ->
+        []
 end
 
 and Security_mechanism : sig
@@ -1368,8 +1456,10 @@ end = struct
            (Bytes.of_string property))
     in
     let rec convert_metadata = function
-      | [] -> Bytes.empty
-      | hd :: tl -> Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
+      | [] ->
+          Bytes.empty
+      | hd :: tl ->
+          Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
     in
     Frame.to_bytes
       (Command.to_frame
@@ -1387,8 +1477,10 @@ end = struct
            (Bytes.of_string property))
     in
     let rec convert_metadata = function
-      | [] -> Bytes.empty
-      | hd :: tl -> Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
+      | [] ->
+          Bytes.empty
+      | hd :: tl ->
+          Bytes.cat (bytes_of_metadata hd) (convert_metadata tl)
     in
     Frame.to_bytes
       (Command.to_frame
@@ -1425,12 +1517,15 @@ end = struct
 
   let client_first_message t =
     match t.mechanism_type with
-    | NULL -> Bytes.empty
+    | NULL ->
+        Bytes.empty
     | PLAIN ->
         if t.as_client then
           match t.data with
-          | Plain_client (u, p) -> hello u p
-          | _ -> raise (Internal_Error "Security mechanism mismatch")
+          | Plain_client (u, p) ->
+              hello u p
+          | _ ->
+              raise (Internal_Error "Security mechanism mismatch")
         else Bytes.empty
 
   let fsm t command =
@@ -1453,14 +1548,16 @@ end = struct
         | _ ->
             ( {t with state= OK}
             , [Write (error "unknown command received"); Close] ) )
-      | _ -> raise Should_Not_Reach )
+      | _ ->
+          raise Should_Not_Reach )
     | PLAIN -> (
       match t.state with
       | START_SERVER ->
           if name = "HELLO" then
             let username, password = extract_username_password data in
             match t.data with
-            | Plain_client _ -> raise (Internal_Error "Server data expected")
+            | Plain_client _ ->
+                raise (Internal_Error "Server data expected")
             | Plain_server hashtable -> (
               match Hashtbl.find_opt hashtable (Bytes.to_string username) with
               | Some valid_password ->
@@ -1472,7 +1569,8 @@ end = struct
               | None ->
                   ({t with state= OK}, [Write (error "Handshake error"); Close])
               )
-            | _ -> raise (Internal_Error "Security type mismatch")
+            | _ ->
+                raise (Internal_Error "Security type mismatch")
           else ({t with state= OK}, [Write (error "Handshake error"); Close])
       | START_CLIENT ->
           if name = "WELCOME" then
@@ -1495,7 +1593,8 @@ end = struct
                 (extract_metadata data)
               @ [Ok] )
           else ({t with state= OK}, [Write (error "Handshake error"); Close])
-      | _ -> raise Should_Not_Reach )
+      | _ ->
+          raise Should_Not_Reach )
 
   let get_as_server t = t.as_server
 
@@ -1637,19 +1736,24 @@ end = struct
         if Bytes.get b 0 = Char.chr 0 then
           ({t with state= AS_SERVER}, Set_server false)
         else ({t with state= AS_SERVER}, Set_server true)
-    | AS_SERVER, Recv_filler -> ({t with state= SUCCESS}, Ok)
-    | _ -> ({t with state= ERROR}, Error "Unexpected event.")
+    | AS_SERVER, Recv_filler ->
+        ({t with state= SUCCESS}, Ok)
+    | _ ->
+        ({t with state= ERROR}, Error "Unexpected event.")
 
   let fsm t event_list =
     let rec fsm_accumulator t event_list action_list =
       match event_list with
       | [] -> (
         match t.state with
-        | ERROR -> ({t with state= ERROR}, [List.hd action_list])
-        | _ -> (t, List.rev action_list) )
+        | ERROR ->
+            ({t with state= ERROR}, [List.hd action_list])
+        | _ ->
+            (t, List.rev action_list) )
       | hd :: tl -> (
         match t.state with
-        | ERROR -> ({t with state= ERROR}, [List.hd action_list])
+        | ERROR ->
+            ({t with state= ERROR}, [List.hd action_list])
         | _ ->
             let new_state, action = fsm_single t hd in
             fsm_accumulator new_state tl (action :: action_list) )
@@ -1764,23 +1868,29 @@ end = struct
     | GREETING -> (
         let if_pair =
           match Socket.get_socket_type !(t.socket) with
-          | PAIR -> true
-          | _ -> false
+          | PAIR ->
+              true
+          | _ ->
+              false
         in
         let if_pair_already_connected =
           match Socket.get_socket_type !(t.socket) with
-          | PAIR -> Socket.get_pair_connected !(t.socket)
-          | _ -> false
+          | PAIR ->
+              Socket.get_pair_connected !(t.socket)
+          | _ ->
+              false
         in
         Logs.debug (fun f -> f "Module Connection: Greeting -> FSM\n") ;
         if if_pair then Socket.set_pair_connected !(t.socket) true ;
         let len = Bytes.length bytes in
         let rec convert greeting_action_list =
           match greeting_action_list with
-          | [] -> []
+          | [] ->
+              []
           | hd :: tl -> (
             match hd with
-            | Greeting.Send_bytes b -> Write b :: convert tl
+            | Greeting.Send_bytes b ->
+                Write b :: convert tl
             | Greeting.Set_server b ->
                 t.incoming_as_server <- b ;
                 if
@@ -1797,7 +1907,8 @@ end = struct
                 if s <> Security_mechanism.get_name_string t.handshake_state
                 then [Close "Security Policy mismatch"]
                 else convert tl
-            | Greeting.Continue -> convert tl
+            | Greeting.Continue ->
+                convert tl
             | Greeting.Ok ->
                 Logs.debug (fun f -> f "Module Connection: Greeting OK\n") ;
                 t.stage <- HANDSHAKE ;
@@ -1806,7 +1917,8 @@ end = struct
                     (Security_mechanism.client_first_message t.handshake_state)
                   :: convert tl
                 else convert tl
-            | Greeting.Error s -> [Close ("Greeting FSM error: " ^ s)] )
+            | Greeting.Error s ->
+                [Close ("Greeting FSM error: " ^ s)] )
         in
         match len with
         (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54 *)
@@ -1898,18 +2010,22 @@ end = struct
         in
         let rec convert handshake_action_list =
           match handshake_action_list with
-          | [] -> []
+          | [] ->
+              []
           | hd :: tl -> (
             match hd with
-            | Security_mechanism.Write b -> Write b :: convert tl
-            | Security_mechanism.Continue -> Continue :: convert tl
+            | Security_mechanism.Write b ->
+                Write b :: convert tl
+            | Security_mechanism.Continue ->
+                Continue :: convert tl
             | Security_mechanism.Ok ->
                 Logs.debug (fun f -> f "Module Connection: Handshake OK\n") ;
                 t.stage <- TRAFFIC ;
                 let frames = Socket.initial_traffic_messages !(t.socket) in
                 List.map (fun x -> Write (Frame.to_bytes x)) frames
                 @ convert tl
-            | Security_mechanism.Close -> [Close "Handshake FSM error"]
+            | Security_mechanism.Close ->
+                [Close "Handshake FSM error"]
             | Security_mechanism.Received_property (name, value) -> (
               match name with
               | "Socket-Type" ->
@@ -1959,7 +2075,8 @@ end = struct
                   let sub = String.sub body 1 (String.length body - 1) in
                   let rec check_and_remove subscriptions =
                     match subscriptions with
-                    | [] -> []
+                    | [] ->
+                        []
                     | hd :: tl ->
                         if hd = sub then tl else hd :: check_and_remove tl
                   in
@@ -1969,7 +2086,8 @@ end = struct
                   t.subscriptions
                   <- String.sub body 1 (String.length body - 1)
                      :: t.subscriptions
-              | _ -> () )
+              | _ ->
+                  () )
             frames
         in
         let enqueue () =
@@ -1980,10 +2098,14 @@ end = struct
           List.iter (fun x -> !(t.read_buffer_pf) (Some x)) frames
         in
         match Socket.get_socket_type !(t.socket) with
-        | PUB -> manage_subscription () ; [Continue]
-        | XPUB -> manage_subscription () ; enqueue () ; [Continue]
-        | _ -> enqueue () ; [Continue] )
-    | CLOSED -> [Close "Connection FSM error"]
+        | PUB ->
+            manage_subscription () ; [Continue]
+        | XPUB ->
+            manage_subscription () ; enqueue () ; [Continue]
+        | _ ->
+            enqueue () ; [Continue] )
+    | CLOSED ->
+        [Close "Connection FSM error"]
 
   let close t =
     let if_pair =
@@ -2004,7 +2126,8 @@ end = struct
       (* Sending queue of limited size *)
       Lwt.async (fun () ->
           match t.send_buffer_pf_bounded with
-          | None -> raise (Internal_Error "")
+          | None ->
+              raise (Internal_Error "")
           | Some ref_f ->
               let rec f x =
                 try !ref_f#push (Command_data (Frame.to_bytes x))
@@ -2017,8 +2140,10 @@ end = struct
     then false
     else
       match t.send_buffer_pf_bounded with
-      | None -> raise (Internal_Error "")
-      | Some ref_f -> !ref_f#size = !ref_f#count
+      | None ->
+          raise (Internal_Error "")
+      | Some ref_f ->
+          !ref_f#size = !ref_f#count
 
   let set_send_buffer t buffer = t.send_buffer <- buffer
 
@@ -2055,7 +2180,8 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
         let action_list = Connection.fsm connection (Cstruct.to_bytes b) in
         let rec act actions =
           match actions with
-          | [] -> Lwt.pause () >>= fun () -> process_input flow connection
+          | [] ->
+              Lwt.pause () >>= fun () -> process_input flow connection
           | hd :: tl -> (
             match hd with
             | Connection.Write b -> (
@@ -2072,7 +2198,8 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                           "Module Connection_tcp: Error writing data to \
                            established connection." ) ;
                     Lwt.return_unit
-                | Ok () -> act tl )
+                | Ok () ->
+                    act tl )
             | Connection.Continue ->
                 Logs.debug (fun f ->
                     f "Module Connection_tcp: Connection FSM Continue\n" ) ;
@@ -2090,7 +2217,8 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
   let rec process_output buffer flow connection =
     Lwt_stream.peek buffer
     >>= function
-    | None -> Lwt.pause () >>= fun x -> process_output buffer flow connection
+    | None ->
+        Lwt.pause () >>= fun x -> process_output buffer flow connection
     | Some data -> (
       match data with
       | Command_data b -> (
