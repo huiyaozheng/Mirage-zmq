@@ -102,11 +102,8 @@ module Frame : sig
   val to_bytes : t -> Bytes.t
   (** Convert a frame to raw bytes *)
 
-  val of_bytes : Bytes.t -> t
-  (** Construct a frame from raw bytes of a complete frame *)
-
-  val list_of_bytes : Bytes.t -> t list
-  (** Construct a list of frames from raw bytes; used when potentially many frames in received buffer *)
+  val list_of_bytes : Bytes.t -> t list * Bytes.t
+  (** Construct a list of frames from raw bytes and returns any remaining fragment *)
 
   val get_if_more : t -> bool
   (** Get if_more flag from a frame *)
@@ -153,49 +150,57 @@ end = struct
       ; size_to_bytes t.size (Char.code t.flags land 2 = 2)
       ; t.body ]
 
-  let of_bytes bytes =
-    let flag = Char.code (Bytes.get bytes 0) in
+  let rec list_of_bytes bytes =
     let total_length = Bytes.length bytes in
-    let if_long = flag land 2 = 2 in
-    if if_long then
-      (* long-size *)
-      (* TODO test long *)
-      let content_length = Utils.network_order_to_int (Bytes.sub bytes 1 8) in
-      if total_length < content_length + 9 then
-        raise (Internal_Error "Not a complete frame buffer")
-      else if total_length > content_length + 9 then
-        raise (Internal_Error "More than one frame in the buffer")
-      else
-        { flags= Char.chr flag
-        ; size= content_length
-        ; body= Bytes.sub bytes 9 content_length }
+    if total_length < 2 then ([], bytes)
     else
-      (* short-size *)
-      let content_length = Char.code (Bytes.get bytes 1) in
-      (* check length *)
-      if total_length < content_length + 2 then
-        raise (Internal_Error "Not a complete frame buffer")
-      else if total_length > content_length + 2 then
-        raise (Internal_Error "More than one frame in the buffer")
+      let flag = Char.code (Bytes.get bytes 0) in
+      let if_long = flag land 2 = 2 in
+      if if_long then
+        if (* long-size *)
+           total_length < 9 then ([], bytes)
+        else
+          let content_length =
+            Utils.network_order_to_int (Bytes.sub bytes 1 8)
+          in
+          if total_length < content_length + 9 then ([], bytes)
+          else if total_length > content_length + 9 then
+            let list, remain =
+              list_of_bytes
+                (Bytes.sub bytes (content_length + 9)
+                   (total_length - content_length - 9))
+            in
+            ( { flags= Char.chr flag
+              ; size= content_length
+              ; body= Bytes.sub bytes 9 content_length }
+              :: list
+            , remain )
+          else
+            ( [ { flags= Char.chr flag
+                ; size= content_length
+                ; body= Bytes.sub bytes 9 content_length } ]
+            , Bytes.empty )
       else
-        { flags= Char.chr flag
-        ; size= content_length
-        ; body= Bytes.sub bytes 2 content_length }
-
-  let list_of_bytes bytes =
-    let rec list_of_bytes_accumu bytes list =
-      let total_length = Bytes.length bytes in
-      let content_length = Char.code (Bytes.get bytes 1) in
-      if total_length < content_length + 2 then
-        raise (Internal_Error "Not a complete frame buffer")
-      else if total_length > content_length + 2 then
-        list_of_bytes_accumu
-          (Bytes.sub bytes (content_length + 2)
-             (total_length - content_length - 2))
-          (of_bytes (Bytes.sub bytes 0 (content_length + 2)) :: list)
-      else of_bytes (Bytes.sub bytes 0 (content_length + 2)) :: list
-    in
-    List.rev (list_of_bytes_accumu bytes [])
+        (* short-size *)
+        let content_length = Char.code (Bytes.get bytes 1) in
+        (* check length *)
+        if total_length < content_length + 2 then ([], bytes)
+        else if total_length > content_length + 2 then
+          let list, remain =
+            list_of_bytes
+              (Bytes.sub bytes (content_length + 2)
+                 (total_length - content_length - 2))
+          in
+          ( { flags= Char.chr flag
+            ; size= content_length
+            ; body= Bytes.sub bytes 2 content_length }
+            :: list
+          , remain )
+        else
+          ( [ { flags= Char.chr flag
+              ; size= content_length
+              ; body= Bytes.sub bytes 2 content_length } ]
+          , Bytes.empty )
 
   let get_if_more t = Char.code t.flags land 1 = 1
 
@@ -316,7 +321,6 @@ end = struct
   let to_frame t = Frame.make_frame t.body ~if_more:t.if_more ~if_command:false
 end
 
-(* TODO add preset queue size to context? *)
 module Context : sig
   type t
 
@@ -1826,7 +1830,8 @@ end = struct
     ; mutable send_buffer_pf: connection_buffer_object option -> unit
     ; mutable send_buffer_pf_bounded:
         connection_buffer_object Lwt_stream.bounded_push ref option
-    ; mutable subscriptions: string list }
+    ; mutable subscriptions: string list
+    ; mutable previous_fragment: Bytes.t }
 
   let init socket security_mechanism tag =
     let read_stream, read_pf = Lwt_stream.create () in
@@ -1847,7 +1852,8 @@ end = struct
     ; send_buffer= Lwt_stream.of_list []
     ; send_buffer_pf= (fun x -> ())
     ; send_buffer_pf_bounded= None
-    ; subscriptions= [] }
+    ; subscriptions= []
+    ; previous_fragment= Bytes.empty }
 
   let get_tag t = t.tag
 
@@ -2002,58 +2008,70 @@ end = struct
                 fsm t (Bytes.sub bytes expected_length (n - expected_length))
               in
               action_list_1 @ action_list_2 )
-    | HANDSHAKE ->
+    | HANDSHAKE -> (
         Logs.debug (fun f -> f "Module Connection: Handshake -> FSM\n") ;
-        let command = Command.of_frame (Frame.of_bytes bytes) in
-        let new_state, actions =
-          Security_mechanism.fsm t.handshake_state command
+        let frames, fragment =
+          Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
         in
-        let rec convert handshake_action_list =
-          match handshake_action_list with
-          | [] ->
-              []
-          | hd :: tl -> (
-            match hd with
-            | Security_mechanism.Write b ->
-                Write b :: convert tl
-            | Security_mechanism.Continue ->
-                Continue :: convert tl
-            | Security_mechanism.Ok ->
-                Logs.debug (fun f -> f "Module Connection: Handshake OK\n") ;
-                t.stage <- TRAFFIC ;
-                let frames = Socket.initial_traffic_messages !(t.socket) in
-                List.map (fun x -> Write (Frame.to_bytes x)) frames
-                @ convert tl
-            | Security_mechanism.Close ->
-                [Close "Handshake FSM error"]
-            | Security_mechanism.Received_property (name, value) -> (
-              match name with
-              | "Socket-Type" ->
-                  if
-                    Socket.if_valid_socket_pair
-                      (Socket.get_socket_type !(t.socket))
-                      (Socket.socket_type_from_string value)
-                  then (
-                    t.incoming_socket_type
-                    <- Socket.socket_type_from_string value ;
-                    convert tl )
-                  else [Close "Socket type mismatch"]
-              | "Identity" ->
-                  t.incoming_identity <- value ;
-                  convert tl
-              | _ ->
-                  Logs.debug (fun f ->
-                      f "Module Connection: Ignore unknown property %s\n" name
-                  ) ;
-                  convert tl ) )
-        in
-        let actions = convert actions in
-        t.handshake_state <- new_state ;
-        actions
+        match frames with
+        | [] ->
+            t.previous_fragment <- fragment ;
+            [Continue]
+        | frame :: _ ->
+            (* assume only one command is received at a time *)
+            t.previous_fragment <- fragment ;
+            let command = Command.of_frame frame in
+            let new_state, actions =
+              Security_mechanism.fsm t.handshake_state command
+            in
+            let rec convert handshake_action_list =
+              match handshake_action_list with
+              | [] ->
+                  []
+              | hd :: tl -> (
+                match hd with
+                | Security_mechanism.Write b ->
+                    Write b :: convert tl
+                | Security_mechanism.Continue ->
+                    Continue :: convert tl
+                | Security_mechanism.Ok ->
+                    Logs.debug (fun f -> f "Module Connection: Handshake OK\n") ;
+                    t.stage <- TRAFFIC ;
+                    let frames = Socket.initial_traffic_messages !(t.socket) in
+                    List.map (fun x -> Write (Frame.to_bytes x)) frames
+                    @ convert tl
+                | Security_mechanism.Close ->
+                    [Close "Handshake FSM error"]
+                | Security_mechanism.Received_property (name, value) -> (
+                  match name with
+                  | "Socket-Type" ->
+                      if
+                        Socket.if_valid_socket_pair
+                          (Socket.get_socket_type !(t.socket))
+                          (Socket.socket_type_from_string value)
+                      then (
+                        t.incoming_socket_type
+                        <- Socket.socket_type_from_string value ;
+                        convert tl )
+                      else [Close "Socket type mismatch"]
+                  | "Identity" ->
+                      t.incoming_identity <- value ;
+                      convert tl
+                  | _ ->
+                      Logs.debug (fun f ->
+                          f "Module Connection: Ignore unknown property %s\n"
+                            name ) ;
+                      convert tl ) )
+            in
+            let actions = convert actions in
+            t.handshake_state <- new_state ;
+            actions )
     | TRAFFIC -> (
-        (* TODO investigate what happens when overflow of frames *)
         Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ;
-        let frames = Frame.list_of_bytes bytes in
+        let frames, fragment =
+          Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
+        in
+        t.previous_fragment <- fragment ;
         let manage_subscription () =
           let match_subscription_signature frame =
             if
