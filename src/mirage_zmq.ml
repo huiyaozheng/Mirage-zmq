@@ -58,7 +58,7 @@ type security_data =
   | Plain_client of string * string
   | Plain_server of (string, string) Hashtbl.t
 
-type connection_stage = GREETING | HANDSHAKE | TRAFFIC | CLOSED
+type connection_stage =  GREETING | HANDSHAKE | TRAFFIC | CLOSED
 
 type connection_buffer_object = Command_data of Bytes.t | Command_close
 
@@ -1618,7 +1618,6 @@ and Greeting : sig
     | Init of string
 
   type action =
-    | Send_bytes of bytes
     | Check_mechanism of string
     | Set_server of bool
     | Continue
@@ -1633,6 +1632,8 @@ and Greeting : sig
 
   val fsm : t -> event list -> t * action list
   (** FSM call for handling a list of events. *)
+
+  val new_greeting : Security_mechanism.t -> Bytes.t
 end = struct
   type state =
     | START
@@ -1656,7 +1657,6 @@ end = struct
     | Init of string
 
   type action =
-    | Send_bytes of bytes
     | Check_mechanism of string
     | Set_server of bool
     | Continue
@@ -1723,7 +1723,7 @@ end = struct
     match (t.state, event) with
     | START, Recv_sig b ->
         if Bytes.get b 0 = Char.chr 255 && Bytes.get b 9 = Char.chr 127 then
-          ({t with state= SIGNATURE}, Send_bytes (new_greeting t.security))
+          ({t with state= SIGNATURE}, Continue)
         else ({t with state= ERROR}, Error "Protocol Signature not detected.")
     | SIGNATURE, Recv_Vmajor b ->
         if Bytes.get b 0 = Char.chr 3 then
@@ -1789,6 +1789,8 @@ and Connection : sig
   val get_subscriptions : t -> string list
 
   val get_incoming_socket_type : t -> socket_type
+
+  val greeting_message : t -> Bytes.t
 
   val fsm : t -> Bytes.t -> action list
   (** FSM for handing raw bytes transmission *)
@@ -1869,6 +1871,8 @@ end = struct
 
   let get_incoming_socket_type t = t.incoming_socket_type
 
+  let greeting_message t = Greeting.new_greeting t.handshake_state
+
   let rec fsm t bytes =
     match t.stage with
     | GREETING -> (
@@ -1895,8 +1899,6 @@ end = struct
               []
           | hd :: tl -> (
             match hd with
-            | Greeting.Send_bytes b ->
-                Write b :: convert tl
             | Greeting.Set_server b ->
                 t.incoming_as_server <- b ;
                 if
@@ -2168,6 +2170,7 @@ end = struct
   let set_send_pf t pf = t.send_buffer_pf <- pf
 
   let set_send_pf_bounded t pf = t.send_buffer_pf_bounded <- Some (ref pf)
+
 end
 
 module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
@@ -2266,6 +2269,17 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
 
   (* End of helper functions *)
 
+  let start_connection flow connection =
+    S.TCPV4.write flow (Cstruct.of_bytes (Connection.greeting_message connection))
+                >>= function
+                | Error _ ->
+                    Logs.warn (fun f ->
+                        f
+                          "Module Connection_tcp: Error writing data to \
+                           established connection." ) ;
+                    Lwt.return_unit
+                | Ok () -> process_input flow connection
+
   let listen s port socket =
     S.listen_tcpv4 s ~port (fun flow ->
         let dst, dst_port = S.TCPV4.dst flow in
@@ -2291,11 +2305,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             Connection.set_send_pf_bounded connection pf ;
             Socket.add_connection !socket (ref connection) ;
             Lwt.join
-              [ process_input flow connection
+              [ start_connection flow connection
               ; process_output stream flow connection ] )
           else (
             Socket.add_connection !socket (ref connection) ;
-            process_input flow connection )
+            start_connection flow connection )
         else if
           Socket.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
@@ -2304,11 +2318,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           Connection.set_send_pf connection pf ;
           Socket.add_connection !socket (ref connection) ;
           Lwt.join
-            [ process_input flow connection
+            [ start_connection flow connection
             ; process_output stream flow connection ] )
         else (
           Socket.add_connection !socket (ref connection) ;
-          process_input flow connection ) ) ;
+          start_connection flow connection ) ) ;
     S.listen s
 
   let rec connect s addr port connection =
@@ -2332,9 +2346,9 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             Connection.set_send_pf_bounded connection pf ;
             Lwt.async (fun () ->
                 Lwt.join
-                  [ process_input flow connection
+                  [ start_connection flow connection
                   ; process_output stream flow connection ] ) )
-          else Lwt.async (fun () -> process_input flow connection)
+          else Lwt.async (fun () -> start_connection flow connection)
         else if
           Socket.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
@@ -2343,9 +2357,9 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           Connection.set_send_pf connection pf ;
           Lwt.async (fun () ->
               Lwt.join
-                [ process_input flow connection
+                [ start_connection flow connection
                 ; process_output stream flow connection ] ) )
-        else Lwt.async (fun () -> process_input flow connection) ;
+        else Lwt.async (fun () -> start_connection flow connection) ;
         let rec wait_until_traffic () =
           if Connection.get_stage connection <> TRAFFIC then
             Lwt.pause () >>= fun () -> wait_until_traffic ()
