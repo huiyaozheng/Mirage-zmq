@@ -1368,11 +1368,15 @@ and Security_mechanism : sig
   val get_as_client : t -> bool
   (** Whether the socket is a PLAIN client (always false if mechanism is NULL) *)
 
+  val if_send_command_after_greeting : t -> bool
+
   val init : security_data -> socket_metadata -> t
   (** Initialise a t from security mechanism data and socket metadata *)
 
   val client_first_message : t -> bytes
   (** If the socket is a PLAIN mechanism client, it needs to send the HELLO command first *)
+
+  val first_command : t -> bytes
 
   val fsm : t -> Command.t -> t * action list
   (** FSM for handling the handshake *)
@@ -1545,7 +1549,7 @@ end = struct
             , List.map
                 (fun (name, property) -> Received_property (name, property))
                 (extract_metadata data)
-              @ [Write (new_handshake_null t.socket_metadata); Ok] )
+              @ [Ok] )
         | "ERROR" ->
             ( {t with state= OK}
             , [Write (error "ERROR command received"); Close] )
@@ -1603,6 +1607,15 @@ end = struct
   let get_as_server t = t.as_server
 
   let get_as_client t = t.as_client
+
+  let if_send_command_after_greeting t = t.as_client || t.mechanism_type = NULL
+
+  let first_command t = 
+    if t.mechanism_type = NULL then
+      new_handshake_null t.socket_metadata
+    else if t.mechanism_type = PLAIN then
+      client_first_message t
+    else raise (Internal_Error "This socket should not send the command first.")
 end
 
 and Greeting : sig
@@ -1920,9 +1933,9 @@ end = struct
             | Greeting.Ok ->
                 Logs.debug (fun f -> f "Module Connection: Greeting OK\n") ;
                 t.stage <- HANDSHAKE ;
-                if Security_mechanism.get_as_client t.handshake_state then
+                if Security_mechanism.if_send_command_after_greeting t.handshake_state then
                   Write
-                    (Security_mechanism.client_first_message t.handshake_state)
+                    (Security_mechanism.first_command t.handshake_state)
                   :: convert tl
                 else convert tl
             | Greeting.Error s ->
