@@ -673,7 +673,7 @@ end = struct
         String.sub content 0 subscription_length = subscription
       else false
     in
-    if subscriptions = [] then true
+    if subscriptions = [] then false
     else
       List.fold_left
         (fun flag x -> flag || match_subscription x)
