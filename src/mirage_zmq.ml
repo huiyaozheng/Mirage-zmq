@@ -58,7 +58,7 @@ type security_data =
   | Plain_client of string * string
   | Plain_server of (string, string) Hashtbl.t
 
-type connection_stage =  GREETING | HANDSHAKE | TRAFFIC | CLOSED
+type connection_stage = GREETING | HANDSHAKE | TRAFFIC | CLOSED
 
 type connection_buffer_object = Command_data of Bytes.t | Command_close
 
@@ -1610,12 +1610,11 @@ end = struct
 
   let if_send_command_after_greeting t = t.as_client || t.mechanism_type = NULL
 
-  let first_command t = 
-    if t.mechanism_type = NULL then
-      new_handshake_null t.socket_metadata
-    else if t.mechanism_type = PLAIN then
-      client_first_message t
-    else raise (Internal_Error "This socket should not send the command first.")
+  let first_command t =
+    if t.mechanism_type = NULL then new_handshake_null t.socket_metadata
+    else if t.mechanism_type = PLAIN then client_first_message t
+    else
+      raise (Internal_Error "This socket should not send the command first.")
 end
 
 and Greeting : sig
@@ -1829,6 +1828,8 @@ and Connection : sig
 end = struct
   type action = Write of bytes | Continue | Close of string
 
+  type subscription_message = Subscribe | Unsubscribe | Ignore
+
   type t =
     { tag: string
     ; socket: Socket.t ref
@@ -1933,9 +1934,11 @@ end = struct
             | Greeting.Ok ->
                 Logs.debug (fun f -> f "Module Connection: Greeting OK\n") ;
                 t.stage <- HANDSHAKE ;
-                if Security_mechanism.if_send_command_after_greeting t.handshake_state then
-                  Write
-                    (Security_mechanism.first_command t.handshake_state)
+                if
+                  Security_mechanism.if_send_command_after_greeting
+                    t.handshake_state
+                then
+                  Write (Security_mechanism.first_command t.handshake_state)
                   :: convert tl
                 else convert tl
             | Greeting.Error s ->
@@ -2095,15 +2098,15 @@ end = struct
               && not (Frame.get_if_long frame)
             then
               let first_char = (Bytes.to_string (Frame.get_body frame)).[0] in
-              if first_char = Char.chr 1 then 1
-              else if first_char = Char.chr 0 then 0
-              else -1
-            else -1
+              if first_char = Char.chr 1 then Subscribe
+              else if first_char = Char.chr 0 then Unsubscribe
+              else Ignore
+            else Ignore
           in
           List.iter
             (fun x ->
               match match_subscription_signature x with
-              | 0 ->
+              | Unsubscribe ->
                   let body = Bytes.to_string (Frame.get_body x) in
                   let sub = String.sub body 1 (String.length body - 1) in
                   let rec check_and_remove subscriptions =
@@ -2114,12 +2117,12 @@ end = struct
                         if hd = sub then tl else hd :: check_and_remove tl
                   in
                   t.subscriptions <- check_and_remove t.subscriptions
-              | 1 ->
+              | Subscribe ->
                   let body = Bytes.to_string (Frame.get_body x) in
                   t.subscriptions
                   <- String.sub body 1 (String.length body - 1)
                      :: t.subscriptions
-              | _ ->
+              | Ignore ->
                   () )
             frames
         in
@@ -2183,7 +2186,6 @@ end = struct
   let set_send_pf t pf = t.send_buffer_pf <- pf
 
   let set_send_pf_bounded t pf = t.send_buffer_pf_bounded <- Some (ref pf)
-
 end
 
 module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
@@ -2283,15 +2285,17 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
   (* End of helper functions *)
 
   let start_connection flow connection =
-    S.TCPV4.write flow (Cstruct.of_bytes (Connection.greeting_message connection))
-                >>= function
-                | Error _ ->
-                    Logs.warn (fun f ->
-                        f
-                          "Module Connection_tcp: Error writing data to \
-                           established connection." ) ;
-                    Lwt.return_unit
-                | Ok () -> process_input flow connection
+    S.TCPV4.write flow
+      (Cstruct.of_bytes (Connection.greeting_message connection))
+    >>= function
+    | Error _ ->
+        Logs.warn (fun f ->
+            f
+              "Module Connection_tcp: Error writing data to established \
+               connection." ) ;
+        Lwt.return_unit
+    | Ok () ->
+        process_input flow connection
 
   let listen s port socket =
     S.listen_tcpv4 s ~port (fun flow ->
