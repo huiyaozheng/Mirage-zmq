@@ -1,4 +1,4 @@
 mirage clean
-mirage configure -t macosx --net socket
+mirage configure -t hvt --net direct
 make depend
 make

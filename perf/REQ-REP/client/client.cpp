@@ -6,14 +6,14 @@
 #include <zmq.hpp>
 using namespace std;
 const int NO_OF_REQ = 1000;
-const int NO_OF_THREADS = 1;
-auto target_address = "tcp://localhost:5555";
+const int NO_OF_THREADS = 2;
+auto target_address = "tcp://10.0.0.2:5555";
 auto msg_length = 255;
 auto msg =
-    "77777777777777777777777777777777777777777777777777777777777777777777777777"
-    "77777777777777777777777777777777777777777777777777777777777777777777777777"
-    "777777777777777777777777777777777777777777777777777777"
-    "7777777777777777777777777777777777777777777777777777";
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 double latency[NO_OF_REQ * NO_OF_THREADS];
 
 class Timer {
@@ -57,24 +57,18 @@ class Writer {
 void req_worker(int index) {
   zmq::context_t context(1);
   zmq::socket_t socket(context, ZMQ_REQ);
-  cout << "Connecting to server…" << endl;
   socket.connect(target_address);
+  cout << "Server connected" << endl;
   Timer timer;
   for (int request_nbr = 0; request_nbr != NO_OF_REQ; request_nbr++) {
     zmq::message_t request(msg_length);
     memcpy(request.data(), msg, msg_length);
-    // cout << "Sending request " << request_nbr << "…" << endl;
     timer.start();
     socket.send(request);
     zmq::message_t reply;
     socket.recv(&reply);
     timer.stop();
     double _latency = timer.elapsedMicroseconds();
-    // cout << "Microseconds: " << timer.elapsedMicroseconds() <<
-    // endl;
-    // w.write(to_string(request_nbr) + ',' + to_string(latency));
-    // cout << "Received reply " << request_nbr << endl;
-    latency[index * NO_OF_REQ + request_nbr] = _latency;
     this_thread::sleep_for(chrono::milliseconds(100));
   }
 }

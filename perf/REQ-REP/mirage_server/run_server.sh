@@ -1,1 +1,1 @@
-./rep_server 
+./solo5-hvt --net=tap100 -- rep_server.hvt
