@@ -1,80 +1,110 @@
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <string>
-#include <fstream>
-#include <string>
+#include <thread>
 #include <zmq.hpp>
-#include <chrono>
+using namespace std;
+const int NO_OF_REQ = 1000;
+const int NO_OF_THREADS = 1;
+auto target_address = "tcp://localhost:5555";
+auto msg_length = 255;
+auto msg =
+    "77777777777777777777777777777777777777777777777777777777777777777777777777"
+    "77777777777777777777777777777777777777777777777777777777777777777777777777"
+    "777777777777777777777777777777777777777777777777777777"
+    "7777777777777777777777777777777777777777777777777777";
+double latency[NO_OF_REQ * NO_OF_THREADS];
+
 class Timer {
  public:
   void start() {
-    m_StartTime = std::chrono::system_clock::now();
+    m_StartTime = chrono::system_clock::now();
     m_bRunning = true;
   }
   void stop() {
-    m_EndTime = std::chrono::system_clock::now();
+    m_EndTime = chrono::system_clock::now();
     m_bRunning = false;
   }
   double elapsedMicroseconds() {
-    std::chrono::time_point<std::chrono::system_clock> endTime;
+    chrono::time_point<chrono::system_clock> endTime;
     if (m_bRunning) {
-      endTime = std::chrono::system_clock::now();
+      endTime = chrono::system_clock::now();
     } else {
       endTime = m_EndTime;
     }
-    return std::chrono::duration_cast<std::chrono::microseconds>(endTime -
-                                                                 m_StartTime)
+    return chrono::duration_cast<chrono::microseconds>(endTime - m_StartTime)
         .count();
   }
 
  private:
-  std::chrono::time_point<std::chrono::system_clock> m_StartTime;
-  std::chrono::time_point<std::chrono::system_clock> m_EndTime;
+  chrono::time_point<chrono::system_clock> m_StartTime;
+  chrono::time_point<chrono::system_clock> m_EndTime;
   bool m_bRunning = false;
 };
 
 class Writer {
-  std::ofstream out;
-public:
-  Writer(std::string filename) {
-    out.open (filename+".csv");
-  }
+  ofstream out;
 
-  void write(std::string line) {
-    out << line << '\n';
-  }
+ public:
+  Writer(string filename) { out.open(filename + ".csv"); }
 
-  ~Writer() {
-    out.close();
-  }
+  void write(string line) { out << line << '\n'; }
+
+  ~Writer() { out.close(); }
 };
 
-int main(int argc, char *argv[]) {
-  if (argc != 2) {
-    std::cout << "A CSV filename is needed" << std::endl;
-    return 0;
-  }
-  Writer w(argv[1]);
-  
-  w.write("Req no., latency (microsecond)");
+void req_worker(int index) {
   zmq::context_t context(1);
   zmq::socket_t socket(context, ZMQ_REQ);
-  std::cout << "Connecting to server…" << std::endl;
-  socket.connect("tcp://localhost:5555");
+  cout << "Connecting to server…" << endl;
+  socket.connect(target_address);
   Timer timer;
-  const int REQ_NO = 10000;
-  for (int request_nbr = 0; request_nbr != REQ_NO; request_nbr++) {
-    zmq::message_t request(7);
-    memcpy(request.data(), "Request", 7);
-    std::cout << "Sending request " << request_nbr << "…" << std::endl;
+  for (int request_nbr = 0; request_nbr != NO_OF_REQ; request_nbr++) {
+    zmq::message_t request(msg_length);
+    memcpy(request.data(), msg, msg_length);
+    // cout << "Sending request " << request_nbr << "…" << endl;
     timer.start();
     socket.send(request);
     zmq::message_t reply;
     socket.recv(&reply);
     timer.stop();
-    double latency = timer.elapsedMicroseconds();
-    //std::cout << "Microseconds: " << timer.elapsedMicroseconds() << std::endl;
-    w.write(std::to_string(request_nbr) + ',' + std::to_string(latency));
-    std::cout << "Received reply " << request_nbr << std::endl;
+    double _latency = timer.elapsedMicroseconds();
+    // cout << "Microseconds: " << timer.elapsedMicroseconds() <<
+    // endl;
+    // w.write(to_string(request_nbr) + ',' + to_string(latency));
+    // cout << "Received reply " << request_nbr << endl;
+    latency[index * NO_OF_REQ + request_nbr] = _latency;
+    this_thread::sleep_for(chrono::milliseconds(100));
+  }
+}
+
+int main(int argc, char *argv[]) {
+  if (argc != 2) {
+    cout << "A CSV filename is needed" << endl;
+    return 0;
+  }
+  Writer w(argv[1]);
+
+  auto line = "Req no."s;
+  for (int j = 0; j < NO_OF_THREADS; ++j) {
+    line += ", latency (microseconds)"s;
+  }
+  w.write(line);
+
+  thread t[NO_OF_THREADS];
+  for (int i = 0; i < NO_OF_THREADS; ++i) {
+    t[i] = thread(req_worker, i);
+  }
+  for (int i = 0; i < NO_OF_THREADS; ++i) {
+    t[i].join();
+  }
+  for (int i = 0; i < NO_OF_REQ; ++i) {
+    auto line = to_string(i);
+    for (int j = 0; j < NO_OF_THREADS; ++j) {
+      line += ", " + to_string(latency[i + j * NO_OF_REQ]);
+    }
+    w.write(line);
   }
   return 0;
 }
