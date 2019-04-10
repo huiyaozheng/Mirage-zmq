@@ -1,1 +1,1 @@
-g++ client.cpp -O2 -lzmq --std=c++14 -o client
+g++ client.cpp -O2 -lzmq --std=c++14 -o client -pthread
