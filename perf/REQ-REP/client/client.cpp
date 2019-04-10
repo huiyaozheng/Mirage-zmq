@@ -69,6 +69,7 @@ void req_worker(int index) {
     socket.recv(&reply);
     timer.stop();
     double _latency = timer.elapsedMicroseconds();
+    latency[index * NO_OF_REQ + request_nbr] = _latency;
     this_thread::sleep_for(chrono::milliseconds(100));
   }
 }
