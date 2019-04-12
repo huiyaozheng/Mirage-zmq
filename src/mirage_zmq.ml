@@ -2243,10 +2243,10 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                     f "Module Connection_tcp: Connection FSM Continue\n" ) ; *)
                 act tl
             | Connection.Close s ->
-                (* Logs.debug (fun f ->
+                Logs.debug (fun f ->
                     f
                       "Module Connection_tcp: Connection FSM Close due to: %s\n"
-                      s ) ; *)
+                      s ) ; 
                 Lwt.return_unit )
         in
         act action_list
