@@ -2201,6 +2201,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     >>= function
     | Ok `Eof ->
         (* Logs.debug (fun f -> f "Module Connection_tcp: Closing connection!") ; *)
+        Connection.close connection;
         Lwt.return_unit
     | Error e ->
         (* Logs.warn (fun f ->
@@ -2208,6 +2209,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
               "Module Connection_tcp: Error reading data from established \
                connection: %a"
               S.TCPV4.pp_error e ) ; *)
+        Connection.close connection;
         Lwt.return_unit
     | Ok (`Data b) ->
         (* Logs.debug (fun f ->
