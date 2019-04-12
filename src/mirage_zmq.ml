@@ -594,7 +594,7 @@ end = struct
         Lwt_stream.is_empty buffer
         >>= function
         | true ->
-            Queue.push (Queue.pop connections) connections ;
+            rotate connections false;
             find_connection_with_incoming_buffer connections
         | false ->
             Lwt.return (Some head)
