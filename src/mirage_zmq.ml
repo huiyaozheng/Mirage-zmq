@@ -15,7 +15,7 @@
  *)
 open Lwt.Infix
 
-let default_queue_size = 50
+let default_queue_size = 1000
 
 exception No_Available_Peers
 
@@ -59,6 +59,7 @@ type security_data =
   | Plain_server of (string, string) Hashtbl.t
 
 type connection_stage = GREETING | HANDSHAKE | TRAFFIC | CLOSED
+
 type connection_fsm_data = Input_data of Bytes.t | End_of_connection
 
 type io_buffer_pf_bounded =
@@ -542,7 +543,7 @@ end = struct
           let head = Queue.peek connections in
           if
             Connection.get_stage !head <> TRAFFIC
-            or Connection.if_send_queue_full !head
+            || Connection.if_send_queue_full !head
           then (
             Queue.push (Queue.pop connections) buffer_queue ;
             rotate () )
@@ -585,40 +586,43 @@ end = struct
   (* Rotate a queue until the front connection has non-empty incoming buffer.
     Will rotate indefinitely until return, unless queue is empty at start*)
   let rec find_connection_with_incoming_buffer connections =
-    if Queue.is_empty connections then ( Lwt.return None)
+    if Queue.is_empty connections then Lwt.return None
     else
       let head = !(Queue.peek connections) in
-      Logs.debug (fun f -> f "Not empty");
+      Logs.debug (fun f -> f "Not empty") ;
       if Connection.get_stage head = TRAFFIC then
-        let buffer = !(Connection.get_buffer head) in
-        Lwt_stream.is_empty buffer
-        >>= function
-        | true ->
-            rotate connections false;
-            find_connection_with_incoming_buffer connections
-        | false ->
-            Lwt.return (Some head)
+        let buffer = Connection.get_buffer head in
+        if Queue.is_empty buffer then (
+          rotate connections false ;
+          Lwt.pause ()
+          >>= fun () -> find_connection_with_incoming_buffer connections )
+        else Lwt.return (Some head)
       else if Connection.get_stage head = CLOSED then (
         rotate connections true ;
-        find_connection_with_incoming_buffer connections
-      )
-      else 
-      (
+        find_connection_with_incoming_buffer connections )
+      else (
         rotate connections false ;
         Lwt.pause ()
         >>= fun () -> find_connection_with_incoming_buffer connections )
 
-  (** Get the next list of frames containing a complete message/command from the read buffer *)
+  (* Get the next list of frames containing a complete message/command from the read buffer.
+  Return None if the stream is closed.
+  Block if message not complete
+  *)
   let get_frame_list connection =
     let rec get_reverse_frame_list_accumu list =
-      Lwt_stream.get !(Connection.get_buffer connection)
-      >>= function
-      | None ->
-          (* Received data not complete *) Lwt.return None
-      | Some next_frame ->
-          if Frame.get_if_more next_frame then
-            get_reverse_frame_list_accumu (next_frame :: list)
-          else Lwt.return (Some (next_frame :: list))
+      try
+        Queue.pop (Connection.get_buffer connection)
+        |> function
+        | None ->
+            (* Stream closed *) Lwt.return None
+        | Some next_frame ->
+            if Frame.get_if_more next_frame then
+              get_reverse_frame_list_accumu (next_frame :: list)
+            else Lwt.return (Some (next_frame :: list))
+      with Queue.Empty ->
+        (* Wait for more frames to come *)
+        Lwt.pause () >>= fun () -> get_reverse_frame_list_accumu list
     in
     get_reverse_frame_list_accumu []
     >>= function
@@ -648,18 +652,23 @@ end = struct
               rotate connections false ;
               Lwt.return (Data (Frame.splice_message_frames frames)) )
 
-  (** Get the address envelope from the read buffer, stop when the empty delimiter is encountered and discard the delimiter *)
+  (* Get the address envelope from the read buffer, stop when the empty delimiter is encountered and discard the delimiter.connections
+  Return None if stream closed
+  Block if envelope not complete yet *)
   let get_address_envelope connection =
     let rec get_reverse_frame_list_accumu list =
-      Lwt_stream.get !(Connection.get_buffer connection)
-      >>= function
-      | None ->
-          (* Received data not complete *) Lwt.return None
-      | Some next_frame ->
-          if Frame.is_delimiter_frame next_frame then Lwt.return (Some list)
-          else if Frame.get_if_more next_frame then
-            get_reverse_frame_list_accumu (next_frame :: list)
-          else Lwt.return (Some (next_frame :: list))
+      try
+        Queue.pop (Connection.get_buffer connection)
+        |> function
+        | None ->
+            (* Stream closed *) Lwt.return None
+        | Some next_frame ->
+            if Frame.is_delimiter_frame next_frame then Lwt.return (Some list)
+            else if Frame.get_if_more next_frame then
+              get_reverse_frame_list_accumu (next_frame :: list)
+            else Lwt.return (Some (next_frame :: list))
+      with Queue.Empty ->
+        Lwt.pause () >>= fun () -> get_reverse_frame_list_accumu list
     in
     get_reverse_frame_list_accumu []
     >>= function
@@ -938,15 +947,16 @@ end = struct
   type queue_fold_type = UNINITIALISED | Result of Connection.t
 
   let rec recv t =
-    Logs.debug (fun f -> f "Recevin\n");
+    Logs.debug (fun f -> f "Recevin\n") ;
     match t.socket_type with
     | REP -> (
       match t.socket_states with
-      | Rep _ -> (
-          if Queue.is_empty t.connections then
-            ( Logs.debug (fun f -> f "Empty"); Lwt.pause () >>= fun () -> recv t)
-          else
-             ( Logs.debug (fun f -> f "Not Empty");
+      | Rep _ ->
+          if Queue.is_empty t.connections then (
+            Logs.debug (fun f -> f "Empty") ;
+            Lwt.pause () >>= fun () -> recv t )
+          else (
+            Logs.debug (fun f -> f "Not Empty") ;
             (* Go through the queue of connections and check buffer *)
             find_connection_with_incoming_buffer t.connections
             >>= function
@@ -975,7 +985,7 @@ end = struct
                                  Connection.get_tag connection
                              ; address_envelope } ;
                         Lwt.return (Data (Frame.splice_message_frames frames))
-                    ) ) ) )
+                    ) ) )
       | _ ->
           raise Should_Not_Reach )
     | REQ -> (
@@ -997,7 +1007,11 @@ end = struct
                       t.socket_states
                       <- Req {if_sent= false; last_sent_connection_tag= ""} ;
                       Lwt.return (Some (Frame.splice_message_frames frames)) )
-                else raise (Internal_Error "Connection closed")
+                else (
+                  rotate t.connections true ;
+                  t.socket_states
+                  <- Req {if_sent= false; last_sent_connection_tag= ""} ;
+                  raise Connection_closed )
               else
                 raise
                   (Internal_Error "Receive target no longer at head of queue")
@@ -1007,7 +1021,10 @@ end = struct
             | Some result ->
                 rotate t.connections false ; Lwt.return (Data result)
             | None ->
-                recv t )
+                rotate t.connections true ;
+                t.socket_states
+                <- Req {if_sent= false; last_sent_connection_tag= ""} ;
+                raise Connection_closed )
       | _ ->
           raise Should_Not_Reach )
     | DEALER -> (
@@ -1102,8 +1119,9 @@ end = struct
               >>= function
               | None ->
                   Connection.close connection ;
-                  (* TODO check validity *)
-                  raise No_Available_Peers
+                  t.socket_states <- Pair {connected= false} ;
+                  rotate t.connections true ;
+                  raise Connection_closed
               | Some frames ->
                   Lwt.return (Data (Frame.splice_message_frames frames))
             else raise No_Available_Peers
@@ -1168,9 +1186,7 @@ end = struct
                     raise No_Available_Peers
                 | Some connection ->
                     (* TODO check re-send is working *)
-                    Lwt.async (fun () ->
-                        Lwt_stream.junk_old !(Connection.get_buffer connection)
-                    ) ;
+                    Queue.clear (Connection.get_buffer connection) ;
                     Connection.send connection
                       ( Frame.delimiter_frame
                       :: List.map
@@ -1283,9 +1299,7 @@ end = struct
       | Data msg -> (
         match t.socket_states with
         | Push -> (
-            if Queue.is_empty t.connections then
-              (* TODO: not accepting further messages when no available_peers *)
-              raise No_Available_Peers
+            if Queue.is_empty t.connections then raise No_Available_Peers
             else
               find_available_connection t.connections
               |> function
@@ -1321,7 +1335,6 @@ end = struct
                   (List.map
                      (fun x -> Message.to_frame x)
                      (Message.list_of_string msg))
-                (* TODO: not accepting further messages*)
               else raise No_Available_Peers
         | _ ->
             raise Should_Not_Reach )
@@ -1787,7 +1800,7 @@ end
 and Connection : sig
   type t
 
-  type action = Write of bytes | Continue | Close of string
+  type action = Write of bytes | Continue | Close of string | Block
 
   val init : Socket.t ref -> Security_mechanism.t -> string -> t
   (** Create a new connection for socket with specified security mechanism *)
@@ -1795,7 +1808,7 @@ and Connection : sig
   val get_tag : t -> string
   (** Get the unique tag used to identify the connection *)
 
-  val get_buffer : t -> Frame.t Lwt_stream.t ref
+  val get_buffer : t -> Frame.t option Queue.t
   (** Get the read buffer of the connection *)
 
   val get_stage : t -> connection_stage
@@ -1826,14 +1839,13 @@ and Connection : sig
   val set_send_pf : t -> (Bytes.t option -> unit) -> unit
   (** Set the push function of the send buffer *)
 
-  val set_send_pf_bounded :
-    t -> Bytes.t Lwt_stream.bounded_push -> unit
+  val set_send_pf_bounded : t -> Bytes.t Lwt_stream.bounded_push -> unit
   (** Set the push function of the bounded send buffer *)
 
   val if_send_queue_full : t -> bool
   (** Returns whether the send queue is full (always false if unbounded size *)
 end = struct
-  type action = Write of bytes | Continue | Close of string
+  type action = Write of bytes | Continue | Close of string | Block
 
   type subscription_message = Subscribe | Unsubscribe | Ignore
 
@@ -1847,8 +1859,7 @@ end = struct
     ; mutable incoming_as_server: bool
     ; mutable incoming_socket_type: socket_type
     ; mutable incoming_identity: string
-    ; read_buffer: Frame.t Lwt_stream.t ref
-    ; read_buffer_pf: (Frame.t option -> unit) ref
+    ; read_buffer: Frame.t option Queue.t
     ; mutable send_buffer: Bytes.t Lwt_stream.t
     ; mutable send_buffer_pf: Bytes.t option -> unit
     ; mutable send_buffer_pf_bounded:
@@ -1857,9 +1868,6 @@ end = struct
     ; mutable previous_fragment: Bytes.t }
 
   let init socket security_mechanism tag =
-    let read_stream, read_pf = Lwt_stream.create () in
-    let ref_stream = ref read_stream in
-    let ref_pf = ref read_pf in
     { tag
     ; socket
     ; greeting_state= Greeting.init security_mechanism
@@ -1870,8 +1878,7 @@ end = struct
       incoming_socket_type= REP
     ; incoming_as_server= false
     ; incoming_identity= tag
-    ; read_buffer= ref_stream
-    ; read_buffer_pf= ref_pf
+    ; read_buffer= Queue.create ()
     ; send_buffer= Lwt_stream.of_list []
     ; send_buffer_pf= (fun x -> ())
     ; send_buffer_pf_bounded= None
@@ -1896,262 +1903,289 @@ end = struct
 
   let rec fsm t data =
     match data with
-    | End_of_connection -> (!(t.read_buffer_pf) None; [Continue])
-    | Input_data bytes ->
-    match t.stage with
-    | GREETING -> (
-        let if_pair =
-          match Socket.get_socket_type !(t.socket) with
-          | PAIR ->
-              true
-          | _ ->
-              false
-        in
-        let if_pair_already_connected =
-          match Socket.get_socket_type !(t.socket) with
-          | PAIR ->
-              Socket.get_pair_connected !(t.socket)
-          | _ ->
-              false
-        in
-        (* Logs.debug (fun f -> f "Module Connection: Greeting -> FSM\n") ;*)
-        if if_pair then Socket.set_pair_connected !(t.socket) true ;
-        let len = Bytes.length bytes in
-        let rec convert greeting_action_list =
-          match greeting_action_list with
-          | [] ->
-              []
-          | hd :: tl -> (
-            match hd with
-            | Greeting.Set_server b ->
-                t.incoming_as_server <- b ;
-                if
-                  t.incoming_as_server
-                  && Security_mechanism.get_as_server t.handshake_state
-                then [Close "Both ends cannot be servers"]
-                else if
-                  Security_mechanism.get_as_client t.handshake_state
-                  && not t.incoming_as_server
-                then [Close "Other end is not a server"]
-                else convert tl
-            (* Assume security mechanism is pre-set*)
-            | Greeting.Check_mechanism s ->
-                if s <> Security_mechanism.get_name_string t.handshake_state
-                then [Close "Security Policy mismatch"]
-                else convert tl
-            | Greeting.Continue ->
-                convert tl
-            | Greeting.Ok ->
-                (* Logs.debug (fun f -> f "Module Connection: Greeting OK\n") ; *)
-                t.stage <- HANDSHAKE ;
-                if
-                  Security_mechanism.if_send_command_after_greeting
-                    t.handshake_state
-                then
-                  Write (Security_mechanism.first_command t.handshake_state)
-                  :: convert tl
-                else convert tl
-            | Greeting.Error s ->
-                [Close ("Greeting FSM error: " ^ s)] )
-        in
-        match len with
-        (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54 *)
-        (* Full greeting *)
-        | 64 ->
-            let state, action_list =
-              Greeting.fsm t.greeting_state
-                [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
-                ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1)
-                ; Greeting.Recv_Vminor (Bytes.sub bytes 11 1)
-                ; Greeting.Recv_Mechanism (Bytes.sub bytes 12 20)
-                ; Greeting.Recv_as_server (Bytes.sub bytes 32 1)
-                ; Greeting.Recv_filler ]
-            in
-            let connection_action = convert action_list in
-            if if_pair_already_connected then
-              [Close "This PAIR is already connected"]
-            else (
+    | End_of_connection ->
+        Queue.push None t.read_buffer ;
+        [Continue]
+    | Input_data bytes -> (
+      match t.stage with
+      | GREETING -> (
+          let if_pair =
+            match Socket.get_socket_type !(t.socket) with
+            | PAIR ->
+                true
+            | _ ->
+                false
+          in
+          let if_pair_already_connected =
+            match Socket.get_socket_type !(t.socket) with
+            | PAIR ->
+                Socket.get_pair_connected !(t.socket)
+            | _ ->
+                false
+          in
+          (* Logs.debug (fun f -> f "Module Connection: Greeting -> FSM\n") ;*)
+          if if_pair then Socket.set_pair_connected !(t.socket) true ;
+          let len = Bytes.length bytes in
+          let rec convert greeting_action_list =
+            match greeting_action_list with
+            | [] ->
+                []
+            | hd :: tl -> (
+              match hd with
+              | Greeting.Set_server b ->
+                  t.incoming_as_server <- b ;
+                  if
+                    t.incoming_as_server
+                    && Security_mechanism.get_as_server t.handshake_state
+                  then [Close "Both ends cannot be servers"]
+                  else if
+                    Security_mechanism.get_as_client t.handshake_state
+                    && not t.incoming_as_server
+                  then [Close "Other end is not a server"]
+                  else convert tl
+              (* Assume security mechanism is pre-set*)
+              | Greeting.Check_mechanism s ->
+                  if s <> Security_mechanism.get_name_string t.handshake_state
+                  then [Close "Security Policy mismatch"]
+                  else convert tl
+              | Greeting.Continue ->
+                  convert tl
+              | Greeting.Ok ->
+                  (* Logs.debug (fun f -> f "Module Connection: Greeting OK\n") ; *)
+                  t.stage <- HANDSHAKE ;
+                  if
+                    Security_mechanism.if_send_command_after_greeting
+                      t.handshake_state
+                  then
+                    Write (Security_mechanism.first_command t.handshake_state)
+                    :: convert tl
+                  else convert tl
+              | Greeting.Error s ->
+                  [Close ("Greeting FSM error: " ^ s)] )
+          in
+          match len with
+          (* Hard code the length here. The greeting is either complete or split into 11 + 53 or 10 + 54 *)
+          (* Full greeting *)
+          | 64 ->
+              let state, action_list =
+                Greeting.fsm t.greeting_state
+                  [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
+                  ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1)
+                  ; Greeting.Recv_Vminor (Bytes.sub bytes 11 1)
+                  ; Greeting.Recv_Mechanism (Bytes.sub bytes 12 20)
+                  ; Greeting.Recv_as_server (Bytes.sub bytes 32 1)
+                  ; Greeting.Recv_filler ]
+              in
+              let connection_action = convert action_list in
+              if if_pair_already_connected then
+                [Close "This PAIR is already connected"]
+              else (
+                t.greeting_state <- state ;
+                t.expected_bytes_length <- 0 ;
+                connection_action )
+          (* Signature + version major *)
+          | 11 ->
+              let state, action_list =
+                Greeting.fsm t.greeting_state
+                  [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
+                  ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1) ]
+              in
+              if if_pair_already_connected then
+                [Close "This PAIR is already connected"]
+              else (
+                t.greeting_state <- state ;
+                t.expected_bytes_length <- 53 ;
+                convert action_list )
+          (* Signature *)
+          | 10 ->
+              let state, action =
+                Greeting.fsm_single t.greeting_state (Greeting.Recv_sig bytes)
+              in
+              if if_pair_already_connected then
+                [Close "This PAIR is already connected"]
+              else (
+                t.greeting_state <- state ;
+                t.expected_bytes_length <- 54 ;
+                convert [action] )
+          (* version minor + rest *)
+          | 53 ->
+              let state, action_list =
+                Greeting.fsm t.greeting_state
+                  [ Greeting.Recv_Vminor (Bytes.sub bytes 0 1)
+                  ; Greeting.Recv_Mechanism (Bytes.sub bytes 1 20)
+                  ; Greeting.Recv_as_server (Bytes.sub bytes 21 1)
+                  ; Greeting.Recv_filler ]
+              in
+              let connection_action = convert action_list in
               t.greeting_state <- state ;
               t.expected_bytes_length <- 0 ;
-              connection_action )
-        (* Signature + version major *)
-        | 11 ->
-            let state, action_list =
-              Greeting.fsm t.greeting_state
-                [ Greeting.Recv_sig (Bytes.sub bytes 0 10)
-                ; Greeting.Recv_Vmajor (Bytes.sub bytes 10 1) ]
-            in
-            if if_pair_already_connected then
-              [Close "This PAIR is already connected"]
-            else (
-              t.greeting_state <- state ;
-              t.expected_bytes_length <- 53 ;
-              convert action_list )
-        (* Signature *)
-        | 10 ->
-            let state, action =
-              Greeting.fsm_single t.greeting_state (Greeting.Recv_sig bytes)
-            in
-            if if_pair_already_connected then
-              [Close "This PAIR is already connected"]
-            else (
-              t.greeting_state <- state ;
-              t.expected_bytes_length <- 54 ;
-              convert [action] )
-        (* version minor + rest *)
-        | 53 ->
-            let state, action_list =
-              Greeting.fsm t.greeting_state
-                [ Greeting.Recv_Vminor (Bytes.sub bytes 0 1)
-                ; Greeting.Recv_Mechanism (Bytes.sub bytes 1 20)
-                ; Greeting.Recv_as_server (Bytes.sub bytes 21 1)
-                ; Greeting.Recv_filler ]
-            in
-            let connection_action = convert action_list in
-            t.greeting_state <- state ;
-            t.expected_bytes_length <- 0 ;
-            connection_action
-        (* version major + rest *)
-        | 54 ->
-            let state, action_list =
-              Greeting.fsm t.greeting_state
-                [ Greeting.Recv_Vmajor (Bytes.sub bytes 0 1)
-                ; Greeting.Recv_Vminor (Bytes.sub bytes 1 1)
-                ; Greeting.Recv_Mechanism (Bytes.sub bytes 2 20)
-                ; Greeting.Recv_as_server (Bytes.sub bytes 22 1)
-                ; Greeting.Recv_filler ]
-            in
-            let connection_action = convert action_list in
-            t.greeting_state <- state ;
-            t.expected_bytes_length <- 0 ;
-            connection_action
-        | n ->
-            if n < t.expected_bytes_length then [Close "Message too short"]
-            else
-              let expected_length = t.expected_bytes_length in
-              (* Handle greeting part *)
-              let action_list_1 = fsm t  (Input_data(Bytes.sub bytes 0 expected_length)) in
-              (* Handle handshake part *)
-              let action_list_2 =
-                fsm t (Input_data(Bytes.sub bytes expected_length (n - expected_length)))
+              connection_action
+          (* version major + rest *)
+          | 54 ->
+              let state, action_list =
+                Greeting.fsm t.greeting_state
+                  [ Greeting.Recv_Vmajor (Bytes.sub bytes 0 1)
+                  ; Greeting.Recv_Vminor (Bytes.sub bytes 1 1)
+                  ; Greeting.Recv_Mechanism (Bytes.sub bytes 2 20)
+                  ; Greeting.Recv_as_server (Bytes.sub bytes 22 1)
+                  ; Greeting.Recv_filler ]
               in
-              action_list_1 @ action_list_2 )
-    | HANDSHAKE -> (
-        (* Logs.debug (fun f -> f "Module Connection: Handshake -> FSM\n") ; *)
-        let frames, fragment =
-          Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
-        in
-        match frames with
-        | [] ->
-            t.previous_fragment <- fragment ;
-            [Continue]
-        | frame :: _ ->
-            (* assume only one command is received at a time *)
-            t.previous_fragment <- fragment ;
-            let command = Command.of_frame frame in
-            let new_state, actions =
-              Security_mechanism.fsm t.handshake_state command
-            in
-            let rec convert handshake_action_list =
-              match handshake_action_list with
-              | [] ->
-                  []
-              | hd :: tl -> (
-                match hd with
-                | Security_mechanism.Write b ->
-                    Write b :: convert tl
-                | Security_mechanism.Continue ->
-                    Continue :: convert tl
-                | Security_mechanism.Ok ->
-                    (* Logs.debug (fun f -> f "Module Connection: Handshake OK\n") ; *)
-                    t.stage <- TRAFFIC ;
-                    let frames = Socket.initial_traffic_messages !(t.socket) in
-                    List.map (fun x -> Write (Frame.to_bytes x)) frames
-                    @ convert tl
-                | Security_mechanism.Close ->
-                    [Close "Handshake FSM error"]
-                | Security_mechanism.Received_property (name, value) -> (
-                  match name with
-                  | "Socket-Type" ->
-                      if
-                        Socket.if_valid_socket_pair
-                          (Socket.get_socket_type !(t.socket))
-                          (Socket.socket_type_from_string value)
-                      then (
-                        t.incoming_socket_type
-                        <- Socket.socket_type_from_string value ;
-                        convert tl )
-                      else [Close "Socket type mismatch"]
-                  | "Identity" ->
-                      t.incoming_identity <- value ;
-                      convert tl
-                  | _ ->
-                      (* Logs.debug (fun f ->
+              let connection_action = convert action_list in
+              t.greeting_state <- state ;
+              t.expected_bytes_length <- 0 ;
+              connection_action
+          | n ->
+              if n < t.expected_bytes_length then [Close "Message too short"]
+              else
+                let expected_length = t.expected_bytes_length in
+                (* Handle greeting part *)
+                let action_list_1 =
+                  fsm t (Input_data (Bytes.sub bytes 0 expected_length))
+                in
+                (* Handle handshake part *)
+                let action_list_2 =
+                  fsm t
+                    (Input_data
+                       (Bytes.sub bytes expected_length (n - expected_length)))
+                in
+                action_list_1 @ action_list_2 )
+      | HANDSHAKE -> (
+          (* Logs.debug (fun f -> f "Module Connection: Handshake -> FSM\n") ; *)
+          let frames, fragment =
+            Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
+          in
+          match frames with
+          | [] ->
+              t.previous_fragment <- fragment ;
+              [Continue]
+          | frame :: _ ->
+              (* assume only one command is received at a time *)
+              t.previous_fragment <- fragment ;
+              let command = Command.of_frame frame in
+              let new_state, actions =
+                Security_mechanism.fsm t.handshake_state command
+              in
+              let rec convert handshake_action_list =
+                match handshake_action_list with
+                | [] ->
+                    []
+                | hd :: tl -> (
+                  match hd with
+                  | Security_mechanism.Write b ->
+                      Write b :: convert tl
+                  | Security_mechanism.Continue ->
+                      Continue :: convert tl
+                  | Security_mechanism.Ok ->
+                      (* Logs.debug (fun f -> f "Module Connection: Handshake OK\n") ; *)
+                      t.stage <- TRAFFIC ;
+                      let frames =
+                        Socket.initial_traffic_messages !(t.socket)
+                      in
+                      List.map (fun x -> Write (Frame.to_bytes x)) frames
+                      @ convert tl
+                  | Security_mechanism.Close ->
+                      [Close "Handshake FSM error"]
+                  | Security_mechanism.Received_property (name, value) -> (
+                    match name with
+                    | "Socket-Type" ->
+                        if
+                          Socket.if_valid_socket_pair
+                            (Socket.get_socket_type !(t.socket))
+                            (Socket.socket_type_from_string value)
+                        then (
+                          t.incoming_socket_type
+                          <- Socket.socket_type_from_string value ;
+                          convert tl )
+                        else [Close "Socket type mismatch"]
+                    | "Identity" ->
+                        t.incoming_identity <- value ;
+                        convert tl
+                    | _ ->
+                        (* Logs.debug (fun f ->
                           f "Module Connection: Ignore unknown property %s\n"
                             name ) ;*)
-                      convert tl ) )
-            in
-            let actions = convert actions in
-            t.handshake_state <- new_state ;
-            actions )
-    | TRAFFIC -> (
-        Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ; 
-        let frames, fragment =
-          Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
-        in
-        t.previous_fragment <- fragment ;
-        let manage_subscription () =
-          let match_subscription_signature frame =
-            if
-              (not (Frame.get_if_more frame))
-              && (not (Frame.get_if_command frame))
-              && not (Frame.get_if_long frame)
-            then
-              let first_char = (Bytes.to_string (Frame.get_body frame)).[0] in
-              if first_char = Char.chr 1 then Subscribe
-              else if first_char = Char.chr 0 then Unsubscribe
-              else Ignore
-            else Ignore
+                        convert tl ) )
+              in
+              let actions = convert actions in
+              t.handshake_state <- new_state ;
+              actions )
+      | TRAFFIC -> (
+          Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ;
+          let frames, fragment =
+            Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
           in
-          List.iter
-            (fun x ->
-              match match_subscription_signature x with
-              | Unsubscribe ->
-                  let body = Bytes.to_string (Frame.get_body x) in
-                  let sub = String.sub body 1 (String.length body - 1) in
-                  let rec check_and_remove subscriptions =
-                    match subscriptions with
-                    | [] ->
-                        []
-                    | hd :: tl ->
-                        if hd = sub then tl else hd :: check_and_remove tl
-                  in
-                  t.subscriptions <- check_and_remove t.subscriptions
-              | Subscribe ->
-                  let body = Bytes.to_string (Frame.get_body x) in
-                  t.subscriptions
-                  <- String.sub body 1 (String.length body - 1)
-                     :: t.subscriptions
-              | Ignore ->
-                  () )
-            frames
-        in
-        let enqueue () =
-          (* Put the received frames into the buffer *)
-          (* Logs.debug (fun f ->
-              f "Module Connection: %d frames enqueued\n" (List.length frames)
-          ) ; *)
-          List.iter (fun x -> !(t.read_buffer_pf) (Some x)) frames
-        in
-        match Socket.get_socket_type !(t.socket) with
-        | PUB ->
-            manage_subscription () ; [Continue]
-        | XPUB ->
-            manage_subscription () ; enqueue () ; [Continue]
-        | _ ->
-            enqueue () ; [Continue] )
-    | CLOSED ->
-        [Close "Connection FSM error"]
+          t.previous_fragment <- fragment ;
+          let manage_subscription () =
+            let match_subscription_signature frame =
+              if
+                (not (Frame.get_if_more frame))
+                && (not (Frame.get_if_command frame))
+                && not (Frame.get_if_long frame)
+              then
+                let first_char =
+                  (Bytes.to_string (Frame.get_body frame)).[0]
+                in
+                if first_char = Char.chr 1 then Subscribe
+                else if first_char = Char.chr 0 then Unsubscribe
+                else Ignore
+              else Ignore
+            in
+            List.iter
+              (fun x ->
+                match match_subscription_signature x with
+                | Unsubscribe ->
+                    let body = Bytes.to_string (Frame.get_body x) in
+                    let sub = String.sub body 1 (String.length body - 1) in
+                    let rec check_and_remove subscriptions =
+                      match subscriptions with
+                      | [] ->
+                          []
+                      | hd :: tl ->
+                          if hd = sub then tl else hd :: check_and_remove tl
+                    in
+                    t.subscriptions <- check_and_remove t.subscriptions
+                | Subscribe ->
+                    let body = Bytes.to_string (Frame.get_body x) in
+                    t.subscriptions
+                    <- String.sub body 1 (String.length body - 1)
+                       :: t.subscriptions
+                | Ignore ->
+                    () )
+              frames
+          in
+          let enqueue () =
+            (* Put the received frames into the buffer *)
+            (* TODO limit incoming buffer *)
+            let socket_type = Socket.get_socket_type !(t.socket) in
+            if Socket.if_queue_size_limited socket_type then
+              if
+                Queue.length t.read_buffer
+                < Socket.get_incoming_queue_size !(t.socket)
+              then (
+                List.iter (fun x -> Queue.push (Some x) t.read_buffer) frames ;
+                [Continue] )
+              else [Block]
+            else (
+              List.iter (fun x -> Queue.push (Some x) t.read_buffer) frames ;
+              [Continue] )
+          in
+          match Socket.get_socket_type !(t.socket) with
+          | PUB ->
+              manage_subscription () ; [Continue]
+          | XPUB -> (
+              (* TODO check XPUB's behaviour *)
+              enqueue ()
+              |> function
+              | [Continue] ->
+                  manage_subscription () ; [Continue]
+              | [Block] ->
+                  [Block]
+              | _ ->
+                  raise (Internal_Error "Should not reach") )
+          | _ ->
+              enqueue () )
+      | CLOSED ->
+          [Close "Connection FSM error"] )
 
   let close t =
     let if_pair =
@@ -2165,9 +2199,7 @@ end = struct
     if not (Socket.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
     then
       (* Unbounded sending queue *)
-      List.iter
-        (fun x -> t.send_buffer_pf (Some (Frame.to_bytes x)))
-        msg_list
+      List.iter (fun x -> t.send_buffer_pf (Some (Frame.to_bytes x))) msg_list
     else
       (* Sending queue of limited size *)
       Lwt.async (fun () ->
@@ -2210,58 +2242,64 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     S.TCPV4.read flow
     >>= function
     | Ok `Eof ->
-         Logs.debug (fun f -> f "Module Connection_tcp: Closing connection EOF") ; 
-        ignore (Connection.fsm connection End_of_connection);
-        Connection.close connection;
-        Lwt.return_unit;
+        Logs.debug (fun f -> f "Module Connection_tcp: Closing connection EOF") ;
+        ignore (Connection.fsm connection End_of_connection) ;
+        Connection.close connection ;
+        Lwt.return_unit
     | Error e ->
-         Logs.warn (fun f ->
+        Logs.warn (fun f ->
             f
               "Module Connection_tcp: Error reading data from established \
                connection: %a"
-              S.TCPV4.pp_error e ) ; 
-        ignore (Connection.fsm connection End_of_connection);
-        Connection.close connection;
+              S.TCPV4.pp_error e ) ;
+        ignore (Connection.fsm connection End_of_connection) ;
+        Connection.close connection ;
         Lwt.return_unit
     | Ok (`Data b) ->
         (* Logs.debug (fun f ->
             f "Module Connection_tcp: Read: %d bytes:\n%s" (Cstruct.len b)
               (Utils.buffer_to_string (Cstruct.to_bytes b)) ) ; *)
-        let action_list = Connection.fsm connection (Input_data(Cstruct.to_bytes b)) in
-        let rec act actions =
-          match actions with
-          | [] ->
-              Lwt.pause () >>= fun () -> process_input flow connection
-          | hd :: tl -> (
-            match hd with
-            | Connection.Write b -> (
-                (* Logs.debug (fun f ->
+        let bytes = Cstruct.to_bytes b in
+        let rec act () =
+          let actions = Connection.fsm connection (Input_data bytes) in
+          let rec deal_with_action_list actions =
+            match actions with
+            | [] ->
+                Lwt.pause () >>= fun () -> process_input flow connection
+            | hd :: tl -> (
+              match hd with
+              | Connection.Block ->
+                  act ()
+              | Connection.Write b -> (
+                  (* Logs.debug (fun f ->
                     f
                       "Module Connection_tcp: Connection FSM Write %d bytes\n\
                        %s\n"
                       (Bytes.length b) (Utils.buffer_to_string b) ) ; *)
-                S.TCPV4.write flow (Cstruct.of_bytes b)
-                >>= function
-                | Error _ ->
-                    (* Logs.warn (fun f ->
+                  S.TCPV4.write flow (Cstruct.of_bytes b)
+                  >>= function
+                  | Error _ ->
+                      (* Logs.warn (fun f ->
                         f
                           "Module Connection_tcp: Error writing data to \
                            established connection." ) ; *)
-                    Lwt.return_unit
-                | Ok () ->
-                    act tl )
-            | Connection.Continue ->
-                (* Logs.debug (fun f ->
+                      Lwt.return_unit
+                  | Ok () ->
+                      deal_with_action_list tl )
+              | Connection.Continue ->
+                  (* Logs.debug (fun f ->
                     f "Module Connection_tcp: Connection FSM Continue\n" ) ; *)
-                act tl
-            | Connection.Close s ->
-                Logs.debug (fun f ->
-                    f
-                      "Module Connection_tcp: Connection FSM Close due to: %s\n"
-                      s ) ; 
-                Lwt.return_unit )
+                  deal_with_action_list tl
+              | Connection.Close s ->
+                  Logs.debug (fun f ->
+                      f
+                        "Module Connection_tcp: Connection FSM Close due to: %s\n"
+                        s ) ;
+                  Lwt.return_unit )
+          in
+          deal_with_action_list actions
         in
-        act action_list
+        act ()
 
   (** Check the 'mailbox' and send outgoing data / close connection *)
   let rec process_output buffer flow connection =
@@ -2270,28 +2308,25 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     | None ->
         (* Stream closed *)
         Logs.debug (fun f ->
-              f "Module Connection_tcp: Connection was instructed to close" ) ;
-          S.TCPV4.close flow
+            f "Module Connection_tcp: Connection was instructed to close" ) ;
+        S.TCPV4.close flow
     | Some data -> (
-      
-         Logs.debug (fun f ->
-              f
-                "Module Connection_tcp: Connection mailbox Write %d bytes\n\
-                 %s\n"
-                (Bytes.length data) (Utils.buffer_to_string data) ) ; 
-          S.TCPV4.write flow (Cstruct.of_bytes data)
-          >>= function
-          | Error _ ->
-              Logs.warn (fun f ->
-                  f
-                    "Module Connection_tcp: Error writing data to established \
-                     connection." ) ; 
-              Connection.close connection ;
-              Lwt.return_unit
-          | Ok () ->
-              Lwt_stream.junk buffer
-              >>= fun () -> process_output buffer flow connection
-          )
+        Logs.debug (fun f ->
+            f "Module Connection_tcp: Connection mailbox Write %d bytes\n%s\n"
+              (Bytes.length data)
+              (Utils.buffer_to_string data) ) ;
+        S.TCPV4.write flow (Cstruct.of_bytes data)
+        >>= function
+        | Error _ ->
+            Logs.warn (fun f ->
+                f
+                  "Module Connection_tcp: Error writing data to established \
+                   connection." ) ;
+            Connection.close connection ;
+            Lwt.return_unit
+        | Ok () ->
+            Lwt_stream.junk buffer
+            >>= fun () -> process_output buffer flow connection )
 
   (* End of helper functions *)
 
@@ -2347,8 +2382,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           Socket.add_connection !socket (ref connection) ;
           Lwt.pick
             [ start_connection flow connection
-            ; process_output stream flow connection ]
-            )
+            ; process_output stream flow connection ] )
         else (
           Socket.add_connection !socket (ref connection) ;
           start_connection flow connection ) ) ;
