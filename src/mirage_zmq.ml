@@ -585,7 +585,6 @@ end = struct
     if Queue.is_empty connections then Lwt.return None
     else
       let head = !(Queue.peek connections) in
-      Logs.debug (fun f -> f "Not empty") ;
       if Connection.get_stage head = TRAFFIC then
         let buffer = Connection.get_read_buffer head in
         if Queue.is_empty buffer then (
@@ -943,16 +942,13 @@ end = struct
   type queue_fold_type = UNINITIALISED | Result of Connection.t
 
   let rec recv t =
-    Logs.debug (fun f -> f "Recevin\n") ;
     match t.socket_type with
     | REP -> (
       match t.socket_states with
-      | Rep _ ->
-          if Queue.is_empty t.connections then (
-            Logs.debug (fun f -> f "Empty") ;
-            Lwt.pause () >>= fun () -> recv t )
-          else (
-            Logs.debug (fun f -> f "Not Empty") ;
+      | Rep _ -> (
+          if Queue.is_empty t.connections then
+            Lwt.pause () >>= fun () -> recv t
+          else
             (* Go through the queue of connections and check buffer *)
             find_connection_with_incoming_buffer t.connections
             >>= function
@@ -2097,7 +2093,7 @@ end = struct
               t.handshake_state <- new_state ;
               actions )
       | TRAFFIC -> (
-          Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ;
+          (* Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ; *)
           let frames, fragment =
             Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
           in
@@ -2220,16 +2216,16 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     S.TCPV4.read flow
     >>= function
     | Ok `Eof ->
-        Logs.debug (fun f -> f "Module Connection_tcp: Closing connection EOF") ;
+        (* Logs.debug (fun f -> f "Module Connection_tcp: Closing connection EOF") ; *)
         ignore (Connection.fsm connection End_of_connection) ;
         Connection.close connection ;
         Lwt.return_unit
     | Error e ->
-        Logs.warn (fun f ->
+        (* Logs.warn (fun f ->
             f
               "Module Connection_tcp: Error reading data from established \
                connection: %a"
-              S.TCPV4.pp_error e ) ;
+              S.TCPV4.pp_error e ) ; *)
         ignore (Connection.fsm connection End_of_connection) ;
         Connection.close connection ;
         Lwt.return_unit
@@ -2269,10 +2265,10 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                     f "Module Connection_tcp: Connection FSM Continue\n" ) ; *)
                   deal_with_action_list tl
               | Connection.Close s ->
-                  Logs.debug (fun f ->
+                  (* Logs.debug (fun f ->
                       f
                         "Module Connection_tcp: Connection FSM Close due to: %s\n"
-                        s ) ;
+                        s ) ; *)
                   Lwt.return_unit )
           in
           deal_with_action_list actions
@@ -2286,23 +2282,23 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
       |> function
       | None ->
           (* Stream closed *)
-          Logs.debug (fun f ->
-              f "Module Connection_tcp: Connection was instructed to close" ) ;
+          (* Logs.debug (fun f ->
+              f "Module Connection_tcp: Connection was instructed to close" ) ; *)
           S.TCPV4.close flow
       | Some data -> (
-          Logs.debug (fun f ->
+          (* Logs.debug (fun f ->
               f
                 "Module Connection_tcp: Connection mailbox Write %d bytes\n\
                  %s\n"
                 (Bytes.length data)
-                (Utils.buffer_to_string data) ) ;
+                (Utils.buffer_to_string data) ) ; *)
           S.TCPV4.write flow (Cstruct.of_bytes data)
           >>= function
           | Error _ ->
-              Logs.warn (fun f ->
+              (* Logs.warn (fun f ->
                   f
                     "Module Connection_tcp: Error writing data to established \
-                     connection." ) ;
+                     connection." ) ;*)
               Connection.close connection ;
               Lwt.return_unit
           | Ok () ->
@@ -2328,9 +2324,9 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
   let listen s port socket =
     S.listen_tcpv4 s ~port (fun flow ->
         let dst, dst_port = S.TCPV4.dst flow in
-        Logs.debug (fun f ->
+        (*Logs.debug (fun f ->
             f "Module Connection_tcp: New tcp connection from IP %s on port %d"
-              (Ipaddr.V4.to_string dst) dst_port ) ;
+              (Ipaddr.V4.to_string dst) dst_port ) ; *)
         let connection =
           Connection.init socket
             (Security_mechanism.init
