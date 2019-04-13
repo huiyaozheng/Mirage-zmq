@@ -81,7 +81,7 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
   val recv : t -> message Lwt.t
   (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
 
-  val send : t -> message -> unit
+  val send : t -> message -> unit Lwt.t
   (** Send a msg to the underlying connections, according to the semantics of the socket type *)
 
   val send_blocking : t -> message -> unit Lwt.t

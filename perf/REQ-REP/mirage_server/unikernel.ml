@@ -12,12 +12,13 @@ module Main (S : Mirage_stack_lwt.V4) = struct
       >>= fun msg ->
       match msg with
       | Data msg ->
-          (*Logs.info (fun f -> f "Received msg: %s\n" msg); *)
+          Logs.info (fun f -> f "Received msg: %s\n" msg) ;
           Socket.send socket
             (Data
-               "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") ;
-          read_and_print ()
-      | _ -> Lwt.return_unit
+               "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+          >>= fun () -> read_and_print ()
+      | _ ->
+          Lwt.return_unit
     in
     Logs.info (fun f -> f "Started socket\n") ;
     read_and_print ()
