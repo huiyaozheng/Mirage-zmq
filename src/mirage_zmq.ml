@@ -33,6 +33,8 @@ exception Incorrect_use_of_API of string
 
 exception Connection_closed
 
+exception Queue_overflow
+
 type socket_type =
   | REQ
   | REP
@@ -407,7 +409,7 @@ module rec Socket : sig
   val recv : t -> message Lwt.t
   (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
 
-  val send : t -> message -> unit
+  val send : t -> message -> unit Lwt.t
   (** Send a msg to the underlying connections, according to the semantics of the socket type *)
 
   val send_blocking : t -> message -> unit Lwt.t
@@ -694,7 +696,10 @@ end = struct
       List.map (fun x -> Message.to_frame x) (Message.list_of_string msg)
     in
     let publish connection =
-      if if_send_to connection then Connection.send connection frames_to_send
+      if if_send_to connection then
+        try Connection.send connection frames_to_send
+        with (* Drop message when queue full *)
+        | Queue_overflow -> ()
       else ()
     in
     Queue.iter
@@ -1120,7 +1125,7 @@ end = struct
       | _ ->
           raise Should_Not_Reach )
 
-  let send t msg =
+  let rec send t msg =
     match t.socket_type with
     | REP -> (
       match msg with
@@ -1151,7 +1156,8 @@ end = struct
                          { if_received= false
                          ; last_received_connection_tag= ""
                          ; address_envelope= [] } ;
-                    rotate t.connections false )
+                    rotate t.connections false ;
+                    Lwt.return_unit )
                   else
                     raise
                       (Internal_Error "Send target no longer at head of queue")
@@ -1188,7 +1194,8 @@ end = struct
                     <- Req
                          { if_sent= true
                          ; last_sent_connection_tag=
-                             Connection.get_tag connection } )
+                             Connection.get_tag connection } ;
+                    Lwt.return_unit )
           | _ ->
               raise Should_Not_Reach )
       | _ ->
@@ -1205,8 +1212,8 @@ end = struct
                 |> function
                 | None ->
                     raise No_Available_Peers
-                | Some connection ->
-                    (* TODO check re-send is working *)
+                | Some connection -> (
+                  try
                     Connection.send connection
                       ( Frame.delimiter_frame
                       :: List.map
@@ -1215,7 +1222,10 @@ end = struct
                     Queue.push
                       (Connection.get_tag connection)
                       request_order_queue ;
-                    rotate t.connections false )
+                    rotate t.connections false ;
+                    Lwt.return_unit
+                  with Queue_overflow ->
+                    Lwt.pause () >>= fun () -> send t (Data msg) ) )
           | _ ->
               raise Should_Not_Reach )
       | _ ->
@@ -1229,8 +1239,8 @@ end = struct
                 Connection.get_identity connection = id )
             |> function
             | None ->
-                ()
-            | Some connection ->
+                Lwt.return_unit
+            | Some connection -> (
                 let frame_list =
                   if Connection.get_incoming_socket_type connection == REQ then
                     Frame.delimiter_frame
@@ -1242,7 +1252,12 @@ end = struct
                       (fun x -> Message.to_frame x)
                       (Message.list_of_string msg)
                 in
-                Connection.send connection frame_list )
+                try
+                  Connection.send connection frame_list ;
+                  Lwt.return_unit
+                with (* Drop message when queue full *)
+                | Queue_overflow ->
+                  Lwt.return_unit ) )
         | _ ->
             raise Should_Not_Reach )
       | _ ->
@@ -1257,7 +1272,8 @@ end = struct
         | Pub ->
             broadcast t.connections msg (fun connection ->
                 match_subscriptions msg
-                  (Connection.get_subscriptions connection) )
+                  (Connection.get_subscriptions connection) ) ;
+            Lwt.return_unit
         | _ ->
             raise Should_Not_Reach )
       | _ ->
@@ -1271,7 +1287,8 @@ end = struct
         | Xpub ->
             broadcast t.connections msg (fun connection ->
                 match_subscriptions msg
-                  (Connection.get_subscriptions connection) )
+                  (Connection.get_subscriptions connection) ) ;
+            Lwt.return_unit
         | _ ->
             raise Should_Not_Reach )
       | _ ->
@@ -1281,7 +1298,8 @@ end = struct
       | Data msg -> (
         match t.socket_states with
         | Xsub {subscriptions= _} ->
-            broadcast t.connections msg (fun _ -> true)
+            broadcast t.connections msg (fun _ -> true) ;
+            Lwt.return_unit
         | _ ->
             raise Should_Not_Reach )
       | _ ->
@@ -1297,13 +1315,15 @@ end = struct
               |> function
               | None ->
                   raise No_Available_Peers
-              | Some connection ->
-                  (* TODO check re-send is working *)
+              | Some connection -> (
+                try
                   Connection.send connection
                     (List.map
                        (fun x -> Message.to_frame x)
                        (Message.list_of_string msg)) ;
-                  rotate t.connections false )
+                  rotate t.connections false ;
+                  Lwt.return_unit
+                with Queue_overflow -> send t (Data msg) ) )
         | _ ->
             raise Should_Not_Reach )
       | _ ->
@@ -1323,10 +1343,13 @@ end = struct
                 && Connection.get_stage connection = TRAFFIC
                 && not (Connection.if_send_queue_full connection)
               then
-                Connection.send connection
-                  (List.map
-                     (fun x -> Message.to_frame x)
-                     (Message.list_of_string msg))
+                try
+                  Connection.send connection
+                    (List.map
+                       (fun x -> Message.to_frame x)
+                       (Message.list_of_string msg)) ;
+                  Lwt.return_unit
+                with Queue_overflow -> send t (Data msg)
               else raise No_Available_Peers
         | _ ->
             raise Should_Not_Reach )
@@ -1334,7 +1357,7 @@ end = struct
           raise (Incorrect_use_of_API "PUSH accepts a message only!") )
 
   let rec send_blocking t msg =
-    try send t msg ; Lwt.return_unit
+    try send t msg
     with No_Available_Peers -> Lwt.pause () >>= fun () -> send_blocking t msg
 
   let add_connection t connection = Queue.push connection t.connections
@@ -2185,20 +2208,16 @@ end = struct
       List.iter
         (fun x -> Queue.push (Some (Frame.to_bytes x)) t.send_buffer)
         msg_list
-    else
+    else if
       (* Sending queue of limited size *)
+      Queue.length t.send_buffer < Socket.get_outgoing_queue_size !(t.socket)
+    then
       Lwt.async (fun () ->
           let bytes = List.map (fun x -> Frame.to_bytes x) msg_list in
-          let rec send () =
-            if
-              Queue.length t.send_buffer
-              >= Socket.get_outgoing_queue_size !(t.socket)
-            then (
-              List.iter (fun x -> Queue.push (Some x) t.send_buffer) bytes ;
-              Lwt.return_unit )
-            else Lwt.pause () >>= fun () -> send ()
-          in
-          send () )
+          List.iter (fun x -> Queue.push (Some x) t.send_buffer) bytes ;
+          Lwt.return_unit )
+    else (* Overflowing sending queue *)
+      raise Queue_overflow
 
   let if_send_queue_full t =
     Queue.length t.send_buffer >= Socket.get_outgoing_queue_size !(t.socket)
@@ -2404,7 +2423,7 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
   val recv : t -> message Lwt.t
   (** Receive a msg from the underlying connections, according to the  semantics of the socket type *)
 
-  val send : t -> message -> unit
+  val send : t -> message -> unit Lwt.t
   (** Send a msg to the underlying connections, according to the semantics of the socket type *)
 
   val send_blocking : t -> message -> unit Lwt.t
