@@ -59,11 +59,10 @@ type security_data =
   | Plain_server of (string, string) Hashtbl.t
 
 type connection_stage = GREETING | HANDSHAKE | TRAFFIC | CLOSED
-
-type connection_buffer_object = Command_data of Bytes.t | Command_close
+type connection_fsm_data = Input_data of Bytes.t | End_of_connection
 
 type io_buffer_pf_bounded =
-  | Applicable of connection_buffer_object option Lwt_stream.bounded_push ref
+  | Applicable of Bytes.t option Lwt_stream.bounded_push ref
   | NA
 
 module Utils = struct
@@ -586,9 +585,10 @@ end = struct
   (* Rotate a queue until the front connection has non-empty incoming buffer.
     Will rotate indefinitely until return, unless queue is empty at start*)
   let rec find_connection_with_incoming_buffer connections =
-    if Queue.is_empty connections then Lwt.return None
+    if Queue.is_empty connections then ( Lwt.return None)
     else
       let head = !(Queue.peek connections) in
+      Logs.debug (fun f -> f "Not empty");
       if Connection.get_stage head = TRAFFIC then
         let buffer = !(Connection.get_buffer head) in
         Lwt_stream.is_empty buffer
@@ -598,7 +598,12 @@ end = struct
             find_connection_with_incoming_buffer connections
         | false ->
             Lwt.return (Some head)
-      else (
+      else if Connection.get_stage head = CLOSED then (
+        rotate connections true ;
+        find_connection_with_incoming_buffer connections
+      )
+      else 
+      (
         rotate connections false ;
         Lwt.pause ()
         >>= fun () -> find_connection_with_incoming_buffer connections )
@@ -933,13 +938,15 @@ end = struct
   type queue_fold_type = UNINITIALISED | Result of Connection.t
 
   let rec recv t =
+    Logs.debug (fun f -> f "Recevin\n");
     match t.socket_type with
     | REP -> (
       match t.socket_states with
       | Rep _ -> (
           if Queue.is_empty t.connections then
-            Lwt.pause () >>= fun () -> recv t
+            ( Logs.debug (fun f -> f "Empty"); Lwt.pause () >>= fun () -> recv t)
           else
+             ( Logs.debug (fun f -> f "Not Empty");
             (* Go through the queue of connections and check buffer *)
             find_connection_with_incoming_buffer t.connections
             >>= function
@@ -968,7 +975,7 @@ end = struct
                                  Connection.get_tag connection
                              ; address_envelope } ;
                         Lwt.return (Data (Frame.splice_message_frames frames))
-                    ) ) )
+                    ) ) ) )
       | _ ->
           raise Should_Not_Reach )
     | REQ -> (
@@ -1804,7 +1811,7 @@ and Connection : sig
 
   val greeting_message : t -> Bytes.t
 
-  val fsm : t -> Bytes.t -> action list
+  val fsm : t -> connection_fsm_data -> action list
   (** FSM for handing raw bytes transmission *)
 
   val send : t -> Frame.t list -> unit
@@ -1813,14 +1820,14 @@ and Connection : sig
   val close : t -> unit
   (** Force close connection *)
 
-  val set_send_buffer : t -> connection_buffer_object Lwt_stream.t -> unit
+  val set_send_buffer : t -> Bytes.t Lwt_stream.t -> unit
   (** Set the the send buffer *)
 
-  val set_send_pf : t -> (connection_buffer_object option -> unit) -> unit
+  val set_send_pf : t -> (Bytes.t option -> unit) -> unit
   (** Set the push function of the send buffer *)
 
   val set_send_pf_bounded :
-    t -> connection_buffer_object Lwt_stream.bounded_push -> unit
+    t -> Bytes.t Lwt_stream.bounded_push -> unit
   (** Set the push function of the bounded send buffer *)
 
   val if_send_queue_full : t -> bool
@@ -1842,10 +1849,10 @@ end = struct
     ; mutable incoming_identity: string
     ; read_buffer: Frame.t Lwt_stream.t ref
     ; read_buffer_pf: (Frame.t option -> unit) ref
-    ; mutable send_buffer: connection_buffer_object Lwt_stream.t
-    ; mutable send_buffer_pf: connection_buffer_object option -> unit
+    ; mutable send_buffer: Bytes.t Lwt_stream.t
+    ; mutable send_buffer_pf: Bytes.t option -> unit
     ; mutable send_buffer_pf_bounded:
-        connection_buffer_object Lwt_stream.bounded_push ref option
+        Bytes.t Lwt_stream.bounded_push ref option
     ; mutable subscriptions: string list
     ; mutable previous_fragment: Bytes.t }
 
@@ -1887,7 +1894,10 @@ end = struct
 
   let greeting_message t = Greeting.new_greeting t.handshake_state
 
-  let rec fsm t bytes =
+  let rec fsm t data =
+    match data with
+    | End_of_connection -> (!(t.read_buffer_pf) None; [Continue])
+    | Input_data bytes ->
     match t.stage with
     | GREETING -> (
         let if_pair =
@@ -2020,10 +2030,10 @@ end = struct
             else
               let expected_length = t.expected_bytes_length in
               (* Handle greeting part *)
-              let action_list_1 = fsm t (Bytes.sub bytes 0 expected_length) in
+              let action_list_1 = fsm t  (Input_data(Bytes.sub bytes 0 expected_length)) in
               (* Handle handshake part *)
               let action_list_2 =
-                fsm t (Bytes.sub bytes expected_length (n - expected_length))
+                fsm t (Input_data(Bytes.sub bytes expected_length (n - expected_length)))
               in
               action_list_1 @ action_list_2 )
     | HANDSHAKE -> (
@@ -2085,7 +2095,7 @@ end = struct
             t.handshake_state <- new_state ;
             actions )
     | TRAFFIC -> (
-        (* Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ; *)
+        Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ; 
         let frames, fragment =
           Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
         in
@@ -2149,24 +2159,24 @@ end = struct
     in
     if if_pair then Socket.set_pair_connected !(t.socket) false ;
     t.stage <- CLOSED ;
-    t.send_buffer_pf (Some Command_close)
+    t.send_buffer_pf None
 
   let send t msg_list =
     if not (Socket.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
     then
       (* Unbounded sending queue *)
       List.iter
-        (fun x -> t.send_buffer_pf (Some (Command_data (Frame.to_bytes x))))
+        (fun x -> t.send_buffer_pf (Some (Frame.to_bytes x)))
         msg_list
     else
       (* Sending queue of limited size *)
       Lwt.async (fun () ->
           match t.send_buffer_pf_bounded with
           | None ->
-              raise (Internal_Error "")
+              raise (Internal_Error "Bounded push buffer not set")
           | Some ref_f ->
               let rec f x =
-                try !ref_f#push (Command_data (Frame.to_bytes x))
+                try !ref_f#push (Frame.to_bytes x)
                 with Lwt_stream.Full -> Lwt.pause () >>= fun () -> f x
               in
               Lwt_list.iter_s f msg_list )
@@ -2200,22 +2210,24 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     S.TCPV4.read flow
     >>= function
     | Ok `Eof ->
-        (* Logs.debug (fun f -> f "Module Connection_tcp: Closing connection!") ; *)
+         Logs.debug (fun f -> f "Module Connection_tcp: Closing connection EOF") ; 
+        ignore (Connection.fsm connection End_of_connection);
         Connection.close connection;
-        Lwt.return_unit
+        Lwt.return_unit;
     | Error e ->
-        (* Logs.warn (fun f ->
+         Logs.warn (fun f ->
             f
               "Module Connection_tcp: Error reading data from established \
                connection: %a"
-              S.TCPV4.pp_error e ) ; *)
+              S.TCPV4.pp_error e ) ; 
+        ignore (Connection.fsm connection End_of_connection);
         Connection.close connection;
         Lwt.return_unit
     | Ok (`Data b) ->
         (* Logs.debug (fun f ->
             f "Module Connection_tcp: Read: %d bytes:\n%s" (Cstruct.len b)
               (Utils.buffer_to_string (Cstruct.to_bytes b)) ) ; *)
-        let action_list = Connection.fsm connection (Cstruct.to_bytes b) in
+        let action_list = Connection.fsm connection (Input_data(Cstruct.to_bytes b)) in
         let rec act actions =
           match actions with
           | [] ->
@@ -2256,33 +2268,30 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     Lwt_stream.peek buffer
     >>= function
     | None ->
-        Lwt.pause () >>= fun x -> process_output buffer flow connection
+        (* Stream closed *)
+        Logs.debug (fun f ->
+              f "Module Connection_tcp: Connection was instructed to close" ) ;
+          S.TCPV4.close flow
     | Some data -> (
-      match data with
-      | Command_data b -> (
-          (* Logs.debug (fun f ->
+      
+         Logs.debug (fun f ->
               f
                 "Module Connection_tcp: Connection mailbox Write %d bytes\n\
                  %s\n"
-                (Bytes.length b) (Utils.buffer_to_string b) ) ; *)
-          S.TCPV4.write flow (Cstruct.of_bytes b)
+                (Bytes.length data) (Utils.buffer_to_string data) ) ; 
+          S.TCPV4.write flow (Cstruct.of_bytes data)
           >>= function
           | Error _ ->
-              (* Logs.warn (fun f ->
+              Logs.warn (fun f ->
                   f
                     "Module Connection_tcp: Error writing data to established \
-                     connection." ) ; *)
+                     connection." ) ; 
               Connection.close connection ;
               Lwt.return_unit
           | Ok () ->
               Lwt_stream.junk buffer
-              >>= fun () ->
-              Lwt.pause () >>= fun () -> process_output buffer flow connection
+              >>= fun () -> process_output buffer flow connection
           )
-      | Command_close ->
-          (* Logs.debug (fun f ->
-              f "Module Connection_tcp: Connection was instructed to close" ) ; *)
-          S.TCPV4.close flow )
 
   (* End of helper functions *)
 
@@ -2302,9 +2311,9 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
   let listen s port socket =
     S.listen_tcpv4 s ~port (fun flow ->
         let dst, dst_port = S.TCPV4.dst flow in
-        (* Logs.debug (fun f ->
+        Logs.debug (fun f ->
             f "Module Connection_tcp: New tcp connection from IP %s on port %d"
-              (Ipaddr.V4.to_string dst) dst_port ) ; *)
+              (Ipaddr.V4.to_string dst) dst_port ) ;
         let connection =
           Connection.init socket
             (Security_mechanism.init
@@ -2336,9 +2345,10 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           let stream, pf = Lwt_stream.create () in
           Connection.set_send_pf connection pf ;
           Socket.add_connection !socket (ref connection) ;
-          Lwt.join
+          Lwt.pick
             [ start_connection flow connection
-            ; process_output stream flow connection ] )
+            ; process_output stream flow connection ]
+            )
         else (
           Socket.add_connection !socket (ref connection) ;
           start_connection flow connection ) ) ;
