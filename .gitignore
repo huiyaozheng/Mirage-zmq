@@ -37,6 +37,7 @@ main.ml
 myocamlbuild.ml
 src/dune-project
 *.ctf
+*.csv
 
 test/**/mirage_zmq.ml
 test/**/mirage_zmq.mli
