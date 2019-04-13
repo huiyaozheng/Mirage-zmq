@@ -8,7 +8,7 @@ module Main (S: Mirage_stack_lwt.V4) = struct
             Socket.bind socket 5556 s;
             let rec send content =
             try
-                Socket.send socket (Data(content));
+                Socket.send socket (Data(content)) >>= fun () ->
                 Logs.info (fun f -> f "Greeting sent");
                 Lwt.return_unit
             with No_Available_Peers -> Lwt.pause () >>= fun () -> send content

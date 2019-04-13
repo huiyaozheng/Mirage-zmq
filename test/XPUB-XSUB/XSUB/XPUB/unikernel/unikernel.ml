@@ -11,6 +11,6 @@ module Main (S: Mirage_stack_lwt.V4) = struct
                 | Data(msg) -> Logs.info (fun f -> f "Received msg: %s\n" msg);
                         read_and_print ()
                 | _ -> Logs.info (fun f -> f "Unexpected msg received\n");  Lwt.return_unit in
-            Logs.info (fun f -> f "Started socket\n"); Socket.subscribe socket "A"; Socket.send socket (Data("ABC")); read_and_print (); 
+            Logs.info (fun f -> f "Started socket\n"); Socket.subscribe socket "A"; Socket.send socket (Data("ABC")) >>= fun () -> read_and_print (); 
             
 end

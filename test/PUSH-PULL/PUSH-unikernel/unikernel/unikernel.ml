@@ -8,7 +8,7 @@ module Main (S: Mirage_stack_lwt.V4) = struct
             Socket.bind socket 5556 s;
             let rec send_jobs n =
             try
-                Socket.send socket (Data("Work item " ^ (string_of_int n)));
+                Socket.send socket (Data("Work item " ^ (string_of_int n))) >>= fun () ->
                 Logs.info (fun f -> f "work item sent");
                 send_jobs (n + 1)
             with No_Available_Peers -> Lwt.pause () >>= fun () -> send_jobs n

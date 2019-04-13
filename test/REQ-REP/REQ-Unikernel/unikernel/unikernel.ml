@@ -7,7 +7,7 @@ module Main (S: Mirage_stack_lwt.V4) = struct
         let socket = Socket.create_socket context REQ in
             Socket.connect socket "127.0.0.1" 5556 s >>= fun () ->
             let read_and_print : unit Lwt.t =
-                Socket.send socket (Data("World"));
+                Socket.send socket (Data("World")) >>= fun () ->
                 Socket.recv socket >>= fun msg -> match msg with
                 | Data(msg) -> Logs.info (fun f -> f "Received msg: %s\n" msg); 
                         Lwt.return_unit
