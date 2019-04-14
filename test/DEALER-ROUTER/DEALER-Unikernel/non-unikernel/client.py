@@ -3,7 +3,7 @@ import zmq
 context = zmq.Context()
 
 #  Socket to talk to server
-print("Connecting to server…")
+print("Starting server…")
 socket = context.socket(zmq.REP)
 socket.connect("tcp://127.0.0.1:5556")
 for i in range(10):
