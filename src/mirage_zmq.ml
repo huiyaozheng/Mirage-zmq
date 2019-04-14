@@ -300,21 +300,12 @@ end = struct
   let list_of_string msg =
     let length = String.length msg in
     (* Assume Sys.max_string_length < max_int *)
-    if length > 1020 then
+    if length > 255 then
       (* Make a LONG message *)
       [of_string msg ~if_long:true ~if_more:false]
     else
       (* Make short messages *)
-      let rec make msg list =
-        let length = String.length msg in
-        if length > 255 then
-          make
-            (String.sub msg 255 (length - 255))
-            ( of_string (String.sub msg 0 255) ~if_long:false ~if_more:true
-            :: list )
-        else of_string msg ~if_long:false ~if_more:false :: list
-      in
-      List.rev (make msg [])
+      [of_string msg ~if_long:false ~if_more:false]
 
   let to_frame t = Frame.make_frame t.body ~if_more:t.if_more ~if_command:false
 end
