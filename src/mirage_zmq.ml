@@ -1810,7 +1810,7 @@ end
 and Connection : sig
   type t
 
-  type action = Write of bytes | Continue | Close of string | Block
+  type action = Write of bytes | Close of string | Block
 
   val init : Socket.t ref -> Security_mechanism.t -> string -> t
   (** Create a new connection for socket with specified security mechanism *)
@@ -1849,7 +1849,7 @@ and Connection : sig
   val if_send_queue_full : t -> bool
   (** Returns whether the send queue is full (always false if unbounded size *)
 end = struct
-  type action = Write of bytes | Continue | Close of string | Block
+  type action = Write of bytes | Close of string | Block
 
   type subscription_message = Subscribe | Unsubscribe | Ignore
 
@@ -1906,7 +1906,7 @@ end = struct
     match data with
     | End_of_connection ->
         Queue.push None t.read_buffer ;
-        [Continue]
+        []
     | Input_data bytes -> (
       match t.stage with
       | GREETING -> (
@@ -2058,7 +2058,7 @@ end = struct
           match frames with
           | [] ->
               t.previous_fragment <- fragment ;
-              [Continue]
+              []
           | frame :: _ ->
               (* assume only one command is received at a time *)
               t.previous_fragment <- fragment ;
@@ -2075,7 +2075,7 @@ end = struct
                   | Security_mechanism.Write b ->
                       Write b :: convert tl
                   | Security_mechanism.Continue ->
-                      Continue :: convert tl
+                      convert tl
                   | Security_mechanism.Ok ->
                       (* Logs.debug (fun f -> f "Module Connection: Handshake OK\n") ; *)
                       t.stage <- TRAFFIC ;
@@ -2164,21 +2164,21 @@ end = struct
                 < Socket.get_incoming_queue_size !(t.socket)
               then (
                 List.iter (fun x -> Queue.push (Some x) t.read_buffer) frames ;
-                [Continue] )
+                [] )
               else [Block]
             else (
               List.iter (fun x -> Queue.push (Some x) t.read_buffer) frames ;
-              [Continue] )
+              [] )
           in
           match Socket.get_socket_type !(t.socket) with
           | PUB ->
-              manage_subscription () ; [Continue]
+              manage_subscription () ; []
           | XPUB -> (
               (* TODO check XPUB's behaviour *)
               enqueue ()
               |> function
-              | [Continue] ->
-                  manage_subscription () ; [Continue]
+              | [] ->
+                  manage_subscription () ; []
               | [Block] ->
                   [Block]
               | _ ->
@@ -2269,7 +2269,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             | hd :: tl -> (
               match hd with
               | Connection.Block ->
-                  act ()
+                  Lwt.pause () >>= fun () -> act ()
               | Connection.Write b -> (
                   (* Logs.debug (fun f ->
                     f
@@ -2286,10 +2286,6 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                       Lwt.return_unit
                   | Ok () ->
                       deal_with_action_list tl )
-              | Connection.Continue ->
-                  (* Logs.debug (fun f ->
-                    f "Module Connection_tcp: Connection FSM Continue\n" ) ; *)
-                  deal_with_action_list tl
               | Connection.Close s ->
                   (* Logs.debug (fun f ->
                       f
