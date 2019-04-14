@@ -1,0 +1,1 @@
+g++ local_lat.cpp -O2 -lzmq --std=c++14 -o rep
