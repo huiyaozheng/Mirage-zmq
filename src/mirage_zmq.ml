@@ -699,11 +699,15 @@ end = struct
       if if_send_to connection then
         try Connection.send connection frames_to_send
         with (* Drop message when queue full *)
-        | Queue_overflow -> ()
-      else ()
+        | Queue_overflow ->
+          Lwt.return_unit
+      else Lwt.return_unit
     in
     Queue.iter
-      (fun x -> if Connection.get_stage !x = TRAFFIC then publish !x else ())
+      (fun x ->
+        if Connection.get_stage !x = TRAFFIC then
+          Lwt.async (fun () -> publish !x)
+        else () )
       connections
 
   let subscription_frame content =
@@ -719,7 +723,8 @@ end = struct
   let rec send_message_to_all_active_connections connections frame =
     Queue.iter
       (fun x ->
-        if Connection.get_stage !x = TRAFFIC then Connection.send !x [frame] )
+        if Connection.get_stage !x = TRAFFIC then
+          Lwt.async (fun () -> Connection.send !x [frame]) )
       connections
 
   (* End of helper functions *)
@@ -1142,22 +1147,23 @@ end = struct
               else
                 let rec find_and_send connections =
                   let head = !(Queue.peek connections) in
-                  if tag = Connection.get_tag head then (
-                    if Connection.get_stage head = TRAFFIC then
+                  if tag = Connection.get_tag head then
+                    if Connection.get_stage head = TRAFFIC then (
                       Connection.send head
                         ( address_envelope
                         @ Frame.delimiter_frame
                           :: List.map
                                (fun x -> Message.to_frame x)
                                (Message.list_of_string msg) )
-                    else () ;
-                    t.socket_states
-                    <- Rep
-                         { if_received= false
-                         ; last_received_connection_tag= ""
-                         ; address_envelope= [] } ;
-                    rotate t.connections false ;
-                    Lwt.return_unit )
+                      >>= fun () ->
+                      t.socket_states
+                      <- Rep
+                           { if_received= false
+                           ; last_received_connection_tag= ""
+                           ; address_envelope= [] } ;
+                      rotate t.connections false ;
+                      Lwt.return_unit )
+                    else Lwt.return_unit
                   else
                     raise
                       (Internal_Error "Send target no longer at head of queue")
@@ -1189,7 +1195,8 @@ end = struct
                       ( Frame.delimiter_frame
                       :: List.map
                            (fun x -> Message.to_frame x)
-                           (Message.list_of_string msg) ) ;
+                           (Message.list_of_string msg) )
+                    >>= fun () ->
                     t.socket_states
                     <- Req
                          { if_sent= true
@@ -1201,6 +1208,7 @@ end = struct
       | _ ->
           raise (Incorrect_use_of_API "REP sends [Data(string)]") )
     | DEALER -> (
+      (* TODO investigate DEALER dropping messages *)
       match msg with
       | Data msg -> (
           let state = t.socket_states in
@@ -1214,14 +1222,16 @@ end = struct
                     raise No_Available_Peers
                 | Some connection -> (
                   try
-                    Connection.send connection
+                    Connection.send connection ~wait_until_sent:true
                       ( Frame.delimiter_frame
                       :: List.map
                            (fun x -> Message.to_frame x)
-                           (Message.list_of_string msg) ) ;
+                           (Message.list_of_string msg) )
+                    >>= fun () ->
                     Queue.push
                       (Connection.get_tag connection)
                       request_order_queue ;
+                    Logs.debug (fun f -> f "Message sent");
                     rotate t.connections false ;
                     Lwt.return_unit
                   with Queue_overflow ->
@@ -1252,9 +1262,7 @@ end = struct
                       (fun x -> Message.to_frame x)
                       (Message.list_of_string msg)
                 in
-                try
-                  Connection.send connection frame_list ;
-                  Lwt.return_unit
+                try Connection.send connection frame_list
                 with (* Drop message when queue full *)
                 | Queue_overflow ->
                   Lwt.return_unit ) )
@@ -1320,9 +1328,8 @@ end = struct
                   Connection.send connection
                     (List.map
                        (fun x -> Message.to_frame x)
-                       (Message.list_of_string msg)) ;
-                  rotate t.connections false ;
-                  Lwt.return_unit
+                       (Message.list_of_string msg))
+                  >>= fun () -> rotate t.connections false ; Lwt.return_unit
                 with Queue_overflow -> send t (Data msg) ) )
         | _ ->
             raise Should_Not_Reach )
@@ -1347,8 +1354,7 @@ end = struct
                   Connection.send connection
                     (List.map
                        (fun x -> Message.to_frame x)
-                       (Message.list_of_string msg)) ;
-                  Lwt.return_unit
+                       (Message.list_of_string msg))
                 with Queue_overflow -> send t (Data msg)
               else raise No_Available_Peers
         | _ ->
@@ -1845,7 +1851,7 @@ and Connection : sig
   val fsm : t -> connection_fsm_data -> action list
   (** FSM for handing raw bytes transmission *)
 
-  val send : t -> Frame.t list -> unit
+  val send : t -> ?wait_until_sent:bool -> Frame.t list -> unit Lwt.t
   (** Send the list of frames to underlying connection *)
 
   val close : t -> unit
@@ -2201,21 +2207,33 @@ end = struct
     t.stage <- CLOSED ;
     Queue.push None t.send_buffer
 
-  let send t msg_list =
+  let send t ?(wait_until_sent = false) msg_list =
     if not (Socket.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
-    then
+    then (
       (* Unbounded sending queue *)
       List.iter
         (fun x -> Queue.push (Some (Frame.to_bytes x)) t.send_buffer)
-        msg_list
+        msg_list ;
+      if wait_until_sent then
+        let rec check () =
+          if Queue.is_empty t.send_buffer then Lwt.return_unit
+          else Lwt.pause () >>= fun () -> check ()
+        in
+        check ()
+      else Lwt.return_unit )
     else if
       (* Sending queue of limited size *)
       Queue.length t.send_buffer < Socket.get_outgoing_queue_size !(t.socket)
-    then
-      Lwt.async (fun () ->
-          let bytes = List.map (fun x -> Frame.to_bytes x) msg_list in
-          List.iter (fun x -> Queue.push (Some x) t.send_buffer) bytes ;
-          Lwt.return_unit )
+    then (
+      let bytes = List.map (fun x -> Frame.to_bytes x) msg_list in
+      List.iter (fun x -> Queue.push (Some x) t.send_buffer) bytes ;
+      if wait_until_sent then
+        let rec check () =
+          if Queue.is_empty t.send_buffer then Lwt.return_unit
+          else Lwt.pause () >>= fun () -> check ()
+        in
+        check ()
+      else Lwt.return_unit )
     else (* Overflowing sending queue *)
       raise Queue_overflow
 
