@@ -414,7 +414,7 @@ module rec Socket : sig
 
   val send_blocking : t -> message -> unit Lwt.t
 
-  val add_connection : t -> Connection.t ref -> unit
+  val add_connection : t -> Connection.t -> unit
 
   val initial_traffic_messages : t -> Frame.t list
   (** Get the messages to send at the beginning of a connection, e.g. subscriptions *)
@@ -441,7 +441,7 @@ end = struct
     ; mutable metadata: socket_metadata
     ; security_mechanism: mechanism_type
     ; mutable security_info: security_data
-    ; mutable connections: Connection.t ref Queue.t
+    ; mutable connections: Connection.t Queue.t
     ; mutable socket_states: socket_states
     ; mutable incoming_queue_size: int option
     ; mutable outgoing_queue_size: int option }
@@ -532,6 +532,12 @@ end = struct
   let rec find_available_connection connections =
     if Queue.is_empty connections then None
     else
+      if Queue.length connections = 1 then
+        let head = (Queue.peek connections) in
+        if Connection.get_stage head <> TRAFFIC
+            || Connection.if_send_queue_full head then
+            Some head else None
+      else
       let buffer_queue = Queue.create () in
       let rec rotate () =
         if Queue.is_empty connections then (
@@ -540,14 +546,14 @@ end = struct
         else
           let head = Queue.peek connections in
           if
-            Connection.get_stage !head <> TRAFFIC
-            || Connection.if_send_queue_full !head
+            Connection.get_stage head <> TRAFFIC
+            || Connection.if_send_queue_full head
           then (
             Queue.push (Queue.pop connections) buffer_queue ;
             rotate () )
           else (
             Queue.transfer buffer_queue connections ;
-            Some !head )
+            Some head )
       in
       rotate ()
 
@@ -572,12 +578,11 @@ end = struct
     This functions returns the Connection.t with the compare function if found *)
   let find_connection connections comp =
     Queue.fold
-      (fun accum connection_ref ->
+      (fun accum connection ->
         match accum with
         | Some _ ->
             accum
         | None ->
-            let connection = !connection_ref in
             if comp connection then Some connection else accum )
       None connections
 
@@ -586,7 +591,7 @@ end = struct
   let rec find_connection_with_incoming_buffer connections =
     if Queue.is_empty connections then Lwt.return None
     else
-      let head = !(Queue.peek connections) in
+      let head = (Queue.peek connections) in
       if Connection.get_stage head = TRAFFIC then
         let buffer = Connection.get_read_buffer head in
         if Queue.is_empty buffer then (
@@ -705,8 +710,8 @@ end = struct
     in
     Queue.iter
       (fun x ->
-        if Connection.get_stage !x = TRAFFIC then
-          Lwt.async (fun () -> publish !x)
+        if Connection.get_stage x = TRAFFIC then
+          Lwt.async (fun () -> publish x)
         else () )
       connections
 
@@ -723,8 +728,8 @@ end = struct
   let rec send_message_to_all_active_connections connections frame =
     Queue.iter
       (fun x ->
-        if Connection.get_stage !x = TRAFFIC then
-          Lwt.async (fun () -> Connection.send !x [frame]) )
+        if Connection.get_stage x = TRAFFIC then
+          Lwt.async (fun () -> Connection.send x [frame]) )
       connections
 
   (* End of helper functions *)
@@ -998,7 +1003,7 @@ end = struct
               (Incorrect_use_of_API "Need to send a request before receiving")
           else
             let rec find_and_send connections =
-              let head = !(Queue.peek connections) in
+              let head = (Queue.peek connections) in
               if tag = Connection.get_tag head then
                 if Connection.get_stage head = TRAFFIC then (
                   get_frame_list head
@@ -1115,7 +1120,7 @@ end = struct
       | Pair {connected} ->
           if Queue.is_empty t.connections then raise No_Available_Peers
           else
-            let connection = !(Queue.peek t.connections) in
+            let connection = (Queue.peek t.connections) in
             if connected && Connection.get_stage connection = TRAFFIC then
               get_frame_list connection
               >>= function
@@ -1155,7 +1160,7 @@ end = struct
                        "Need to receive a request before sending a message")
                 else
                   let rec find_and_send connections =
-                    let head = !(Queue.peek connections) in
+                    let head = (Queue.peek connections) in
                     if tag = Connection.get_tag head then
                       if Connection.get_stage head = TRAFFIC then (
                         Connection.send head
@@ -1335,7 +1340,7 @@ end = struct
           | Pair {connected} ->
               if Queue.is_empty t.connections then raise No_Available_Peers
               else
-                let connection = !(Queue.peek t.connections) in
+                let connection = (Queue.peek t.connections) in
                 if
                   connected
                   && Connection.get_stage connection = TRAFFIC
@@ -2360,11 +2365,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
           Socket.if_has_outgoing_queue
             (Socket.get_socket_type !(Connection.get_socket connection))
         then (
-          Socket.add_connection !socket (ref connection) ;
+          Socket.add_connection !socket connection ;
           Lwt.join
             [start_connection flow connection; process_output flow connection] )
         else (
-          Socket.add_connection !socket (ref connection) ;
+          Socket.add_connection !socket connection ;
           start_connection flow connection ) ) ;
     S.listen s
 
@@ -2481,6 +2486,6 @@ end = struct
            (Socket.get_metadata t.socket))
         (C_tcp.tag_of_tcp_connection ipaddr port)
     in
-    Socket.add_connection t.socket (ref connection) ;
+    Socket.add_connection t.socket connection ;
     C_tcp.connect s ipaddr port connection
 end
