@@ -1,0 +1,1 @@
+g++ remote_thr.cpp -O2 -lzmq --std=c++14 -o push

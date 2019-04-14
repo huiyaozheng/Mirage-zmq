@@ -1,0 +1,1 @@
+g++ local_thr.cpp -O2 -lzmq --std=c++14 -o pull

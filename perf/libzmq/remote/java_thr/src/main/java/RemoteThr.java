@@ -1,5 +1,3 @@
-package perf;
-
 import zmq.Ctx;
 import zmq.Msg;
 import zmq.SocketBase;
