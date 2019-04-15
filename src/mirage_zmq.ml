@@ -615,6 +615,7 @@ end = struct
             else Lwt.return (Some (next_frame :: list))
       with Queue.Empty ->
         (* Wait for more frames to come *)
+        (* TODO check lock *)
         Lwt.pause () >>= fun () -> get_reverse_frame_list_accumu list
     in
     get_reverse_frame_list_accumu []
@@ -661,6 +662,7 @@ end = struct
               get_reverse_frame_list_accumu (next_frame :: list)
             else Lwt.return (Some (next_frame :: list))
       with Queue.Empty ->
+        (* TODO check lock *)
         Lwt.pause () >>= fun () -> get_reverse_frame_list_accumu list
     in
     get_reverse_frame_list_accumu []
@@ -2317,6 +2319,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                   f
                     "Module Connection_tcp: Error writing data to established \
                      connection." ) ;*)
+              Queue.push None (Connection.get_read_buffer connection);
               Connection.close connection ;
               Lwt.return_unit
           | Ok () ->
@@ -2335,6 +2338,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             f
               "Module Connection_tcp: Error writing data to established \
                connection." ) ; *)
+        Queue.push None (Connection.get_read_buffer connection);
         Lwt.return_unit
     | Ok () ->
         process_input flow connection
