@@ -31,7 +31,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include<thread>
+#include<chrono>
 int main (int argc, char *argv[])
 {
     const char *connect_to;
@@ -80,9 +81,12 @@ int main (int argc, char *argv[])
     }
     memset (zmq_msg_data (&msg), 0, message_size);
 
+     rc = zmq_sendmsg (s, &msg, 0);
+     rc = zmq_recvmsg (s, &msg, 0);
+
     watch = zmq_stopwatch_start ();
 
-    for (i = 0; i != roundtrip_count; i++) {
+    for (i = 1; i != roundtrip_count; i++) {
         rc = zmq_sendmsg (s, &msg, 0);
         if (rc < 0) {
             printf ("error in zmq_sendmsg: %s\n", zmq_strerror (errno));
@@ -97,6 +101,7 @@ int main (int argc, char *argv[])
             printf ("message of incorrect size received\n");
             return -1;
         }
+        //std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     elapsed = zmq_stopwatch_stop (watch);
@@ -107,7 +112,7 @@ int main (int argc, char *argv[])
         return -1;
     }
 
-    latency = (double) elapsed / (roundtrip_count);
+    latency = (double) elapsed / (roundtrip_count - 1);
 
     printf ("message size: %d [B]\n", (int) message_size);
     printf ("roundtrip count: %d\n", (int) roundtrip_count);
