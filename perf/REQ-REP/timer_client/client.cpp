@@ -7,7 +7,7 @@
 using namespace std;
 const int NO_OF_REQ = 100000;
 const int NO_OF_THREADS = 100;
-auto target_address = "tcp://10.0.0.2:5555";
+auto target_address = "tcp://192.168.122.153:5555";
 auto msg_length = 255;
 auto msg =
     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -32,11 +32,6 @@ void req_worker(int index) {
 }
 
 int main(int argc, char *argv[]) {
-  if (argc != 2) {
-    cout << "A CSV filename is needed" << endl;
-    return 0;
-  }
-
   thread t[NO_OF_THREADS];
   for (int i = 0; i < NO_OF_THREADS; ++i) {
     t[i] = thread(req_worker, i);
