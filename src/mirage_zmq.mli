@@ -34,7 +34,7 @@ type socket_type =
 (** Secuirty mechanism types; CURVE not implemented *)
 type mechanism_type = NULL | PLAIN
 
-type message = Data of string | Identity_and_data of string * string
+type message_type = Data of string | Identity_and_data of string * string
 
 (** A context is essentially a set of options shared by a group of socket *)
 module Context : sig
@@ -78,13 +78,13 @@ module Socket_tcp (S : Mirage_stack_lwt.V4) : sig
   val unsubscribe : t -> string -> unit
   (** Remove a subscription filter from SUB/XSUB socket *)
 
-  val recv : t -> message Lwt.t
+  val recv : t -> message_type Lwt.t
   (** Receive a msg from the underlying connections, according to the semantics of the socket type *)
 
-  val send : t -> message -> unit Lwt.t
+  val send : t -> message_type -> unit Lwt.t
   (** Send a msg to the underlying connections, according to the semantics of the socket type *)
 
-  val send_blocking : t -> message -> unit Lwt.t
+  val send_blocking : t -> message_type -> unit Lwt.t
   (** Send a msg to the underlying connections. It blocks until a peer is available *)
 
   val bind : t -> int -> S.t -> unit
