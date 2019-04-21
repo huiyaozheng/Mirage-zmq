@@ -303,8 +303,7 @@ end = struct
     if length > 255 then
       (* Make a LONG message *)
       [of_string msg ~if_long:true ~if_more:false]
-    else
-      (* Make short messages *)
+    else (* Make short messages *)
       [of_string msg ~if_long:false ~if_more:false]
 
   let to_frame t = Frame.make_frame t.body ~if_more:t.if_more ~if_command:false
@@ -562,15 +561,20 @@ end = struct
   (* connections is a queue of Connection.t ref. 
     This functions returns the Connection.t with the compare function if found *)
   let find_connection connections comp =
-    Queue.fold
-      (fun accum connection_ref ->
-        match accum with
-        | Some _ ->
-            accum
-        | None ->
-            let connection = !connection_ref in
-            if comp connection then Some connection else accum )
-      None connections
+    if not (Queue.is_empty connections) then
+      let head = Queue.peek connections in
+      if comp !head then Some !head
+      else
+        Queue.fold
+          (fun accum connection_ref ->
+            match accum with
+            | Some _ ->
+                accum
+            | None ->
+                let connection = !connection_ref in
+                if comp connection then Some connection else accum )
+          None connections
+    else None
 
   (* Rotate a queue until the front connection has non-empty incoming buffer.
     Will rotate indefinitely until return, unless queue is empty at start*)
@@ -2314,7 +2318,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
                   f
                     "Module Connection_tcp: Error writing data to established \
                      connection." ) ;*)
-              Queue.push None (Connection.get_read_buffer connection);
+              Queue.push None (Connection.get_read_buffer connection) ;
               Connection.close connection ;
               Lwt.return_unit
           | Ok () ->
@@ -2333,7 +2337,7 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
             f
               "Module Connection_tcp: Error writing data to established \
                connection." ) ; *)
-        Queue.push None (Connection.get_read_buffer connection);
+        Queue.push None (Connection.get_read_buffer connection) ;
         Lwt.return_unit
     | Ok () ->
         process_input flow connection
