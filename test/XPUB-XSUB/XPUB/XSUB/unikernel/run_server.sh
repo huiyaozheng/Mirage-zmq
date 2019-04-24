@@ -1,1 +1,0 @@
-./xpub_unikernel -l "*:debug"

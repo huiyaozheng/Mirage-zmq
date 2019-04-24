@@ -1,1 +1,0 @@
-./pair_unikernel -l "*:debug"

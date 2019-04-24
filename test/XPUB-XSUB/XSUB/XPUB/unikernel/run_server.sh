@@ -1,1 +1,0 @@
-./xsub_unikernel -l "*:debug"
