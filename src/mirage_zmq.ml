@@ -1944,7 +1944,7 @@ end = struct
                     Security_mechanism.get_as_client t.handshake_state
                     && not t.incoming_as_server
                     (* TODO check validity of the logic *)
-                  then [] (*[Close "Other end is not a server"]*)
+                  then convert tl (*[Close "Other end is not a server"]*)
                   else convert tl
               (* Assume security mechanism is pre-set*)
               | Greeting.Check_mechanism s ->
@@ -2236,7 +2236,10 @@ end = struct
       raise Queue_overflow
 
   let if_send_queue_full t =
-    Queue.length t.send_buffer >= Socket.get_outgoing_queue_size !(t.socket)
+    if not (Socket.if_queue_size_limited (Socket.get_socket_type !(t.socket)))
+    then false
+    else
+      Queue.length t.send_buffer >= Socket.get_outgoing_queue_size !(t.socket)
 end
 
 module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
