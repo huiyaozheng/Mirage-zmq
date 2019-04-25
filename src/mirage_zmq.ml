@@ -15,6 +15,8 @@
  *)
 open Lwt.Infix
 
+let print_debug_logs = true
+
 let default_queue_size = 1000
 
 exception No_Available_Peers
@@ -1228,7 +1230,8 @@ end = struct
                       Queue.push
                         (Connection.get_tag connection)
                         request_order_queue ;
-                      Logs.debug (fun f -> f "Message sent") ;
+                      if print_debug_logs then
+                        Logs.debug (fun f -> f "Message sent") ;
                       rotate t.connections false ;
                       Lwt.return_unit
                     with Queue_overflow ->
@@ -1921,7 +1924,8 @@ end = struct
             | _ ->
                 false
           in
-          (* Logs.debug (fun f -> f "Module Connection: Greeting -> FSM\n") ;*)
+          if print_debug_logs then
+            Logs.debug (fun f -> f "Module Connection: Greeting -> FSM\n") ;
           if if_pair then Socket.set_pair_connected !(t.socket) true ;
           let len = Bytes.length bytes in
           let rec convert greeting_action_list =
@@ -1939,7 +1943,8 @@ end = struct
                   else if
                     Security_mechanism.get_as_client t.handshake_state
                     && not t.incoming_as_server
-                  then [Close "Other end is not a server"]
+                    (* TODO check validity of the logic *)
+                  then [] (*[Close "Other end is not a server"]*)
                   else convert tl
               (* Assume security mechanism is pre-set*)
               | Greeting.Check_mechanism s ->
@@ -1949,7 +1954,8 @@ end = struct
               | Greeting.Continue ->
                   convert tl
               | Greeting.Ok ->
-                  (* Logs.debug (fun f -> f "Module Connection: Greeting OK\n") ; *)
+                  if print_debug_logs then
+                    Logs.debug (fun f -> f "Module Connection: Greeting OK\n") ;
                   t.stage <- HANDSHAKE ;
                   if
                     Security_mechanism.if_send_command_after_greeting
@@ -2048,7 +2054,8 @@ end = struct
                 in
                 action_list_1 @ action_list_2 )
       | HANDSHAKE -> (
-          (* Logs.debug (fun f -> f "Module Connection: Handshake -> FSM\n") ; *)
+          if print_debug_logs then
+            Logs.debug (fun f -> f "Module Connection: Handshake -> FSM\n") ;
           let frames, fragment =
             Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
           in
@@ -2074,7 +2081,9 @@ end = struct
                   | Security_mechanism.Continue ->
                       convert tl
                   | Security_mechanism.Ok ->
-                      (* Logs.debug (fun f -> f "Module Connection: Handshake OK\n") ; *)
+                      if print_debug_logs then
+                        Logs.debug (fun f ->
+                            f "Module Connection: Handshake OK\n" ) ;
                       t.stage <- TRAFFIC ;
                       let frames =
                         Socket.initial_traffic_messages !(t.socket)
@@ -2099,16 +2108,19 @@ end = struct
                         t.incoming_identity <- value ;
                         convert tl
                     | _ ->
-                        (* Logs.debug (fun f ->
-                          f "Module Connection: Ignore unknown property %s\n"
-                            name ) ;*)
+                        if print_debug_logs then
+                          Logs.debug (fun f ->
+                              f
+                                "Module Connection: Ignore unknown property %s\n"
+                                name ) ;
                         convert tl ) )
               in
               let actions = convert actions in
               t.handshake_state <- new_state ;
               actions )
       | TRAFFIC -> (
-          (* Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ; *)
+          if print_debug_logs then
+            Logs.debug (fun f -> f "Module Connection: TRAFFIC -> FSM\n") ;
           let frames, fragment =
             Frame.list_of_bytes (Bytes.cat t.previous_fragment bytes)
           in
@@ -2239,23 +2251,27 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
     S.TCPV4.read flow
     >>= function
     | Ok `Eof ->
-        (* Logs.debug (fun f -> f "Module Connection_tcp: Closing connection EOF") ; *)
+        if print_debug_logs then
+          Logs.debug (fun f ->
+              f "Module Connection_tcp: Closing connection EOF" ) ;
         ignore (Connection.fsm connection End_of_connection) ;
         Connection.close connection ;
         Lwt.return_unit
     | Error e ->
-        (* Logs.warn (fun f ->
-            f
-              "Module Connection_tcp: Error reading data from established \
-               connection: %a"
-              S.TCPV4.pp_error e ) ; *)
+        if print_debug_logs then
+          Logs.warn (fun f ->
+              f
+                "Module Connection_tcp: Error reading data from established \
+                 connection: %a"
+                S.TCPV4.pp_error e ) ;
         ignore (Connection.fsm connection End_of_connection) ;
         Connection.close connection ;
         Lwt.return_unit
     | Ok (`Data b) ->
-        (* Logs.debug (fun f ->
-            f "Module Connection_tcp: Read: %d bytes:\n%s" (Cstruct.len b)
-              (Utils.buffer_to_string (Cstruct.to_bytes b)) ) ; *)
+        if print_debug_logs then
+          Logs.debug (fun f ->
+              f "Module Connection_tcp: Read: %d bytes:\n%s" (Cstruct.len b)
+                (Utils.buffer_to_string (Cstruct.to_bytes b)) ) ;
         let bytes = Cstruct.to_bytes b in
         let rec act () =
           let actions = Connection.fsm connection (Input_data bytes) in
@@ -2268,26 +2284,30 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
               | Connection.Block ->
                   Lwt.pause () >>= fun () -> act ()
               | Connection.Write b -> (
-                  (* Logs.debug (fun f ->
-                    f
-                      "Module Connection_tcp: Connection FSM Write %d bytes\n\
-                       %s\n"
-                      (Bytes.length b) (Utils.buffer_to_string b) ) ; *)
+                  if print_debug_logs then
+                    Logs.debug (fun f ->
+                        f
+                          "Module Connection_tcp: Connection FSM Write %d bytes\n\
+                           %s\n"
+                          (Bytes.length b) (Utils.buffer_to_string b) ) ;
                   S.TCPV4.write flow (Cstruct.of_bytes b)
                   >>= function
                   | Error _ ->
-                      (* Logs.warn (fun f ->
-                        f
-                          "Module Connection_tcp: Error writing data to \
-                           established connection." ) ; *)
+                      if print_debug_logs then
+                        Logs.warn (fun f ->
+                            f
+                              "Module Connection_tcp: Error writing data to \
+                               established connection." ) ;
                       Lwt.return_unit
                   | Ok () ->
                       deal_with_action_list tl )
               | Connection.Close s ->
-                  (* Logs.debug (fun f ->
-                      f
-                        "Module Connection_tcp: Connection FSM Close due to: %s\n"
-                        s ) ; *)
+                  if print_debug_logs then
+                    Logs.debug (fun f ->
+                        f
+                          "Module Connection_tcp: Connection FSM Close due \
+                           to: %s\n"
+                          s ) ;
                   Lwt.return_unit )
           in
           deal_with_action_list actions
@@ -2301,23 +2321,27 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
       |> function
       | None ->
           (* Stream closed *)
-          (* Logs.debug (fun f ->
-              f "Module Connection_tcp: Connection was instructed to close" ) ; *)
+          if print_debug_logs then
+            Logs.debug (fun f ->
+                f "Module Connection_tcp: Connection was instructed to close"
+            ) ;
           S.TCPV4.close flow
       | Some data -> (
-          (* Logs.debug (fun f ->
-              f
-                "Module Connection_tcp: Connection mailbox Write %d bytes\n\
-                 %s\n"
-                (Bytes.length data)
-                (Utils.buffer_to_string data) ) ; *)
+          if print_debug_logs then
+            Logs.debug (fun f ->
+                f
+                  "Module Connection_tcp: Connection mailbox Write %d bytes\n\
+                   %s\n"
+                  (Bytes.length data)
+                  (Utils.buffer_to_string data) ) ;
           S.TCPV4.write flow (Cstruct.of_bytes data)
           >>= function
           | Error _ ->
-              (* Logs.warn (fun f ->
-                  f
-                    "Module Connection_tcp: Error writing data to established \
-                     connection." ) ;*)
+              if print_debug_logs then
+                Logs.warn (fun f ->
+                    f
+                      "Module Connection_tcp: Error writing data to \
+                       established connection." ) ;
               Queue.push None (Connection.get_read_buffer connection) ;
               Connection.close connection ;
               Lwt.return_unit
@@ -2333,10 +2357,11 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
       (Cstruct.of_bytes (Connection.greeting_message connection))
     >>= function
     | Error _ ->
-        (* Logs.warn (fun f ->
-            f
-              "Module Connection_tcp: Error writing data to established \
-               connection." ) ; *)
+        if print_debug_logs then
+          Logs.warn (fun f ->
+              f
+                "Module Connection_tcp: Error writing data to established \
+                 connection." ) ;
         Queue.push None (Connection.get_read_buffer connection) ;
         Lwt.return_unit
     | Ok () ->
@@ -2345,9 +2370,12 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
   let listen s port socket =
     S.listen_tcpv4 s ~port (fun flow ->
         let dst, dst_port = S.TCPV4.dst flow in
-        (*Logs.debug (fun f ->
-            f "Module Connection_tcp: New tcp connection from IP %s on port %d"
-              (Ipaddr.V4.to_string dst) dst_port ) ; *)
+        if print_debug_logs then
+          Logs.debug (fun f ->
+              f
+                "Module Connection_tcp: New tcp connection from IP %s on port \
+                 %d"
+                (Ipaddr.V4.to_string dst) dst_port ) ;
         let connection =
           Connection.init socket
             (Security_mechanism.init
@@ -2388,11 +2416,12 @@ module Connection_tcp (S : Mirage_stack_lwt.V4) = struct
         in
         wait_until_traffic ()
     | Error e ->
-        (* Logs.warn (fun f ->
-            f
-              "Module Connection_tcp: Error establishing connection: %a, \
-               retrying"
-              S.TCPV4.pp_error e ) ; *)
+        if print_debug_logs then
+          Logs.warn (fun f ->
+              f
+                "Module Connection_tcp: Error establishing connection: %a, \
+                 retrying"
+                S.TCPV4.pp_error e ) ;
         connect s addr port connection
 end
 
