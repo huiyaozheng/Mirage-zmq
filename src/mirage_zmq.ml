@@ -15,7 +15,7 @@
  *)
 open Lwt.Infix
 
-let print_debug_logs = true
+let print_debug_logs = false
 
 let default_queue_size = 1000
 
