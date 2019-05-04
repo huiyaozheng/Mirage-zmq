@@ -7,7 +7,7 @@ module Main (S: Mirage_stack_lwt.V4) = struct
         let socket = Socket.create_socket context PULL in
             Socket.connect socket "127.0.0.1" 5556 s >>= fun () ->
             let rec read_and_print () =
-                Socket.recv socket >>= fun msg -> match msg with
+                Socket.recv socket >>= function
                 | Data(msg) -> Logs.info (fun f -> f "Received msg: %s\n" msg);
                         read_and_print ()
                 | _ -> Logs.info (fun f -> f "Unexpected msg received\n");  Lwt.return_unit

@@ -13,7 +13,7 @@ module Main (S: Mirage_stack_lwt.V4) = struct
                 Lwt.return_unit
             with No_Available_Peers -> Lwt.pause () >>= fun () -> send content
             in let recv () =
-                Socket.recv socket >>= fun msg -> match msg with
+                Socket.recv socket >>= function
                 | Data(msg) -> Logs.info (fun f -> f "Received msg: %s\n" msg); Lwt.return_unit
                 | _ -> Logs.info (fun f -> f "Unexpected msg received\n"); Lwt.return_unit
             in Logs.info (fun f -> f "Started socket\n"); send "Hi there" >>= fun () -> recv ();

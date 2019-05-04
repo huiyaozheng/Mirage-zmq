@@ -8,7 +8,7 @@ module Main (S: Mirage_stack_lwt.V4) = struct
             Socket.bind socket 5555 s;
             let rec read_and_print () =
                 Logs.info (fun f -> f "Started socket\n"); 
-                Socket.recv socket >>= fun msg -> match msg with
+                Socket.recv socket >>= function
                 | Data(msg) -> Logs.info (fun f -> f "Received msg: %s\n" msg); 
                         Socket.send socket (Data("World")) >>= fun () ->
                         read_and_print ();
