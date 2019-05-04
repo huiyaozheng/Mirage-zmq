@@ -1,0 +1,1 @@
+./req_client -l "*:debug"
