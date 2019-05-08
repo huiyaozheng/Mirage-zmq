@@ -5,6 +5,6 @@ let main = foreign ~packages:[package "mirage-zmq"] "Unikernel.Main" (stackv4 @-
 let stack = generic_stackv4 default_network
 
 let () =
-  register "dealer_server"  [
+  register "dealer_unikernel"  [
     main $ stack
   ]

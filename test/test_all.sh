@@ -5,3 +5,4 @@ XSUB/test.sh
 PULL/test.sh
 PUSH/test.sh
 PAIR/test.sh
+REP/test.sh
