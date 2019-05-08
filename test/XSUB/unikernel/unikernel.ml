@@ -9,8 +9,8 @@ module Main (S: Mirage_stack_lwt.V4) = struct
             let rec read_and_print () =
                 Socket.recv socket >>= function
                 | Data(msg) -> Logs.info (fun f -> f "Received msg: %s\n" msg);
-                        read_and_print ()
+                        Lwt.return_unit;
                 | _ -> Logs.info (fun f -> f "Unexpected msg received\n");  Lwt.return_unit in
-            Logs.info (fun f -> f "Started socket\n"); Socket.subscribe socket "A"; Socket.send socket (Data("ABC")) >>= fun () -> read_and_print (); 
+            Logs.info (fun f -> f "Started socket"); Socket.subscribe socket "A"; Socket.send socket (Data("ABC")) >>= fun () -> read_and_print (); 
             
 end

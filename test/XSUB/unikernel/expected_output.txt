@@ -1,0 +1,4 @@
+Manager: connect$
+Manager: configuring$
+Started socket$
+Received msg: A.*$
