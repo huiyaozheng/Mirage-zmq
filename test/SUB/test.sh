@@ -10,8 +10,6 @@ FD1=7
 FD2=8
 file="output1.tmp"
 file_regex="SUB/unikernel/expected_output.txt"
-eof1=0
-eof2=0
 pass=true
 exec 7<$file
 exec 8<$file_regex
@@ -46,8 +44,6 @@ FD1=7
 FD2=8
 file="output1.tmp"
 file_regex="SUB/unikernel/expected_output.txt"
-eof1=0
-eof2=0
 pass=true
 exec 7<$file
 exec 8<$file_regex
@@ -81,8 +77,6 @@ FD1=7
 FD2=8
 file="output1.tmp"
 file_regex="SUB/unikernel/expected_output.txt"
-eof1=0
-eof2=0
 pass=true
 exec 7<$file
 exec 8<$file_regex
@@ -116,8 +110,6 @@ FD1=7
 FD2=8
 file="output1.tmp"
 file_regex="SUB/unikernel/expected_output.txt"
-eof1=0
-eof2=0
 pass=true
 exec 7<$file
 exec 8<$file_regex

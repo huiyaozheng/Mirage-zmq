@@ -10,6 +10,5 @@ i = 1
 while True:
     socket.send_string("Work item " + str(i))
     print("Work item " + str(i) + " sent")
-    time.sleep(3)
     i = i + 1
     

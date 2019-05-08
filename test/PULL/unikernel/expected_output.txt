@@ -1,0 +1,13 @@
+Manager: connect$
+Manager: configuring$
+Started socket$
+Received msg: Work item 1$
+Received msg: Work item 2$
+Received msg: Work item 3$
+Received msg: Work item 4$
+Received msg: Work item 5$
+Received msg: Work item 6$
+Received msg: Work item 7$
+Received msg: Work item 8$
+Received msg: Work item 9$
+Received msg: Work item 10$
