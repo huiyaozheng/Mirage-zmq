@@ -1,1 +1,1 @@
-./req_client -l "*:debug"
+./req_unikernel -l "*:debug"

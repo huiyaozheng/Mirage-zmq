@@ -1,6 +1,6 @@
 cd DEALER/unikernel
 mirage clean
-cd DEALER/unikernel_bind
+cd ../../DEALER/unikernel_bind
 mirage clean
 cd ../../IDENTITY/unikernel
 mirage clean

@@ -9,7 +9,8 @@ auth.start()
 auth.allow('127.0.0.1')
 auth.configure_plain(domain='*', passwords={'admin': 'password'})
 server.plain_server = True
-server.bind('tcp://127.0.0.1:5555')
+server.setsockopt(zmq.PLAIN_SERVER, 1)
+server.connect('tcp://127.0.0.1:5556')
 
 msg = server.recv_string()
 server.send(b'Authenticated')

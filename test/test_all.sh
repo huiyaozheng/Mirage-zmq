@@ -10,3 +10,4 @@ REQ/test.sh
 DEALER/test.sh
 ROUTER/test.sh
 IDENTITY/test.sh
+PLAIN/test.sh
