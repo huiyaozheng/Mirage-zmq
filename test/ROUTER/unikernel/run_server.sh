@@ -1,1 +1,1 @@
-./router_server -l "*:debug"
+./router_unikernel -l "*:debug"
