@@ -1,10 +1,10 @@
-# 0MQ-MirageOS
+# Mirage-zmq
 
 Part II Project: A ZeroMQ implementation for MirageOS
 
 In active development; finish by May 2019.
 
-## RFCs to be implemented as core of the project
+## RFCs implemented
 
 - 23/ZMTP
 
@@ -17,11 +17,3 @@ In active development; finish by May 2019.
 - 30/PIPELINE
 
 - 31/EXPAIR
-
-## RFCs that may be implemented as extension of the project
-
-- 25/ZMTP-CURVE
-
-- 27/ZAP
-
-- 34/SRPZMQ
