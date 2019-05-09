@@ -1,5 +1,7 @@
 cd DEALER/unikernel
 ./build.sh
+cd DEALER/unikernel_bind
+./build.sh
 cd ../../IDENTITY/unikernel
 ./build.sh
 cd ../../PAIR/unikernel1
@@ -25,6 +27,8 @@ cd ../../REP/unikernel
 cd ../../REQ/unikernel
 ./build.sh
 cd ../../ROUTER/unikernel
+./build.sh
+cd ../../ROUTER/unikernel_connect
 ./build.sh
 cd ../../SUB/unikernel
 ./build.sh

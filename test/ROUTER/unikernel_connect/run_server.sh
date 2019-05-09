@@ -1,0 +1,1 @@
+./router_unikernel -l "*:debug"

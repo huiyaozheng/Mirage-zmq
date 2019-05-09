@@ -1,5 +1,7 @@
 cd DEALER/unikernel
 mirage clean
+cd DEALER/unikernel_bind
+mirage clean
 cd ../../IDENTITY/unikernel
 mirage clean
 cd ../../PAIR/unikernel1
@@ -25,6 +27,8 @@ mirage clean
 cd ../../REQ/unikernel
 mirage clean
 cd ../../ROUTER/unikernel
+mirage clean
+cd ../../ROUTER/unikernel_connect
 mirage clean
 cd ../../SUB/unikernel
 mirage clean
