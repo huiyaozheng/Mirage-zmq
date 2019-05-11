@@ -91,6 +91,116 @@ module Utils = struct
              String.make 1 (Char.chr x)
            else string_of_int x )
          (List.rev !content))
+
+  module Trie : sig
+    type t
+
+    val create : unit -> t
+
+    val insert : t -> string -> unit
+
+    val delete : t -> string -> unit
+
+    val find : t -> string -> bool
+  end = struct
+    type node = {mutable count: int; mutable children: (char * node ref) list}
+
+    type t = node
+
+    let rec f list c =
+      match list with
+      | [] ->
+          None
+      | (cc, n) :: tl ->
+          if c = cc then Some n else f tl c
+
+    let rec sep list c accum =
+      match list with
+      | [] ->
+          None
+      | (cc, n) :: tl ->
+          if c = cc then Some (accum, n, tl) else sep tl c ((cc, n) :: accum)
+
+    let create () = {count= 0; children= []}
+
+    let rec insert t entry =
+      if entry = "" then t.count <- t.count + 1
+      else
+        let c = entry.[0] in
+        let rec make_branch s =
+          if s = "" then {count= 1; children= []}
+          else
+            { count= 0
+            ; children=
+                [ ( s.[0]
+                  , ref (make_branch (String.sub s 1 (String.length s - 1))) )
+                ] }
+        in
+        match f t.children c with
+        | None ->
+            t.children
+            <- ( c
+               , ref
+                   (make_branch (String.sub entry 1 (String.length entry - 1)))
+               )
+               :: t.children
+        | Some ref_node ->
+            insert !ref_node (String.sub entry 1 (String.length entry - 1))
+
+    let delete t entry =
+      let rec delete_rec t entry =
+        if entry = "" then (
+          if t.count > 0 then t.count <- t.count - 1 ;
+          t.count = 0 && t.children = [] )
+        else
+          let c = entry.[0] in
+          match sep t.children c [] with
+          | None ->
+              false
+          | Some (front, ref_node, back) ->
+              if
+                delete_rec !ref_node
+                  (String.sub entry 1 (String.length entry - 1))
+              then (
+                t.children <- front @ back ;
+                t.count = 0 && t.children = [] )
+              else (
+                t.children <- front @ ((c, ref_node) :: back) ;
+                false )
+      in
+      if entry = "" then ( if t.count > 0 then t.count <- t.count - 1 )
+      else
+        let c = entry.[0] in
+        match sep t.children c [] with
+        | None ->
+            ()
+        | Some (front, ref_node, back) ->
+            if
+              delete_rec !ref_node
+                (String.sub entry 1 (String.length entry - 1))
+            then t.children <- front @ back
+            else t.children <- front @ ((c, ref_node) :: back)
+
+    let find t entry =
+    if t.count > 0 then true
+    else
+      let rec find_rec t entry =
+        if entry = "" || t.children = [] then true
+        else
+          let c = entry.[0] in
+          match f t.children c with
+          | None ->
+              false
+          | Some ref_node ->
+              find_rec !ref_node (String.sub entry 1 (String.length entry - 1))
+      in
+      let c = entry.[0] in
+      match f t.children c with
+      | None ->
+          false
+      | Some ref_node ->
+          find_rec !ref_node (String.sub entry 1 (String.length entry - 1))
+  end
 end
 
 module Frame : sig
@@ -672,22 +782,6 @@ end = struct
         Lwt.return_none
     | Some frames ->
         Lwt.return_some (List.rev frames)
-
-  (** Check whether the content matches with any entry in the subscriptions *)
-  let match_subscriptions content subscriptions =
-    let match_subscription subscription =
-      let content_length = String.length content in
-      let subscription_length = String.length subscription in
-      if subscription_length = 0 then true
-      else if content_length >= subscription_length then
-        String.sub content 0 subscription_length = subscription
-      else false
-    in
-    if subscriptions = [] then false
-    else
-      List.fold_left
-        (fun flag x -> flag || match_subscription x)
-        false subscriptions
 
   (* Broadcast a message to all connections that satisfy predicate if_send_to in the queue *)
   let broadcast connections msg if_send_to =
@@ -1273,8 +1367,8 @@ end = struct
           match t.socket_states with
           | Pub ->
               broadcast t.connections msg (fun connection ->
-                  match_subscriptions msg
-                    (Connection.get_subscriptions connection) ) ;
+                  Utils.Trie.find (Connection.get_subscriptions connection) msg
+              ) ;
               Lwt.return_unit
           | _ ->
               raise Should_Not_Reach )
@@ -1288,8 +1382,8 @@ end = struct
           match t.socket_states with
           | Xpub ->
               broadcast t.connections msg (fun connection ->
-                  match_subscriptions msg
-                    (Connection.get_subscriptions connection) ) ;
+                  Utils.Trie.find (Connection.get_subscriptions connection) msg
+              ) ;
               Lwt.return_unit
           | _ ->
               raise Should_Not_Reach )
@@ -1831,7 +1925,7 @@ and Connection : sig
 
   val get_identity : t -> string
 
-  val get_subscriptions : t -> string list
+  val get_subscriptions : t -> Utils.Trie.t
 
   val get_incoming_socket_type : t -> socket_type
 
@@ -1865,7 +1959,7 @@ end = struct
     ; mutable incoming_identity: string
     ; read_buffer: Frame.t option Queue.t
     ; send_buffer: Bytes.t option Queue.t
-    ; mutable subscriptions: string list
+    ; mutable subscriptions: Utils.Trie.t
     ; mutable previous_fragment: Bytes.t }
 
   let init socket security_mechanism tag =
@@ -1881,7 +1975,7 @@ end = struct
     ; incoming_identity= tag
     ; read_buffer= Queue.create ()
     ; send_buffer= Queue.create ()
-    ; subscriptions= []
+    ; subscriptions= Utils.Trie.create ()
     ; previous_fragment= Bytes.empty }
 
   let get_tag t = t.tag
@@ -2146,19 +2240,11 @@ end = struct
                 | Unsubscribe ->
                     let body = Bytes.to_string (Frame.get_body x) in
                     let sub = String.sub body 1 (String.length body - 1) in
-                    let rec check_and_remove subscriptions =
-                      match subscriptions with
-                      | [] ->
-                          []
-                      | hd :: tl ->
-                          if hd = sub then tl else hd :: check_and_remove tl
-                    in
-                    t.subscriptions <- check_and_remove t.subscriptions
+                    Utils.Trie.delete t.subscriptions sub
                 | Subscribe ->
                     let body = Bytes.to_string (Frame.get_body x) in
-                    t.subscriptions
-                    <- String.sub body 1 (String.length body - 1)
-                       :: t.subscriptions
+                    let sub = String.sub body 1 (String.length body - 1) in
+                    Utils.Trie.insert t.subscriptions sub
                 | Ignore ->
                     () )
               frames
@@ -2183,7 +2269,6 @@ end = struct
           | PUB ->
               manage_subscription () ; []
           | XPUB -> (
-              (* TODO check XPUB's behaviour *)
               enqueue ()
               |> function
               | [] ->
