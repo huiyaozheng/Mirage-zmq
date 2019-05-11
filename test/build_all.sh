@@ -2,7 +2,7 @@ echo "Building DEALER unikernel 1"
 cd DEALER/unikernel
 ./build.sh
 echo "Building DEALER unikernel 2"
-cd DEALER/unikernel_bind
+cd ../../DEALER/unikernel_bind
 ./build.sh
 echo "Building unikernel for IDENTITY test"
 cd ../../IDENTITY/unikernel
