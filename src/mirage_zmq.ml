@@ -102,6 +102,10 @@ module Utils = struct
     val delete : t -> string -> unit
 
     val find : t -> string -> bool
+
+    val is_empty : t -> bool
+
+    val to_list : t -> string list
   end = struct
     type node = {mutable count: int; mutable children: (char * node ref) list}
 
@@ -182,24 +186,38 @@ module Utils = struct
             else t.children <- front @ ((c, ref_node) :: back)
 
     let find t entry =
-    if t.count > 0 then true
-    else
-      let rec find_rec t entry =
-        if entry = "" || t.children = [] then true
-        else
-          let c = entry.[0] in
-          match f t.children c with
-          | None ->
-              false
-          | Some ref_node ->
-              find_rec !ref_node (String.sub entry 1 (String.length entry - 1))
+      if t.count > 0 then true
+      else
+        let rec find_rec t entry =
+          if entry = "" || t.children = [] then true
+          else
+            let c = entry.[0] in
+            match f t.children c with
+            | None ->
+                false
+            | Some ref_node ->
+                find_rec !ref_node
+                  (String.sub entry 1 (String.length entry - 1))
+        in
+        let c = entry.[0] in
+        match f t.children c with
+        | None ->
+            false
+        | Some ref_node ->
+            find_rec !ref_node (String.sub entry 1 (String.length entry - 1))
+
+    let is_empty t = t.count = 0 && t.children = []
+
+    let rec to_list t =
+      let rec add s n accum =
+        if n = 0 then accum else add s (n - 1) (s :: accum)
       in
-      let c = entry.[0] in
-      match f t.children c with
-      | None ->
-          false
-      | Some ref_node ->
-          find_rec !ref_node (String.sub entry 1 (String.length entry - 1))
+      add "" t.count []
+      @ List.flatten
+          (List.map
+             (fun (c, ref_node) ->
+               List.map (fun s -> String.make 1 c ^ s) (to_list !ref_node) )
+             t.children)
   end
 end
 
@@ -531,9 +549,9 @@ end = struct
     | Dealer of {request_order_queue: string Queue.t}
     | Router
     | Pub
-    | Sub of {subscriptions: string list}
+    | Sub of {subscriptions: Utils.Trie.t}
     | Xpub
-    | Xsub of {subscriptions: string list}
+    | Xsub of {subscriptions: Utils.Trie.t}
     | Push
     | Pull
     | Pair of {connected: bool}
@@ -919,7 +937,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= Queue.create ()
-        ; socket_states= Sub {subscriptions= []}
+        ; socket_states= Sub {subscriptions= Utils.Trie.create ()}
         ; incoming_queue_size=
             Some (Context.get_default_queue_size context)
             (* Need an outgoing queue to send subscriptions *)
@@ -930,7 +948,7 @@ end = struct
         ; security_mechanism= mechanism
         ; security_info= Null
         ; connections= Queue.create ()
-        ; socket_states= Xsub {subscriptions= []}
+        ; socket_states= Xsub {subscriptions= Utils.Trie.create ()}
         ; incoming_queue_size= Some (Context.get_default_queue_size context)
         ; outgoing_queue_size= Some (Context.get_default_queue_size context) }
     | PUSH ->
@@ -1003,11 +1021,11 @@ end = struct
     | SUB | XSUB -> (
       match t.socket_states with
       | Sub {subscriptions} ->
-          t.socket_states <- Sub {subscriptions= subscription :: subscriptions} ;
+          Utils.Trie.insert subscriptions subscription ;
           send_message_to_all_active_connections t.connections
             (subscription_frame subscription)
       | Xsub {subscriptions} ->
-          t.socket_states <- Xsub {subscriptions= subscription :: subscriptions} ;
+          Utils.Trie.insert subscriptions subscription ;
           send_message_to_all_active_connections t.connections
             (subscription_frame subscription)
       | _ ->
@@ -1017,23 +1035,15 @@ end = struct
           (Incorrect_use_of_API "This socket does not support subscription!")
 
   let unsubscribe t subscription =
-    let rec check_and_remove subscriptions =
-      match subscriptions with
-      | [] ->
-          []
-      | hd :: tl ->
-          if hd = subscription then tl else hd :: check_and_remove tl
-    in
     match t.socket_type with
     | SUB | XSUB -> (
       match t.socket_states with
       | Sub {subscriptions} ->
-          t.socket_states <- Sub {subscriptions= check_and_remove subscriptions} ;
+          Utils.Trie.delete subscriptions subscription ;
           send_message_to_all_active_connections t.connections
             (unsubscription_frame subscription)
       | Xsub {subscriptions} ->
-          t.socket_states
-          <- Xsub {subscriptions= check_and_remove subscriptions} ;
+          Utils.Trie.delete subscriptions subscription ;
           send_message_to_all_active_connections t.connections
             (unsubscription_frame subscription)
       | _ ->
@@ -1456,16 +1466,20 @@ end = struct
     | SUB -> (
       match t.socket_states with
       | Sub {subscriptions} ->
-          if subscriptions <> [] then
-            List.map (fun x -> subscription_frame x) subscriptions
+          if not (Utils.Trie.is_empty subscriptions) then
+            List.map
+              (fun x -> subscription_frame x)
+              (Utils.Trie.to_list subscriptions)
           else []
       | _ ->
           raise Should_Not_Reach )
     | XSUB -> (
       match t.socket_states with
       | Xsub {subscriptions} ->
-          if subscriptions <> [] then
-            List.map (fun x -> subscription_frame x) subscriptions
+          if not (Utils.Trie.is_empty subscriptions) then
+            List.map
+              (fun x -> subscription_frame x)
+              (Utils.Trie.to_list subscriptions)
           else []
       | _ ->
           raise Should_Not_Reach )
