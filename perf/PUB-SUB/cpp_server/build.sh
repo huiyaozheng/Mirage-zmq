@@ -1,1 +1,0 @@
-g++ server.cpp -O2 -lzmq --std=c++14 -o server
